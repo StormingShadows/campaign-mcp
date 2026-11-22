@@ -1,0 +1,479 @@
+use crate::db::CampaignDb;
+use crate::models::{
+    CharacterBaseline, CharacterCurrent, CharacterProjection, EventPayload, PlaceBaseline,
+    PlaceCurrent, PlaceProjection, ResourcePool, WorldClock, WorldEvent,
+};
+use anyhow::{anyhow, Result};
+use std::collections::BTreeMap;
+
+/// Deterministically projects a Character's live status from its immutable baseline
+/// plus all events affecting it (optionally capped at `as_of_seq`).
+pub fn project_character(
+    baseline: &CharacterBaseline,
+    events: &[WorldEvent],
+) -> CharacterProjection {
+    let mut current = CharacterCurrent {
+        id: baseline.id.clone(),
+        name: baseline.name.clone(),
+        alive_status: "Active".to_string(),
+        current_location: baseline.initial_location.clone(),
+        stats: baseline.initial_stats.clone(),
+        resources: baseline.initial_resources.clone(),
+        conditions: Vec::new(),
+        equipment: baseline.initial_equipment.clone(),
+        skills: baseline.initial_skills.clone(),
+        techniques: baseline.initial_techniques.clone(),
+        active_goals: baseline.initial_goals.clone(),
+        completed_goals: Vec::new(),
+        last_event_seq: 0,
+        last_world_time: baseline.created_at_world_time.clone(),
+    };
+
+    let mut relevant_events = Vec::new();
+
+    for ev in events {
+        let touches_char = ev.affected_entities.iter().any(|e| e == &baseline.id)
+            || event_targets_character(&ev.payload, &baseline.id);
+        if !touches_char {
+            continue;
+        }
+
+        current.last_event_seq = ev.seq;
+        current.last_world_time = ev.world_time.clone();
+        relevant_events.push(ev.clone());
+
+        match &ev.payload {
+            EventPayload::CharacterMoved {
+                character_id,
+                to_place,
+                ..
+            } if character_id == &baseline.id => {
+                current.current_location = Some(to_place.clone());
+            }
+            EventPayload::ResourceChanged {
+                character_id,
+                resource,
+                delta,
+                set_current,
+                set_max,
+                unit,
+                ..
+            } if character_id == &baseline.id => {
+                let entry = current
+                    .resources
+                    .entry(resource.clone())
+                    .or_insert_with(|| ResourcePool {
+                        current: 0,
+                        max: 100,
+                        unit: unit.clone().unwrap_or_default(),
+                    });
+                if let Some(u) = unit {
+                    if !u.is_empty() {
+                        entry.unit = u.clone();
+                    }
+                }
+                if let Some(new_max) = set_max {
+                    entry.max = *new_max;
+                }
+                if let Some(val) = set_current {
+                    entry.current = *val;
+                } else if let Some(d) = delta {
+                    entry.current += *d;
+                }
+                if entry.max > 0 && entry.current > entry.max {
+                    entry.current = entry.max;
+                }
+                if entry.current < 0 {
+                    entry.current = 0;
+                }
+            }
+            EventPayload::StatChanged {
+                character_id,
+                stat,
+                delta,
+                set_value,
+                ..
+            } if character_id == &baseline.id => {
+                let entry = current.stats.entry(stat.clone()).or_insert(0);
+                if let Some(val) = set_value {
+                    *entry = *val;
+                } else if let Some(d) = delta {
+                    *entry += *d;
+                }
+            }
+            EventPayload::CharacterStatusChanged {
+                character_id,
+                alive_status,
+                ..
+            } if character_id == &baseline.id => {
+                current.alive_status = alive_status.clone();
+            }
+            EventPayload::ConditionAdded {
+                character_id,
+                condition,
+            } if character_id == &baseline.id => {
+                if let Some(existing) = current
+                    .conditions
+                    .iter_mut()
+                    .find(|c| c.name.eq_ignore_ascii_case(&condition.name))
+                {
+                    *existing = condition.clone();
+                } else {
+                    current.conditions.push(condition.clone());
+                }
+            }
+            EventPayload::ConditionRemoved {
+                character_id,
+                condition_name,
+                ..
+            } if character_id == &baseline.id => {
+                current
+                    .conditions
+                    .retain(|c| !c.name.eq_ignore_ascii_case(condition_name));
+            }
+            EventPayload::ItemAcquired { character_id, item } if character_id == &baseline.id => {
+                if let Some(existing) = current
+                    .equipment
+                    .iter_mut()
+                    .find(|i| i.name.eq_ignore_ascii_case(&item.name))
+                {
+                    existing.quantity += item.quantity;
+                    if item.equipped {
+                        existing.equipped = true;
+                    }
+                    if item.slot.is_some() {
+                        existing.slot = item.slot.clone();
+                    }
+                    if !item.description.is_empty() {
+                        existing.description = item.description.clone();
+                    }
+                    if item.durability.is_some() {
+                        existing.durability = item.durability.clone();
+                    }
+                } else {
+                    current.equipment.push(item.clone());
+                }
+            }
+            EventPayload::ItemRemoved {
+                character_id,
+                item_name,
+                quantity,
+                ..
+            } if character_id == &baseline.id => {
+                if let Some(existing) = current
+                    .equipment
+                    .iter_mut()
+                    .find(|i| i.name.eq_ignore_ascii_case(item_name))
+                {
+                    existing.quantity -= *quantity;
+                }
+                current.equipment.retain(|i| i.quantity > 0);
+            }
+            EventPayload::ItemEquipped {
+                character_id,
+                item_name,
+                slot,
+                equipped,
+            } if character_id == &baseline.id => {
+                if let Some(existing) = current
+                    .equipment
+                    .iter_mut()
+                    .find(|i| i.name.eq_ignore_ascii_case(item_name))
+                {
+                    existing.equipped = *equipped;
+                    if slot.is_some() {
+                        existing.slot = slot.clone();
+                    }
+                }
+            }
+            EventPayload::SkillUpdated {
+                character_id,
+                skill,
+            } if character_id == &baseline.id => {
+                if let Some(existing) = current
+                    .skills
+                    .iter_mut()
+                    .find(|s| s.name.eq_ignore_ascii_case(&skill.name))
+                {
+                    *existing = skill.clone();
+                } else {
+                    current.skills.push(skill.clone());
+                }
+            }
+            EventPayload::TechniqueUpdated {
+                character_id,
+                technique,
+            } if character_id == &baseline.id => {
+                if let Some(existing) = current
+                    .techniques
+                    .iter_mut()
+                    .find(|t| t.name.eq_ignore_ascii_case(&technique.name))
+                {
+                    *existing = technique.clone();
+                } else {
+                    current.techniques.push(technique.clone());
+                }
+            }
+            EventPayload::GoalUpdated {
+                character_id,
+                goal,
+                completed,
+            } if character_id == &baseline.id => {
+                if *completed {
+                    current
+                        .active_goals
+                        .retain(|g| !g.eq_ignore_ascii_case(goal));
+                    if !current
+                        .completed_goals
+                        .iter()
+                        .any(|g| g.eq_ignore_ascii_case(goal))
+                    {
+                        current.completed_goals.push(goal.clone());
+                    }
+                } else if !current
+                    .active_goals
+                    .iter()
+                    .any(|g| g.eq_ignore_ascii_case(goal))
+                {
+                    current.active_goals.push(goal.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    CharacterProjection {
+        baseline: baseline.clone(),
+        current,
+        event_log: relevant_events,
+    }
+}
+
+/// Deterministically projects a Place's live status from its baseline, world events,
+/// current world clock, and the list of characters currently located there.
+pub fn project_place(
+    baseline: &PlaceBaseline,
+    events: &[WorldEvent],
+    world_clock: &WorldClock,
+    present_characters: Vec<String>,
+) -> PlaceProjection {
+    let mut current = PlaceCurrent {
+        id: baseline.id.clone(),
+        name: baseline.name.clone(),
+        current_season: world_clock.season.clone(),
+        current_weather: if baseline.initial_weather.is_empty() {
+            world_clock.global_weather.clone()
+        } else {
+            baseline.initial_weather.clone()
+        },
+        controlling_faction: baseline.initial_faction.clone(),
+        danger_level: baseline.initial_danger_level.clone(),
+        active_conditions: Vec::new(),
+        landmarks: baseline.places_of_significance.clone(),
+        routes: baseline.routes.clone(),
+        present_characters,
+        last_event_seq: 0,
+        last_world_time: baseline.created_at_world_time.clone(),
+    };
+
+    let mut relevant_events = Vec::new();
+
+    for ev in events {
+        let touches_place = ev.location_id.as_deref() == Some(baseline.id.as_str())
+            || ev.affected_entities.iter().any(|e| e == &baseline.id)
+            || event_targets_place(&ev.payload, &baseline.id);
+        if !touches_place {
+            continue;
+        }
+
+        current.last_event_seq = ev.seq;
+        current.last_world_time = ev.world_time.clone();
+        relevant_events.push(ev.clone());
+
+        match &ev.payload {
+            EventPayload::PlaceWeatherChanged {
+                place_id, weather, ..
+            } if place_id == &baseline.id => {
+                current.current_weather = weather.clone();
+            }
+            EventPayload::PlaceConditionChanged {
+                place_id,
+                condition,
+                active,
+                ..
+            } if place_id == &baseline.id => {
+                if *active {
+                    if !current
+                        .active_conditions
+                        .iter()
+                        .any(|c| c.eq_ignore_ascii_case(condition))
+                    {
+                        current.active_conditions.push(condition.clone());
+                    }
+                } else {
+                    current
+                        .active_conditions
+                        .retain(|c| !c.eq_ignore_ascii_case(condition));
+                }
+            }
+            EventPayload::PlaceControlChanged {
+                place_id,
+                faction,
+                danger_level,
+                ..
+            } if place_id == &baseline.id => {
+                if faction.is_some() {
+                    current.controlling_faction = faction.clone();
+                }
+                if let Some(d) = danger_level {
+                    current.danger_level = d.clone();
+                }
+            }
+            EventPayload::LandmarkUpdated { place_id, landmark } if place_id == &baseline.id => {
+                if let Some(existing) = current
+                    .landmarks
+                    .iter_mut()
+                    .find(|l| l.name.eq_ignore_ascii_case(&landmark.name))
+                {
+                    *existing = landmark.clone();
+                } else {
+                    current.landmarks.push(landmark.clone());
+                }
+            }
+            EventPayload::RouteUpdated { place_id, route } if place_id == &baseline.id => {
+                if let Some(existing) = current
+                    .routes
+                    .iter_mut()
+                    .find(|r| r.destination_id.eq_ignore_ascii_case(&route.destination_id))
+                {
+                    *existing = route.clone();
+                } else {
+                    current.routes.push(route.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    PlaceProjection {
+        baseline: baseline.clone(),
+        current,
+        event_log: relevant_events,
+    }
+}
+
+pub fn load_all_character_projections(
+    db: &CampaignDb,
+    as_of_seq: Option<i64>,
+) -> Result<BTreeMap<String, CharacterProjection>> {
+    let baselines = db.list_character_baselines()?;
+    let events = match as_of_seq {
+        Some(seq) => db.list_events_up_to(seq)?,
+        None => db.list_all_events()?,
+    };
+    let mut map = BTreeMap::new();
+    for b in baselines {
+        let proj = project_character(&b, &events);
+        map.insert(b.id.clone(), proj);
+    }
+    Ok(map)
+}
+
+pub fn load_character_projection(
+    db: &CampaignDb,
+    character_id: &str,
+    as_of_seq: Option<i64>,
+) -> Result<CharacterProjection> {
+    let baseline = db
+        .get_character_baseline(character_id)?
+        .ok_or_else(|| anyhow!("Character '{character_id}' not found"))?;
+    let events = match as_of_seq {
+        Some(seq) => db.list_events_up_to(seq)?,
+        None => db.list_events_for_entity(character_id)?,
+    };
+    Ok(project_character(&baseline, &events))
+}
+
+pub fn load_all_place_projections(
+    db: &CampaignDb,
+    as_of_seq: Option<i64>,
+) -> Result<BTreeMap<String, PlaceProjection>> {
+    let meta = db.get_campaign_meta()?;
+    let char_projections = load_all_character_projections(db, as_of_seq)?;
+    let place_baselines = db.list_place_baselines()?;
+    let events = match as_of_seq {
+        Some(seq) => db.list_events_up_to(seq)?,
+        None => db.list_all_events()?,
+    };
+
+    // Derive world clock at as_of_seq if needed
+    let mut clock = meta.clock.clone();
+    if as_of_seq.is_some() {
+        for ev in &events {
+            if let EventPayload::TimeAdvanced { new_clock, .. } = &ev.payload {
+                clock = new_clock.clone();
+            }
+        }
+    }
+
+    let mut map = BTreeMap::new();
+    for pb in place_baselines {
+        let mut present: Vec<String> = char_projections
+            .values()
+            .filter(|cp| cp.current.current_location.as_deref() == Some(pb.id.as_str()))
+            .map(|cp| cp.baseline.id.clone())
+            .collect();
+        present.sort();
+        let proj = project_place(&pb, &events, &clock, present);
+        map.insert(pb.id.clone(), proj);
+    }
+    Ok(map)
+}
+
+pub fn load_place_projection(
+    db: &CampaignDb,
+    place_id: &str,
+    as_of_seq: Option<i64>,
+) -> Result<PlaceProjection> {
+    let all = load_all_place_projections(db, as_of_seq)?;
+    all.get(place_id)
+        .cloned()
+        .ok_or_else(|| anyhow!("Place '{place_id}' not found"))
+}
+
+fn event_targets_character(payload: &EventPayload, char_id: &str) -> bool {
+    match payload {
+        EventPayload::CharacterCreated { character_id }
+        | EventPayload::CharacterMoved { character_id, .. }
+        | EventPayload::ResourceChanged { character_id, .. }
+        | EventPayload::StatChanged { character_id, .. }
+        | EventPayload::CharacterStatusChanged { character_id, .. }
+        | EventPayload::ConditionAdded { character_id, .. }
+        | EventPayload::ConditionRemoved { character_id, .. }
+        | EventPayload::ItemAcquired { character_id, .. }
+        | EventPayload::ItemRemoved { character_id, .. }
+        | EventPayload::ItemEquipped { character_id, .. }
+        | EventPayload::SkillUpdated { character_id, .. }
+        | EventPayload::TechniqueUpdated { character_id, .. }
+        | EventPayload::GoalUpdated { character_id, .. } => character_id == char_id,
+        EventPayload::DiceRolled { actor_id, .. } => actor_id.as_deref() == Some(char_id),
+        _ => false,
+    }
+}
+
+fn event_targets_place(payload: &EventPayload, place_id: &str) -> bool {
+    match payload {
+        EventPayload::PlaceCreated { place_id: pid }
+        | EventPayload::PlaceWeatherChanged { place_id: pid, .. }
+        | EventPayload::PlaceConditionChanged { place_id: pid, .. }
+        | EventPayload::PlaceControlChanged { place_id: pid, .. }
+        | EventPayload::LandmarkUpdated { place_id: pid, .. }
+        | EventPayload::RouteUpdated { place_id: pid, .. } => pid == place_id,
+        EventPayload::CharacterMoved {
+            from_place,
+            to_place,
+            ..
+        } => from_place.as_deref() == Some(place_id) || to_place == place_id,
+        _ => false,
+    }
+}

@@ -1,0 +1,23 @@
+# OpenAI Codex CLI / ChatGPT Desktop MCP Configuration Example
+# Copy the desired block into ~/.codex/config.toml (Linux/macOS) or %USERPROFILE%\.codex\config.toml (Windows)
+
+# ---------------------------------------------------------------------------
+# Option A: Local Stdio Transport (Recommended for Codex CLI)
+# ---------------------------------------------------------------------------
+[mcp_servers.chronicle-gm]
+command = "/absolute/path/to/chronicle/target/release/chronicle"
+args = ["mcp", "--campaign", "/absolute/path/to/your-campaign"]
+startup_timeout_sec = 15
+tool_timeout_sec = 60
+
+# ---------------------------------------------------------------------------
+# Option B: Streamable HTTP Transport (Codex CLI & ChatGPT Web/Desktop)
+# Start server first:
+#   chronicle mcp --campaign /path/to/your-campaign --transport http --port 7878
+# (or `chronicle ui --campaign /path/to/your-campaign --port 7878`)
+# ---------------------------------------------------------------------------
+# [mcp_servers.chronicle-gm-http]
+# url = "http://127.0.0.1:7878/mcp"
+# bearer_token_env_var = "CHRONICLE_MCP_TOKEN"
+# startup_timeout_sec = 15
+# tool_timeout_sec = 60

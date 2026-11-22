@@ -1,0 +1,17 @@
+#![recursion_limit = "512"]
+
+pub mod autonomy;
+pub mod compiler;
+pub mod context;
+pub mod db;
+pub mod dice;
+pub mod engine;
+pub mod maintenance;
+pub mod mcp;
+pub mod mechanics;
+pub mod models;
+pub mod oauth;
+pub mod projection;
+pub mod search;
+pub mod web;
+pub mod world_sim;

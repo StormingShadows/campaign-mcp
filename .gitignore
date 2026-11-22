@@ -1,0 +1,21 @@
+# Rust build artifacts & cached cross-platform binaries
+/target
+/bin
+
+# Campaign databases, WAL/SHM sidecars, backups, and private campaign folders
+/my-campaign
+/campaigns
+**/*.db
+**/*.db-wal
+**/*.db-shm
+**/*.backup-*.db
+
+# Local serve secrets / environment overrides
+.env
+.chronicle-serve.env
+*.local.json
+
+# Google Drive for Desktop hidden sync artifacts
+.tmp.drivedownload/
+.tmp.driveupload/
+desktop.ini

@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "chronicle-gm": {
+      "command": "/absolute/path/to/chronicle/target/release/chronicle",
+      "args": [
+        "mcp",
+        "--campaign",
+        "/absolute/path/to/your-campaign"
+      ]
+    }
+  }
+}

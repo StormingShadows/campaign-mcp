@@ -1,0 +1,2259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Chronicle — RPG GM Studio</title>
+<style>
+  :root {
+    --bg: #0c0f16;
+    --bg2: #121722;
+    --panel: #171d2b;
+    --panel-hover: #1e2638;
+    --border: #28324a;
+    --text: #e6ebf5;
+    --muted: #8f9bb3;
+    --accent: #e89b3c;
+    --accent-dim: rgba(232, 155, 60, 0.16);
+    --teal: #38bdf8;
+    --green: #34d399;
+    --red: #f87171;
+    --purple: #a78bfa;
+    --radius: 10px;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: "Segoe UI", system-ui, -apple-system, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: var(--sans); background: var(--bg); color: var(--text);
+    display: flex; flex-direction: column; min-height: 100vh; font-size: 14px;
+  }
+  a { color: var(--teal); text-decoration: none; cursor: pointer; }
+  a:hover { text-decoration: underline; }
+  header {
+    background: linear-gradient(180deg, #151b29 0%, #101521 100%);
+    border-bottom: 1px solid var(--border);
+    padding: 12px 20px; display: flex; flex-wrap: wrap; align-items: center; gap: 14px;
+    position: sticky; top: 0; z-index: 20;
+  }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 17px; letter-spacing: 0.3px; }
+  .brand-badge {
+    width: 30px; height: 30px; border-radius: 8px;
+    background: linear-gradient(135deg, #f59e0b, #b45309);
+    display: grid; place-items: center; color: #0c0f16; font-weight: 900; font-size: 16px;
+  }
+  .clock-pill {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 999px;
+    padding: 5px 12px; font-size: 12.5px; color: var(--text); display: flex; align-items: center; gap: 8px;
+  }
+  .clock-pill strong { color: var(--accent); }
+  .chain-pill {
+    font-size: 11.5px; padding: 4px 10px; border-radius: 999px; font-weight: 600;
+    background: rgba(52, 211, 153, 0.14); color: var(--green); border: 1px solid rgba(52, 211, 153, 0.3);
+  }
+  .chain-pill.bad { background: rgba(248, 113, 113, 0.14); color: var(--red); border-color: rgba(248, 113, 113, 0.3); }
+  .omni-wrap { margin-left: auto; display: flex; align-items: center; gap: 8px; min-width: 260px; }
+  input, select, textarea {
+    background: #0d121c; color: var(--text); border: 1px solid var(--border);
+    border-radius: 7px; padding: 7px 10px; font-family: inherit; font-size: 13px;
+  }
+  input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); }
+  button {
+    background: var(--panel-hover); color: var(--text); border: 1px solid var(--border);
+    border-radius: 7px; padding: 7px 12px; font-family: inherit; font-size: 13px;
+    cursor: pointer; font-weight: 500; transition: all 0.12s;
+  }
+  button:hover { border-color: var(--accent); background: #242e44; }
+  button.primary { background: var(--accent); color: #111; border-color: var(--accent); font-weight: 700; }
+  button.primary:hover { background: #f2ae52; }
+  button.danger { background: rgba(248, 113, 113, 0.14); color: var(--red); border-color: rgba(248, 113, 113, 0.35); }
+  button.danger:hover { background: rgba(248, 113, 113, 0.25); }
+  button.sm { padding: 4px 8px; font-size: 12px; }
+
+  nav.tabs {
+    background: var(--bg2); border-bottom: 1px solid var(--border);
+    padding: 0 20px; display: flex; gap: 4px; overflow-x: auto;
+  }
+  nav.tabs button {
+    background: transparent; border: none; border-bottom: 2px solid transparent;
+    border-radius: 0; padding: 11px 14px; color: var(--muted); font-weight: 600;
+  }
+  nav.tabs button:hover { color: var(--text); background: rgba(255,255,255,0.03); }
+  nav.tabs button.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+  main { flex: 1; padding: 18px 20px; max-width: 1540px; width: 100%; margin: 0 auto; }
+  .tab-pane { display: none; }
+  .tab-pane.active { display: block; }
+
+  .grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+  .grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+  .split { display: grid; grid-template-columns: 360px minmax(0, 1fr); gap: 18px; align-items: start; }
+  @media (max-width: 980px) { .grid-2, .grid-3, .split { grid-template-columns: 1fr; } }
+
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 15px; margin-bottom: 14px;
+  }
+  .card h2, .card h3 { margin: 0 0 10px 0; font-size: 15px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .card h3 { font-size: 13.5px; color: var(--accent); text-transform: uppercase; letter-spacing: 0.5px; }
+  .muted { color: var(--muted); }
+  .mono { font-family: var(--mono); }
+
+  .filter-bar {
+    background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 12px; margin-bottom: 14px; display: flex; flex-wrap: wrap; gap: 8px; align-items: end;
+  }
+  .filter-bar .field { display: flex; flex-direction: column; gap: 3px; min-width: 120px; flex: 1 1 130px; }
+  .filter-bar label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.4px; }
+
+  .roster-item {
+    background: var(--bg2); border: 1px solid var(--border); border-radius: 8px;
+    padding: 11px 12px; margin-bottom: 8px; cursor: pointer; transition: all 0.12s;
+  }
+  .roster-item:hover { border-color: var(--accent); background: var(--panel-hover); }
+  .roster-item.selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; background: #1e2536; }
+
+  .pill {
+    display: inline-block; padding: 2px 7px; border-radius: 999px; font-size: 11px; font-weight: 600;
+    background: rgba(255,255,255,0.07); color: var(--text); border: 1px solid var(--border);
+  }
+  .pill.pc { background: rgba(56, 189, 248, 0.16); color: var(--teal); border-color: rgba(56, 189, 248, 0.35); }
+  .pill.npc { background: rgba(167, 139, 250, 0.16); color: var(--purple); border-color: rgba(167, 139, 250, 0.35); }
+  .pill.debuff, .pill.injury, .pill.curse, .pill.threat, .pill.gm_secret { background: rgba(248, 113, 113, 0.16); color: var(--red); border-color: rgba(248, 113, 113, 0.35); }
+  .pill.buff, .pill.public, .pill.quest { background: rgba(52, 211, 153, 0.16); color: var(--green); border-color: rgba(52, 211, 153, 0.35); }
+  .pill.rumor, .pill.warn { background: var(--accent-dim); color: var(--accent); border-color: rgba(232, 155, 60, 0.4); }
+
+  .bar-wrap { background: #0a0e16; border: 1px solid var(--border); border-radius: 5px; height: 9px; overflow: hidden; margin-top: 4px; }
+  .bar-fill { height: 100%; background: linear-gradient(90deg, #10b981, #34d399); transition: width 0.2s; }
+  .bar-fill.low { background: linear-gradient(90deg, #dc2626, #f87171); }
+  .bar-fill.mid { background: linear-gradient(90deg, #d97706, #fbbf24); }
+  .bar-fill.qi { background: linear-gradient(90deg, #0284c7, #38bdf8); }
+
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.4px; }
+  tr:hover td { background: rgba(255,255,255,0.02); }
+
+  .section-banner {
+    background: var(--bg2); border-left: 3px solid var(--accent);
+    padding: 8px 12px; margin: 16px 0 10px 0; border-radius: 0 6px 6px 0;
+    font-weight: 700; font-size: 13.5px; display: flex; justify-content: space-between; align-items: center;
+  }
+  .section-banner.current { border-left-color: var(--green); }
+  .section-banner.log { border-left-color: var(--teal); }
+
+  .clock-segs { display: flex; gap: 4px; margin: 6px 0; }
+  .clock-seg { flex: 1; height: 10px; border-radius: 3px; background: #0d121c; border: 1px solid var(--border); }
+  .clock-seg.on { background: var(--accent); border-color: var(--accent); }
+  .clock-seg.on.threat { background: var(--red); border-color: var(--red); }
+
+  .pre-box {
+    background: #0a0e16; border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px; font-family: var(--mono); font-size: 12px; white-space: pre-wrap;
+    overflow-x: auto; max-height: 540px; overflow-y: auto; line-height: 1.5;
+  }
+
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .toast {
+    position: fixed; bottom: 18px; right: 18px; z-index: 100;
+    background: #1b2436; border: 1px solid var(--accent); color: var(--text);
+    padding: 10px 16px; border-radius: 8px; box-shadow: 0 8px 30px rgba(0,0,0,0.5);
+    display: none; max-width: 420px;
+  }
+  .modal-bg {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.7); z-index: 50;
+    display: none; place-items: center; padding: 16px;
+  }
+  .modal-bg.open { display: grid; }
+  .modal {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    width: 100%; max-width: 640px; max-height: 90vh; overflow-y: auto; padding: 18px;
+  }
+  .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+  .form-grid .full { grid-column: 1 / -1; }
+  .form-grid label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+  #graphSvg { width: 100%; height: 340px; background: #0a0e16; border: 1px solid var(--border); border-radius: 8px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <div class="brand-badge">C</div>
+    <div>
+      <div id="campaignTitle">Chronicle GM Studio</div>
+      <div class="muted" style="font-size:11px" id="campaignSub">Event-Sourced RPG State Engine</div>
+    </div>
+  </div>
+  <div class="clock-pill" id="clockPill">Loading world clock...</div>
+  <div class="chain-pill" id="chainPill">Ledger: ...</div>
+  <div class="omni-wrap">
+    <input id="omniInput" type="search" placeholder="Omni-search characters, places, lore, items..." style="flex:1" />
+    <button class="primary sm" onclick="runOmniSearch()">Search</button>
+  </div>
+</header>
+
+<nav class="tabs">
+  <button class="active" data-tab="dashboard" onclick="switchTab('dashboard')">Dashboard</button>
+  <button data-tab="characters" onclick="switchTab('characters')">Characters</button>
+  <button data-tab="places" onclick="switchTab('places')">Places &amp; Atlas</button>
+  <button data-tab="items" onclick="switchTab('items')">Items &amp; Relics</button>
+  <button data-tab="texts" onclick="switchTab('texts')">Books &amp; Scrolls</button>
+  <button data-tab="histories" onclick="switchTab('histories')">Histories</button>
+  <button data-tab="lore" onclick="switchTab('lore')">World &amp; Lore</button>
+  <button data-tab="attachments" onclick="switchTab('attachments')">Docs &amp; Media</button>
+  <button data-tab="graph" onclick="switchTab('graph')">Knowledge Graph</button>
+  <button data-tab="timeline" onclick="switchTab('timeline')">Timeline &amp; Rollback</button>
+  <button data-tab="diagnostics" onclick="switchTab('diagnostics')">Diagnostics &amp; Cleanup</button>
+  <button data-tab="ai" onclick="switchTab('ai')">AI Context &amp; Schemas</button>
+</nav>
+
+<main>
+  <!-- OMNI SEARCH MODAL RESULTS BANNER -->
+  <div id="omniResultsCard" class="card" style="display:none; border-color: var(--accent);">
+    <h2>
+      <span id="omniResultsTitle">Search Results</span>
+      <button class="sm" onclick="document.getElementById('omniResultsCard').style.display='none'">Close</button>
+    </h2>
+    <div id="omniResultsBody"></div>
+  </div>
+
+  <!-- ========================================================= DASHBOARD -->
+  <section id="tab-dashboard" class="tab-pane active">
+    <div class="grid-3">
+      <div class="card">
+        <h3>World Calendar &amp; Weather</h3>
+        <div id="dashClockDetail" style="margin-bottom:10px;"></div>
+        <div class="row" style="margin-bottom:8px;">
+          <button class="sm" onclick="advanceTime(15)">+15 min</button>
+          <button class="sm" onclick="advanceTime(60)">+1 hr</button>
+          <button class="sm" onclick="advanceTime(360)">+6 hrs</button>
+          <button class="sm" onclick="advanceTime(1440)">+1 Day</button>
+          <button class="sm" onclick="advanceTime(1440*10)">+10 Days</button>
+        </div>
+        <div class="row">
+          <input id="dashWeatherInput" placeholder="Update global weather..." style="flex:1" />
+          <button class="sm primary" onclick="advanceTime(0)">Set</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Deterministic Dice Tray</h3>
+        <div class="row" style="margin-bottom:8px;">
+          <input id="diceExpr" value="2d10+4" style="width:120px" />
+          <input id="dicePurpose" placeholder="Purpose (optional)..." style="flex:1" />
+          <button class="primary sm" onclick="rollDiceUi()">Roll</button>
+        </div>
+        <div class="row" style="margin-bottom:8px;">
+          <button class="sm" onclick="quickRoll('1d20')">d20</button>
+          <button class="sm" onclick="quickRoll('2d20kh1')">Adv</button>
+          <button class="sm" onclick="quickRoll('2d20kl1')">Dis</button>
+          <button class="sm" onclick="quickRoll('2d6')">2d6</button>
+          <button class="sm" onclick="quickRoll('2d10')">2d10</button>
+          <button class="sm" onclick="quickRoll('1d100')">d100</button>
+        </div>
+        <div id="diceOutput" class="mono muted" style="font-size:12.5px;">Ready to roll.</div>
+      </div>
+
+      <div class="card">
+        <h3>Quick Session &amp; Narrative Log</h3>
+        <div class="row" style="margin-bottom:8px;">
+          <input id="quickEvTitle" placeholder="Event title..." style="flex:1" />
+          <button class="primary sm" onclick="quickLogEvent()">Log Event</button>
+        </div>
+        <textarea id="quickEvDetails" rows="2" placeholder="What happened? (optional details)" style="width:100%; margin-bottom:8px;"></textarea>
+        <div class="row">
+          <button class="sm" onclick="openModal('modalSession')">Start New Session</button>
+          <button class="sm" onclick="forceCompile()">Recompile Markdown Docs</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <h2>
+          <span>Progress Clocks, Quests &amp; Threats</span>
+          <button class="sm primary" onclick="openModal('modalClock')">+ New Clock</button>
+        </h2>
+        <div id="dashClocks"></div>
+      </div>
+
+      <div class="card">
+        <h2>
+          <span>Active Cast &amp; Locations</span>
+          <button class="sm" onclick="openModal('modalRest')">Party Rest</button>
+        </h2>
+        <div id="dashSummary"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========================================================= CHARACTERS -->
+  <section id="tab-characters" class="tab-pane">
+    <div class="filter-bar">
+      <div class="field"><label>Search Text</label><input id="cf_query" placeholder="Name, title, lore..." oninput="loadCharacters()" /></div>
+      <div class="field"><label>Kind</label>
+        <select id="cf_kind" onchange="loadCharacters()">
+          <option value="">All</option><option value="pc">PC</option><option value="npc">NPC</option>
+          <option value="companion">Companion</option><option value="antagonist">Antagonist</option>
+        </select>
+      </div>
+      <div class="field"><label>Location</label><input id="cf_loc" placeholder="place slug..." oninput="loadCharacters()" /></div>
+      <div class="field"><label>Has Item</label><input id="cf_item" placeholder="item name or tag..." oninput="loadCharacters()" /></div>
+      <div class="field"><label>Has Skill</label><input id="cf_skill" placeholder="skill name..." oninput="loadCharacters()" /></div>
+      <div class="field"><label>Has Technique</label><input id="cf_tech" placeholder="technique or spell..." oninput="loadCharacters()" /></div>
+      <div class="field"><label>Has Condition</label><input id="cf_cond" placeholder="buff, injury, curse..." oninput="loadCharacters()" /></div>
+      <div class="field"><label>Faction / Tag</label><input id="cf_faction" placeholder="faction name..." oninput="loadCharacters()" /></div>
+      <div class="row">
+        <button class="sm" onclick="clearCharFilters()">Reset</button>
+        <button class="sm primary" onclick="openModal('modalChar')">+ Character</button>
+      </div>
+    </div>
+
+    <div class="split">
+      <div>
+        <div class="muted" style="margin-bottom:8px; font-size:12px;" id="charCountLabel">Loading...</div>
+        <div id="charList"></div>
+      </div>
+      <div id="charDetail" class="card">
+        <div class="muted">Select a character on the left to inspect their Initial Profile, live Current Status, and Event Log.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========================================================= PLACES -->
+  <section id="tab-places" class="tab-pane">
+    <div class="filter-bar">
+      <div class="field"><label>Search Text</label><input id="pf_query" placeholder="Name, notes..." oninput="loadPlaces()" /></div>
+      <div class="field"><label>Type</label><input id="pf_type" placeholder="settlement, wilderness..." oninput="loadPlaces()" /></div>
+      <div class="field"><label>Terrain</label><input id="pf_terrain" placeholder="basalt, forest..." oninput="loadPlaces()" /></div>
+      <div class="field"><label>Weather</label><input id="pf_weather" placeholder="mist, wind..." oninput="loadPlaces()" /></div>
+      <div class="field"><label>Season Effect</label><input id="pf_season" placeholder="frost, ash..." oninput="loadPlaces()" /></div>
+      <div class="field"><label>Has Landmark</label><input id="pf_landmark" placeholder="landmark name..." oninput="loadPlaces()" /></div>
+      <div class="field"><label>Landmark Status</label><input id="pf_lstatus" placeholder="Intact, Sealed, Ruined..." oninput="loadPlaces()" /></div>
+      <div class="field"><label>Has Character</label><input id="pf_char" placeholder="character slug..." oninput="loadPlaces()" /></div>
+      <div class="row">
+        <button class="sm" onclick="clearPlaceFilters()">Reset</button>
+        <button class="sm primary" onclick="openModal('modalPlace')">+ Place</button>
+      </div>
+    </div>
+
+    <div class="split">
+      <div>
+        <div class="muted" style="margin-bottom:8px; font-size:12px;" id="placeCountLabel">Loading...</div>
+        <div id="placeList"></div>
+      </div>
+      <div id="placeDetail" class="card">
+        <div class="muted">Select a place to view Baseline Geography, Seasonal Profiles, Live Status, Landmarks, and History.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========================================================= ITEMS & RELICS -->
+  <section id="tab-items" class="tab-pane">
+    <div class="filter-bar">
+      <div class="field"><label>Full-Text Search</label><input id="if_query" placeholder="Name, maker, significance..." oninput="loadItems()" /></div>
+      <div class="field"><label>Item Type</label><input id="if_type" placeholder="weapon, tool, artifact, book, keepsake..." oninput="loadItems()" /></div>
+      <div class="field"><label>Current Holder / Loc</label><input id="if_holder" placeholder="character or place slug..." oninput="loadItems()" /></div>
+      <div class="field"><label>Previous Owner</label><input id="if_owner" placeholder="former owner name/slug..." oninput="loadItems()" /></div>
+      <div class="field"><label>Condition</label><input id="if_cond" placeholder="Intact, Chipped, Sealed..." oninput="loadItems()" /></div>
+      <div class="field"><label>Linked Text?</label>
+        <select id="if_text" onchange="loadItems()">
+          <option value="">Any</option>
+          <option value="true">Readable Books / Manuals</option>
+          <option value="false">Non-Text Gear / Relics</option>
+        </select>
+      </div>
+      <div class="row">
+        <button class="sm" onclick="clearItemFilters()">Reset</button>
+        <button class="sm primary" onclick="openModal('modalItem')">+ Catalog Item</button>
+      </div>
+    </div>
+
+    <div class="split">
+      <div>
+        <div class="muted" style="margin-bottom:8px; font-size:12px;" id="itemCountLabel">Loading...</div>
+        <div id="itemList"></div>
+      </div>
+      <div id="itemDetail" class="card">
+        <div class="muted">Select a carryable item, artifact, weapon, tool, keepsake, or book to inspect its provenance, ownership chain, and historical chronicle.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========================================================= ENTITY HISTORIES -->
+  <section id="tab-histories" class="tab-pane">
+    <div class="filter-bar">
+      <div class="field"><label>Full-Text Search</label><input id="hf_query" placeholder="Founding, battle, schism, forging..." oninput="loadHistories()" /></div>
+      <div class="field"><label>Entity ID</label><input id="hf_entity" placeholder="place, sect, item, or char slug..." oninput="loadHistories()" /></div>
+      <div class="field"><label>Entity Kind</label>
+        <select id="hf_kind" onchange="loadHistories()">
+          <option value="">All Kinds</option>
+          <option value="place">Place</option>
+          <option value="establishment">Establishment</option>
+          <option value="sect">Sect</option>
+          <option value="faction">Faction</option>
+          <option value="item">Item / Relic</option>
+          <option value="text">Book / Manual / Record</option>
+          <option value="character">Character</option>
+          <option value="lore">Lore / World</option>
+        </select>
+      </div>
+      <div class="field"><label>Era / Date</label><input id="hf_era" placeholder="First Age, Year 112..." oninput="loadHistories()" /></div>
+      <div class="field"><label>Visibility</label>
+        <select id="hf_vis" onchange="loadHistories()">
+          <option value="">All</option>
+          <option value="public">Public</option>
+          <option value="rumor">Rumor</option>
+          <option value="gm_secret">GM Secret</option>
+        </select>
+      </div>
+      <div class="row">
+        <button class="sm" onclick="clearHistoryFilters()">Reset</button>
+        <button class="sm primary" onclick="openHistoryModal()">+ Record History</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>
+        <span id="historyHeading">Historical Chronicles (Places, Establishments, Sects &amp; Items)</span>
+      </h2>
+      <div id="historyTable"></div>
+    </div>
+  </section>
+
+  <!-- ========================================================= LORE -->
+  <section id="tab-lore" class="tab-pane">
+    <div class="filter-bar">
+      <div class="field"><label>Full-Text Search</label><input id="lf_query" placeholder="FTS5 search..." oninput="loadLore()" /></div>
+      <div class="field"><label>Category</label><input id="lf_cat" placeholder="magic-system, factions..." oninput="loadLore()" /></div>
+      <div class="field"><label>Visibility</label>
+        <select id="lf_vis" onchange="loadLore()">
+          <option value="">All</option><option value="public">Public</option>
+          <option value="rumor">Rumor</option><option value="gm_secret">GM Secret</option>
+        </select>
+      </div>
+      <div class="field"><label>Trigger Keyword</label><input id="lf_kw" placeholder="keyword..." oninput="loadLore()" /></div>
+      <div class="field"><label>Related Entity</label><input id="lf_rel" placeholder="entity slug..." oninput="loadLore()" /></div>
+      <div class="row">
+        <button class="sm" onclick="clearLoreFilters()">Reset</button>
+        <button class="sm primary" onclick="openModal('modalLore')">+ Lore Entry</button>
+      </div>
+    </div>
+
+    <div class="split">
+      <div>
+        <div class="muted" style="margin-bottom:8px; font-size:12px;" id="loreCountLabel">Loading...</div>
+        <div id="loreList"></div>
+      </div>
+      <div id="loreDetail" class="card">
+        <div class="muted">Select a world-building / lore entry to inspect.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========================================================= BOOKS & SCROLLS -->
+  <section id="tab-texts" class="tab-pane">
+    <div class="filter-bar">
+      <div class="field"><label>Full-Text Search</label><input id="tf_query" placeholder="Title, passage, ritual..." oninput="loadTexts()" /></div>
+      <div class="field"><label>Medium</label><input id="tf_medium" placeholder="book, scroll, grimoire..." oninput="loadTexts()" /></div>
+      <div class="field"><label>Subject</label><input id="tf_subject" placeholder="history, spell-ritual..." oninput="loadTexts()" /></div>
+      <div class="field"><label>Language</label><input id="tf_lang" placeholder="Common, Runic..." oninput="loadTexts()" /></div>
+      <div class="field"><label>Read Status</label>
+        <select id="tf_status" onchange="loadTexts()">
+          <option value="">All</option>
+          <option value="undiscovered">Undiscovered</option>
+          <option value="discovered_unread">Discovered (Unread)</option>
+          <option value="partially_read">Partially Read</option>
+          <option value="read">Read</option>
+          <option value="deciphered">Deciphered</option>
+        </select>
+      </div>
+      <div class="field"><label>Read By</label><input id="tf_reader" placeholder="character slug..." oninput="loadTexts()" /></div>
+      <div class="field"><label>Holder / Location</label><input id="tf_holder" placeholder="place or character slug..." oninput="loadTexts()" /></div>
+      <div class="row">
+        <button class="sm" onclick="clearTextFilters()">Reset</button>
+        <button class="sm primary" onclick="openModal('modalText')">+ Book / Scroll</button>
+      </div>
+    </div>
+
+    <div class="split">
+      <div>
+        <div class="muted" style="margin-bottom:8px; font-size:12px;" id="textCountLabel">Loading...</div>
+        <div id="textList"></div>
+      </div>
+      <div id="textDetail" class="card">
+        <div class="muted">Select a book, scroll, grimoire, or ritual text to read and track its study history.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========================================================= ATTACHED DOCS & MEDIA -->
+  <section id="tab-attachments" class="tab-pane">
+    <div class="filter-bar">
+      <div class="field"><label>Full-Text Search</label><input id="af_query" placeholder="Title, filename, notes..." oninput="loadAttachments()" /></div>
+      <div class="field"><label>Category</label><input id="af_cat" placeholder="map, handout, portrait, rules..." oninput="loadAttachments()" /></div>
+      <div class="field"><label>MIME Type</label><input id="af_mime" placeholder="image/, pdf, markdown..." oninput="loadAttachments()" /></div>
+      <div class="field"><label>Visibility</label>
+        <select id="af_vis" onchange="loadAttachments()">
+          <option value="">All</option><option value="public">Public</option>
+          <option value="rumor">Rumor</option><option value="gm_secret">GM Secret</option>
+        </select>
+      </div>
+      <div class="field"><label>Related Entity</label><input id="af_rel" placeholder="entity slug..." oninput="loadAttachments()" /></div>
+      <div class="row">
+        <button class="sm" onclick="clearAttachmentFilters()">Reset</button>
+        <button class="sm primary" onclick="openModal('modalAttachment')">+ Attach File</button>
+      </div>
+    </div>
+
+    <div class="split">
+      <div>
+        <div class="muted" style="margin-bottom:8px; font-size:12px;" id="attachCountLabel">Loading...</div>
+        <div id="attachList"></div>
+      </div>
+      <div id="attachDetail" class="card">
+        <div class="muted">Select an attached reference doc, map, handout, or portrait to inspect its addressable path and preview.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========================================================= GRAPH -->
+  <section id="tab-graph" class="tab-pane">
+    <div class="filter-bar">
+      <div class="field"><label>Entity (Center)</label><input id="gf_entity" placeholder="entity slug..." oninput="loadGraph()" /></div>
+      <div class="field"><label>Hops</label>
+        <select id="gf_hops" onchange="loadGraph()">
+          <option value="1">1 Hop</option><option value="2">2 Hops</option><option value="3">3 Hops</option>
+        </select>
+      </div>
+      <div class="field"><label>Relation Type</label><input id="gf_type" placeholder="ALLIED_WITH..." oninput="loadGraph()" /></div>
+      <div class="field"><label>Min Strength</label><input id="gf_min" type="number" placeholder="-100" oninput="loadGraph()" /></div>
+      <div class="field"><label>Search Notes</label><input id="gf_q" placeholder="keyword..." oninput="loadGraph()" /></div>
+      <button class="sm primary" onclick="openModal('modalRelation')">+ Relation</button>
+    </div>
+    <div class="card">
+      <h3>Interactive Relationship Graph</h3>
+      <svg id="graphSvg" viewBox="0 0 900 340"></svg>
+    </div>
+    <div class="card">
+      <h3>Matching Relations</h3>
+      <div id="graphTable"></div>
+    </div>
+  </section>
+
+  <!-- ========================================================= TIMELINE -->
+  <section id="tab-timeline" class="tab-pane">
+    <div class="filter-bar">
+      <div class="field"><label>Full-Text Search</label><input id="ef_query" placeholder="shrine, damage..." oninput="loadTimeline()" /></div>
+      <div class="field"><label>Entity</label><input id="ef_entity" placeholder="character/place slug..." oninput="loadTimeline()" /></div>
+      <div class="field"><label>Location</label><input id="ef_loc" placeholder="place slug..." oninput="loadTimeline()" /></div>
+      <div class="field"><label>Event Type</label><input id="ef_type" placeholder="resource_changed, movement..." oninput="loadTimeline()" /></div>
+      <div class="field"><label>World Time / Season</label><input id="ef_time" placeholder="Autumn, Y412..." oninput="loadTimeline()" /></div>
+      <div class="field"><label>Session #</label><input id="ef_sess" type="number" placeholder="1" oninput="loadTimeline()" /></div>
+      <button class="sm" onclick="clearEventFilters()">Reset</button>
+    </div>
+    <div class="card">
+      <h2>
+        <span id="timelineHeading">Campaign Event Ledger</span>
+        <span class="muted" style="font-size:12px;">Click "Rewind" on any event to safely rollback (auto-creates DB backup)</span>
+      </h2>
+      <div id="timelineTable"></div>
+    </div>
+  </section>
+
+  <!-- ========================================================= DIAGNOSTICS & CLEANUP -->
+  <section id="tab-diagnostics" class="tab-pane">
+    <div class="card">
+      <h2>
+        <span id="diagHeading">Campaign Health, Mislabeled Data &amp; Cleanup</span>
+        <div class="row">
+          <button class="sm primary" onclick="loadDiagnostics()">Run Diagnostics</button>
+          <button class="sm" onclick="runCleanupUi(true)">Preview Cleanup (Dry Run)</button>
+          <button class="sm" onclick="runCleanupUi(false)">Apply Safe Cleanup</button>
+        </div>
+      </h2>
+      <div id="diagSummary" class="row" style="margin-bottom:12px;"></div>
+      <div id="diagCleanupOut" class="pre-box" style="display:none; margin-bottom:12px;"></div>
+      <div id="diagFindings"></div>
+    </div>
+
+    <div class="grid-3">
+      <div class="card">
+        <h3>Reclassify / Move Register</h3>
+        <div class="form-grid">
+          <label>From Register
+            <select id="rc_from">
+              <option value="lore">Lore</option><option value="text">Book / Scroll</option>
+              <option value="item">Carryable Item</option><option value="attachment">Attachment</option>
+              <option value="history">History</option>
+            </select>
+          </label>
+          <label>To Register
+            <select id="rc_to">
+              <option value="text">Book / Scroll</option><option value="item">Carryable Item</option>
+              <option value="place">Place / Establishment</option><option value="character">Character / NPC</option>
+              <option value="history">Entity History</option><option value="lore">Lore</option>
+            </select>
+          </label>
+          <label class="full">Entity ID (slug or history #)<input id="rc_id" placeholder="mislabeled-slug" /></label>
+          <label>New Slug (optional)<input id="rc_new_id" placeholder="leave blank to keep" /></label>
+          <label>Target Entity (if moving to History)<input id="rc_hist_target" placeholder="place/sect/item slug" /></label>
+          <label class="full">Reason<input id="rc_reason" placeholder="Moved to correct register" /></label>
+        </div>
+        <div class="row" style="margin-top:10px; justify-content:flex-end;">
+          <button class="sm primary" onclick="submitReclassify()">Move to Target Register</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Rename Slug / Merge Duplicate</h3>
+        <div class="form-grid">
+          <label>Register
+            <select id="rm_reg">
+              <option value="character">Character</option><option value="place">Place</option>
+              <option value="item">Carryable Item</option><option value="text">Book / Scroll</option>
+              <option value="lore">Lore</option><option value="attachment">Attachment</option>
+            </select>
+          </label>
+          <label style="flex-direction:row; align-items:center; gap:6px; padding-top:18px;">
+            <input id="rm_merge" type="checkbox" style="width:auto;" /> Merge if target exists
+          </label>
+          <label>Old / Duplicate Slug *<input id="rm_old" placeholder="duplicate-slug" /></label>
+          <label>Canonical New Slug *<input id="rm_new" placeholder="canonical-slug" /></label>
+          <label class="full">Reason<input id="rm_reason" placeholder="Merged duplicate / standardized slug" /></label>
+        </div>
+        <div class="row" style="margin-top:10px; justify-content:flex-end;">
+          <button class="sm primary" onclick="submitRenameOrMerge()">Rename / Merge</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Delete Miscreated / Obsolete Record</h3>
+        <div class="form-grid">
+          <label>Register
+            <select id="del_reg">
+              <option value="lore">Lore</option><option value="item">Carryable Item</option>
+              <option value="text">Book / Scroll</option><option value="history">History (#)</option>
+              <option value="attachment">Attachment</option><option value="clock">Clock</option>
+              <option value="place">Place</option><option value="character">Character</option>
+            </select>
+          </label>
+          <label>Entity ID *<input id="del_id" placeholder="slug or history #" /></label>
+          <label class="full">Reason<input id="del_reason" placeholder="Duplicate / erroneous entry" /></label>
+        </div>
+        <div class="row" style="margin-top:10px; justify-content:flex-end;">
+          <button class="sm danger" onclick="submitDeleteEntity()">Delete Record</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========================================================= AI CONTEXT -->
+  <section id="tab-ai" class="tab-pane">
+    <div class="grid-2">
+      <div class="card">
+        <h3>AI Scene Context Simulator (`get_scene_context`)</h3>
+        <div class="form-grid">
+          <label>Active Place (slug or name)
+            <input id="ai_place" placeholder="place slug or name..." />
+          </label>
+          <label>Extra Characters (comma-separated)
+            <input id="ai_chars" placeholder="character slugs..." />
+          </label>
+          <label class="full">Simulated Player Input / Scene Text (triggers Lorebook &amp; Books/Scrolls keywords + FTS5)
+            <textarea id="ai_scene" rows="3" placeholder="Enter player action or scene prompt to test context &amp; lore triggers..."></textarea>
+          </label>
+          <label>Format
+            <select id="ai_fmt">
+              <option value="markdown">Compact Markdown (~40% fewer tokens)</option>
+              <option value="json">Structured JSON Packet</option>
+            </select>
+          </label>
+          <label>Include GM Secrets?
+            <select id="ai_secrets"><option value="true">Yes (GM View)</option><option value="false">No (Player-Safe View)</option></select>
+          </label>
+        </div>
+        <div class="row" style="margin-top:12px;">
+          <button class="primary" onclick="runAiContext()">Assemble Context</button>
+          <button onclick="copyAiOutput()">Copy Output</button>
+          <span class="muted" id="aiStats" style="font-size:12px;"></span>
+        </div>
+        <div id="aiContextOutput" class="pre-box" style="margin-top:12px;">Click "Assemble Context" to preview what your AI GM receives.</div>
+      </div>
+
+      <div class="card">
+        <h3>Universal AI Compatibility &amp; Tool Schemas</h3>
+        <p class="muted" style="margin-top:0;">Chronicle works natively with <strong>MCP</strong> (Antigravity, Claude, Cursor), <strong>OpenAI Function Calling</strong>, <strong>Anthropic Tool Use</strong>, and <strong>OpenAPI 3.1 REST</strong>.</p>
+        <div class="row" style="margin-bottom:10px;">
+          <button class="sm" onclick="loadToolSchema('mcp')">MCP Schema</button>
+          <button class="sm" onclick="loadToolSchema('openai')">OpenAI Tools</button>
+          <button class="sm" onclick="loadToolSchema('anthropic')">Anthropic Tools</button>
+          <button class="sm" onclick="loadOpenApi()">OpenAPI 3.1</button>
+          <button class="sm primary" onclick="copySchemaBox()">Copy Schema</button>
+        </div>
+        <div id="schemaOutput" class="pre-box">Select a schema format above to inspect or copy.</div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<!-- ========================================================= MODALS -->
+<div class="modal-bg" id="modalChar"><div class="modal">
+  <h2>Create Character (Initial Baseline)</h2>
+  <div class="form-grid">
+    <label>Name *<input id="nc_name" /></label>
+    <label>Title<input id="nc_title" /></label>
+    <label>Kind<select id="nc_kind"><option value="pc">PC</option><option value="npc">NPC</option><option value="companion">Companion</option><option value="antagonist">Antagonist</option></select></label>
+    <label>Archetype / Role<input id="nc_arch" /></label>
+    <label>Origin / Species<input id="nc_origin" /></label>
+    <label>Faction<input id="nc_faction" /></label>
+    <label>Starting Location (place slug)<input id="nc_loc" /></label>
+    <label>Initial HP (current/max)<input id="nc_hp" value="30" type="number" /></label>
+    <label class="full">Appearance<input id="nc_app" /></label>
+    <label class="full">Backstory<textarea id="nc_back" rows="2"></textarea></label>
+    <label class="full">Tags (comma-separated)<input id="nc_tags" placeholder="pc, scout" /></label>
+  </div>
+  <div class="row" style="margin-top:14px; justify-content:flex-end;">
+    <button onclick="closeModals()">Cancel</button>
+    <button class="primary" onclick="submitNewChar()">Create Character</button>
+  </div>
+</div></div>
+
+<div class="modal-bg" id="modalPlace"><div class="modal">
+  <h2>Create Place (Geography &amp; Seasons)</h2>
+  <div class="form-grid">
+    <label>Name *<input id="np_name" /></label>
+    <label>Place Type<input id="np_type" value="settlement" /></label>
+    <label>Terrain<input id="np_terrain" placeholder="Basalt ridge, forest..." /></label>
+    <label>Climate<input id="np_climate" placeholder="Subalpine..." /></label>
+    <label>Initial Weather<input id="np_weather" placeholder="Clear" /></label>
+    <label>Danger Level<input id="np_danger" value="Moderate" /></label>
+    <label>Controlling Faction<input id="np_faction" /></label>
+    <label>Parent Region (slug)<input id="np_parent" /></label>
+    <label class="full">Description<textarea id="np_desc" rows="2"></textarea></label>
+    <label>Spring Effect<input id="np_s_spring" /></label>
+    <label>Summer Effect<input id="np_s_summer" /></label>
+    <label>Autumn Effect<input id="np_s_autumn" /></label>
+    <label>Winter Effect<input id="np_s_winter" /></label>
+  </div>
+  <div class="row" style="margin-top:14px; justify-content:flex-end;">
+    <button onclick="closeModals()">Cancel</button>
+    <button class="primary" onclick="submitNewPlace()">Create Place</button>
+  </div>
+</div></div>
+
+<div class="modal-bg" id="modalLore"><div class="modal">
+  <h2>Create / Update World-Building Lore</h2>
+  <div class="form-grid">
+    <label>Title *<input id="nl_title" /></label>
+    <label>Category<input id="nl_cat" value="world" placeholder="magic-system, factions, history..." /></label>
+    <label>Visibility<select id="nl_vis"><option value="public">Public</option><option value="rumor">Rumor</option><option value="gm_secret">GM Secret</option></select></label>
+    <label>Always Include?<select id="nl_always"><option value="false">No (Keyword/FTS5 Triggered)</option><option value="true">Yes (Core World Law)</option></select></label>
+    <label class="full">Summary<input id="nl_summary" /></label>
+    <label class="full">Auto-Trigger Keywords (comma-separated)<input id="nl_kw" placeholder="keyword1, keyword2..." /></label>
+    <label class="full">Related Entity Slugs (comma-separated)<input id="nl_rel" placeholder="entity-slug-1, entity-slug-2..." /></label>
+    <label class="full">Lore Body (Markdown) *<textarea id="nl_body" rows="6"></textarea></label>
+  </div>
+  <div class="row" style="margin-top:14px; justify-content:flex-end;">
+    <button onclick="closeModals()">Cancel</button>
+    <button class="primary" onclick="submitNewLore()">Save Lore</button>
+  </div>
+</div></div>
+
+<div class="modal-bg" id="modalClock"><div class="modal">
+  <h2>Create Progress Clock</h2>
+  <div class="form-grid">
+    <label>Name *<input id="ncl_name" /></label>
+    <label>Kind<select id="ncl_kind"><option value="quest">Quest</option><option value="threat">Threat</option><option value="faction">Faction</option><option value="ritual">Ritual</option><option value="training">Training</option></select></label>
+    <label>Segments<input id="ncl_seg" type="number" value="6" /></label>
+    <label>Initial Filled<input id="ncl_fill" type="number" value="0" /></label>
+    <label class="full">Description<textarea id="ncl_desc" rows="2"></textarea></label>
+  </div>
+  <div class="row" style="margin-top:14px; justify-content:flex-end;">
+    <button onclick="closeModals()">Cancel</button>
+    <button class="primary" onclick="submitNewClock()">Create Clock</button>
+  </div>
+</div></div>
+
+<div class="modal-bg" id="modalRelation"><div class="modal">
+  <h2>Add / Update Knowledge Graph Relation</h2>
+  <div class="form-grid">
+    <label>Source ID *<input id="nr_src" placeholder="source-slug" /></label>
+    <label>Relation Type *<input id="nr_type" placeholder="ALLIED_WITH, ENEMY_OF..." /></label>
+    <label>Target ID *<input id="nr_tgt" placeholder="target-slug" /></label>
+    <label>Strength (-100 to +100)<input id="nr_str" type="number" placeholder="25" /></label>
+    <label class="full">Notes<textarea id="nr_notes" rows="2"></textarea></label>
+  </div>
+  <div class="row" style="margin-top:14px; justify-content:flex-end;">
+    <button onclick="closeModals()">Cancel</button>
+    <button class="primary" onclick="submitNewRelation()">Save Relation</button>
+  </div>
+</div></div>
+
+<div class="modal-bg" id="modalText"><div class="modal">
+  <h2>Catalog Book, Scroll, Grimoire, or Ritual Text</h2>
+  <div class="form-grid">
+    <label>Title *<input id="nt_title" placeholder="Codex of First-Age Rituals" /></label>
+    <label>Medium<select id="nt_medium">
+      <option value="book">Book</option><option value="scroll">Scroll</option><option value="grimoire">Grimoire</option>
+      <option value="ritual-manual">Ritual Manual</option><option value="tablet">Tablet</option><option value="journal">Journal</option>
+      <option value="letter">Letter</option><option value="inscription">Inscription</option>
+    </select></label>
+    <label>Subject<input id="nt_subject" value="history" placeholder="history, spell-ritual, prophecy..." /></label>
+    <label>Author<input id="nt_author" placeholder="Unknown" /></label>
+    <label>Language / Script<input id="nt_lang" value="Common" /></label>
+    <label>Physical Condition<input id="nt_cond" value="Intact" /></label>
+    <label>Read Status<select id="nt_status">
+      <option value="undiscovered">Undiscovered</option><option value="discovered_unread">Discovered (Unread)</option>
+      <option value="partially_read">Partially Read</option><option value="read">Read</option><option value="deciphered">Deciphered</option>
+    </select></label>
+    <label>Holder / Location (slug)<input id="nt_holder" placeholder="place or character slug" /></label>
+    <label class="full">Outward Summary (visible before reading)<input id="nt_summary" /></label>
+    <label class="full">Readable In-World Text / Passages / Ritual Steps (Markdown) *<textarea id="nt_content" rows="6"></textarea></label>
+    <label class="full">Unlocks / Ritual Effects (one per line)<textarea id="nt_unlocks" rows="2" placeholder="Reveals ritual components for ..."></textarea></label>
+    <label class="full">GM Notes (hidden cipher DCs, traps, historical bias)<input id="nt_gm" /></label>
+    <label>Trigger Keywords (comma-separated)<input id="nt_kw" /></label>
+    <label>Related Entity Slugs (comma-separated)<input id="nt_rel" /></label>
+  </div>
+  <div class="row" style="margin-top:14px; justify-content:flex-end;">
+    <button onclick="closeModals()">Cancel</button>
+    <button class="primary" onclick="submitNewText()">Save Book / Scroll</button>
+  </div>
+</div></div>
+
+<div class="modal-bg" id="modalAttachment"><div class="modal">
+  <h2>Attach File OR Create Pasted Reference Doc</h2>
+  <div class="form-grid">
+    <label>Title *<input id="na_title" placeholder="Region Map / Treaty Handout / Pasted Notes" /></label>
+    <label>Category<select id="na_cat">
+      <option value="world-doc">World Doc</option><option value="map">Map</option><option value="handout">Handout</option>
+      <option value="portrait">Portrait</option><option value="rules">Rules</option><option value="notes">Notes</option>
+      <option value="audio">Audio</option><option value="other">Other</option>
+    </select></label>
+    <label class="full">Upload File from Computer (copied into docs/attachments/files/)
+      <input id="na_file" type="file" />
+    </label>
+    <label class="full">OR Copy Existing Local Path on Disk
+      <input id="na_src" placeholder="/path/to/attached-file.pdf" />
+    </label>
+    <label class="full">OR Paste / Write New Reference Content (creates file if missing via create_reference_doc)
+      <textarea id="na_text_content" rows="4" placeholder="Paste reference text, handouts, lore excerpts, or house rules here..."></textarea>
+    </label>
+    <label>Filename (for pasted doc, optional)<input id="na_filename" placeholder="e.g. sect-charter.md" /></label>
+    <label style="flex-direction:row; align-items:center; gap:8px; padding-top:18px;">
+      <input id="na_append" type="checkbox" style="width:auto;" /> Append if document already exists
+    </label>
+    <label>Visibility<select id="na_vis"><option value="public">Public</option><option value="rumor">Rumor</option><option value="gm_secret">GM Secret</option></select></label>
+    <label>Related Entity Slugs (comma-separated)<input id="na_rel" placeholder="place-slug, char-slug" /></label>
+    <label class="full">Summary &amp; Story Relevance<input id="na_summary" /></label>
+    <label class="full">Extracted Key Notes (searchable via FTS5)<textarea id="na_notes" rows="2"></textarea></label>
+    <label class="full">Trigger Keywords (comma-separated)<input id="na_kw" /></label>
+  </div>
+  <div class="row" style="margin-top:14px; justify-content:flex-end;">
+    <button onclick="closeModals()">Cancel</button>
+    <button class="primary" onclick="submitNewAttachment()">Save / Attach Doc</button>
+  </div>
+</div></div>
+
+<div class="modal-bg" id="modalItem"><div class="modal">
+  <h2>Catalog Carryable Item, Artifact, Weapon, Tool, Book or Keepsake</h2>
+  <div class="form-grid">
+    <label>Name *<input id="ni_name" placeholder="Ancestral Lantern / Iron Ledger..." /></label>
+    <label>Item Type<select id="ni_type">
+      <option value="artifact">Artifact</option><option value="weapon">Weapon</option><option value="armor">Armor</option>
+      <option value="tool">Tool</option><option value="keepsake">Keepsake</option><option value="book">Book</option>
+      <option value="manual">Manual</option><option value="record">Record</option><option value="scroll">Scroll</option>
+      <option value="consumable">Consumable</option><option value="key">Key</option><option value="other">Other</option>
+    </select></label>
+    <label>Rarity / Tier<input id="ni_rarity" placeholder="Common, Heirloom, Relic..." /></label>
+    <label>Condition / Durability<input id="ni_cond" value="Intact" /></label>
+    <label>Current Holder or Place (slug)<input id="ni_holder" placeholder="character or place slug" /></label>
+    <label>Equipment Slot (optional)<input id="ni_slot" placeholder="Main Hand, Pack, Neck..." /></label>
+    <label class="full">Origin &amp; Maker<input id="ni_origin" placeholder="Who crafted it, when, and where..." /></label>
+    <label class="full">Previous Owners (comma-separated, chronological)<input id="ni_prev" placeholder="Founder X, Elder Y..." /></label>
+    <label class="full">Description<textarea id="ni_desc" rows="2"></textarea></label>
+    <label class="full">Story Significance &amp; Provenance Notes<textarea id="ni_sig" rows="2"></textarea></label>
+    <label class="full">Properties &amp; Effects (one per line)<textarea id="ni_props" rows="2"></textarea></label>
+    <label>Linked StoryText ID (optional)<input id="ni_text" placeholder="book/scroll slug" /></label>
+    <label>Trigger Keywords (comma-separated)<input id="ni_kw" /></label>
+    <label class="full">GM Notes (hidden curses, true makers)<input id="ni_gm" /></label>
+  </div>
+  <div class="row" style="margin-top:14px; justify-content:flex-end;">
+    <button onclick="closeModals()">Cancel</button>
+    <button class="primary" onclick="submitNewItem()">Save Item</button>
+  </div>
+</div></div>
+
+<div class="modal-bg" id="modalHistory"><div class="modal">
+  <h2>Record Historical Chronicle Entry</h2>
+  <div class="form-grid">
+    <label>Target Entity ID *<input id="nh_entity" placeholder="place, establishment, sect, or item slug" /></label>
+    <label>Entity Kind<select id="nh_kind">
+      <option value="place">Place</option><option value="establishment">Establishment</option>
+      <option value="sect">Sect</option><option value="faction">Faction</option>
+      <option value="item">Item / Relic</option><option value="text">Book / Manual / Record</option>
+      <option value="character">Character</option><option value="lore">Lore / World</option>
+    </select></label>
+    <label>Era / Date *<input id="nh_era" placeholder="First Age, Year 214, Winter..." /></label>
+    <label>Sort Order (optional integer)<input id="nh_order" type="number" value="0" /></label>
+    <label class="full">Title *<input id="nh_title" placeholder="Founding of the Sect / Shattering of the Blade..." /></label>
+    <label class="full">Historical Details *<textarea id="nh_details" rows="4"></textarea></label>
+    <label class="full">Lasting Significance / Impact<input id="nh_sig" placeholder="Why this event still matters today..." /></label>
+    <label>Visibility<select id="nh_vis"><option value="public">Public</option><option value="rumor">Rumor</option><option value="gm_secret">GM Secret</option></select></label>
+    <label>Related Entity Slugs (comma-separated)<input id="nh_rel" placeholder="char-slug, place-slug" /></label>
+  </div>
+  <div class="row" style="margin-top:14px; justify-content:flex-end;">
+    <button onclick="closeModals()">Cancel</button>
+    <button class="primary" onclick="submitNewHistory()">Record History</button>
+  </div>
+</div></div>
+
+<div class="modal-bg" id="modalSession"><div class="modal">
+  <h2>Start New Session</h2>
+  <div class="form-grid">
+    <label class="full">Session Title *<input id="ns_title" placeholder="Session title..." /></label>
+    <label class="full">Recap / Summary<textarea id="ns_summary" rows="3"></textarea></label>
+  </div>
+  <div class="row" style="margin-top:14px; justify-content:flex-end;">
+    <button onclick="closeModals()">Cancel</button>
+    <button class="primary" onclick="submitNewSession()">Start Session</button>
+  </div>
+</div></div>
+
+<div class="modal-bg" id="modalRest"><div class="modal">
+  <h2>Party Rest</h2>
+  <div class="form-grid">
+    <label class="full">Character IDs (comma-separated) *<input id="rest_chars" placeholder="character slugs..." /></label>
+    <label>Rest Type<select id="rest_type"><option value="long">Long Rest (8h, 100%)</option><option value="short">Short Rest (1h, 50%)</option></select></label>
+    <label>Clear Conditions (comma-separated)<input id="rest_conds" placeholder="condition names..." /></label>
+    <label class="full">Notes<input id="rest_notes" placeholder="Where/how the party rested..." /></label>
+  </div>
+  <div class="row" style="margin-top:14px; justify-content:flex-end;">
+    <button onclick="closeModals()">Cancel</button>
+    <button class="primary" onclick="submitRest()">Apply Rest</button>
+  </div>
+</div></div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+let STATE = { status: null, selectedChar: null, selectedPlace: null, selectedItem: null, selectedLore: null, selectedText: null, selectedAttachment: null, maxSeq: 1 };
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, opts);
+  const ct = res.headers.get("content-type") || "";
+  const data = ct.includes("application/json") ? await res.json() : await res.text();
+  if (!res.ok) throw new Error(data.error || data || res.statusText);
+  return data;
+}
+
+async function callTool(name, args = {}) {
+  return api(`/api/tool/${encodeURIComponent(name)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(args)
+  });
+}
+
+function toast(msg) {
+  const el = document.getElementById("toast");
+  el.textContent = msg;
+  el.style.display = "block";
+  clearTimeout(window._toastTimer);
+  window._toastTimer = setTimeout(() => el.style.display = "none", 3200);
+}
+
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, m => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[m]));
+}
+
+function switchTab(name) {
+  document.querySelectorAll("nav.tabs button").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
+  document.querySelectorAll(".tab-pane").forEach(p => p.classList.toggle("active", p.id === "tab-" + name));
+  if (name === "characters") loadCharacters();
+  if (name === "places") loadPlaces();
+  if (name === "items") loadItems();
+  if (name === "histories") loadHistories();
+  if (name === "lore") loadLore();
+  if (name === "texts") loadTexts();
+  if (name === "attachments") loadAttachments();
+  if (name === "graph") loadGraph();
+  if (name === "timeline") loadTimeline();
+  if (name === "diagnostics") loadDiagnostics();
+}
+
+function openModal(id) { document.getElementById(id).classList.add("open"); }
+function closeModals() { document.querySelectorAll(".modal-bg").forEach(m => m.classList.remove("open")); }
+document.querySelectorAll(".modal-bg").forEach(m => m.addEventListener("click", e => { if (e.target === m) closeModals(); }));
+
+async function refreshAll() {
+  try {
+    const st = await api("/api/status");
+    STATE.status = st;
+    STATE.maxSeq = st.counts.events || 1;
+    const c = st.campaign.clock;
+    document.getElementById("campaignTitle").textContent = st.campaign.name;
+    document.getElementById("campaignSub").textContent = `Session ${st.campaign.current_session} • ${st.counts.characters} Chars • ${st.counts.places} Places • ${st.counts.catalog_items || 0} Items • ${st.counts.story_texts || 0} Texts • ${st.counts.entity_histories || 0} Histories • ${st.counts.lore_entries} Lore • ${st.counts.attachments || 0} Docs`;
+    document.getElementById("clockPill").innerHTML = `<strong>${esc(c.season)}</strong> Day ${c.day}, Y${c.year} &bull; ${String(c.hour).padStart(2,'0')}:${String(c.minute).padStart(2,'0')} &bull; ${esc(c.global_weather || 'Clear')}`;
+    const cp = document.getElementById("chainPill");
+    cp.textContent = st.ledger_hash_chain_valid ? `SHA-256 Verified (${st.counts.events} ev)` : `Chain Warning (${st.counts.events} ev)`;
+    cp.className = "chain-pill" + (st.ledger_hash_chain_valid ? "" : " bad");
+
+    document.getElementById("dashClockDetail").innerHTML =
+      `<div><strong>${esc(c.era)} Year ${c.year}, ${esc(c.season)} Day ${c.day}</strong> (${String(c.hour).padStart(2,'0')}:${String(c.minute).padStart(2,'0')})</div>
+       <div class="muted" style="margin-top:4px;">Weather: ${esc(c.global_weather || 'Clear')}</div>`;
+
+    renderDashboardClocks(st.active_clocks || []);
+    renderDashboardSummary(st);
+
+    if (document.getElementById("tab-characters").classList.contains("active")) loadCharacters();
+    if (document.getElementById("tab-places").classList.contains("active")) loadPlaces();
+    if (document.getElementById("tab-items").classList.contains("active")) loadItems();
+    if (document.getElementById("tab-histories").classList.contains("active")) loadHistories();
+    if (document.getElementById("tab-lore").classList.contains("active")) loadLore();
+    if (document.getElementById("tab-texts").classList.contains("active")) loadTexts();
+    if (document.getElementById("tab-attachments").classList.contains("active")) loadAttachments();
+    if (document.getElementById("tab-graph").classList.contains("active")) loadGraph();
+    if (document.getElementById("tab-timeline").classList.contains("active")) loadTimeline();
+    if (document.getElementById("tab-diagnostics").classList.contains("active")) loadDiagnostics();
+  } catch (e) {
+    toast("Error loading campaign: " + e.message);
+  }
+}
+
+function renderDashboardClocks(clocks) {
+  const el = document.getElementById("dashClocks");
+  if (!clocks.length) { el.innerHTML = '<div class="muted">No progress clocks yet.</div>'; return; }
+  el.innerHTML = clocks.map(cl => {
+    let segs = "";
+    for (let i = 0; i < cl.segments; i++) {
+      segs += `<div class="clock-seg ${i < cl.filled ? 'on ' + esc(cl.kind) : ''}"></div>`;
+    }
+    return `<div style="border-bottom:1px solid var(--border); padding:9px 0;">
+      <div class="row" style="justify-content:space-between;">
+        <div><strong>${esc(cl.name)}</strong> <span class="pill ${esc(cl.kind)}">${esc(cl.kind)}</span> <span class="pill">${esc(cl.status)}</span></div>
+        <div class="row">
+          <span class="mono">${cl.filled}/${cl.segments}</span>
+          <button class="sm" onclick="tickClock('${esc(cl.id)}', -1)">-1</button>
+          <button class="sm primary" onclick="tickClock('${esc(cl.id)}', 1)">+1</button>
+        </div>
+      </div>
+      <div class="clock-segs">${segs}</div>
+      <div class="muted" style="font-size:12px;">${esc(cl.description)}</div>
+    </div>`;
+  }).join("");
+}
+
+function renderDashboardSummary(st) {
+  const el = document.getElementById("dashSummary");
+  const chars = (st.characters || []).map(c =>
+    `<tr><td><a onclick="jumpToChar('${esc(c.id)}')">${esc(c.name)}</a></td><td><span class="pill ${esc(c.kind)}">${esc(c.kind)}</span></td><td>${esc(c.status)}</td><td>${c.location ? `<a onclick="jumpToPlace('${esc(c.location)}')">${esc(c.location)}</a>` : '—'}</td></tr>`
+  ).join("");
+  const places = (st.places || []).map(p =>
+    `<tr><td><a onclick="jumpToPlace('${esc(p.id)}')">${esc(p.name)}</a></td><td>${esc(p.terrain)}</td><td>${esc(p.weather)}</td><td>${(p.present_characters||[]).length} present</td></tr>`
+  ).join("");
+  el.innerHTML = `<div style="margin-bottom:12px;"><strong>Characters</strong><table><tr><th>Name</th><th>Kind</th><th>Status</th><th>Location</th></tr>${chars}</table></div>
+                  <div><strong>Places</strong><table><tr><th>Place</th><th>Terrain</th><th>Weather</th><th>Occupants</th></tr>${places}</table></div>`;
+}
+
+async function advanceTime(minutes) {
+  try {
+    const weather = document.getElementById("dashWeatherInput").value.trim() || undefined;
+    const res = await callTool("advance_time", { minutes, global_weather: weather, reason: "Updated from GM Studio" });
+    document.getElementById("dashWeatherInput").value = "";
+    toast(res.summary);
+    refreshAll();
+  } catch (e) { toast(e.message); }
+}
+
+async function tickClock(id, delta) {
+  try {
+    const res = await callTool("manage_clock", { action: "tick", clock_id: id, delta, reason: "Adjusted in GM Studio" });
+    toast(res.summary);
+    refreshAll();
+  } catch (e) { toast(e.message); }
+}
+
+async function rollDiceUi() {
+  try {
+    const expression = document.getElementById("diceExpr").value.trim();
+    const purpose = document.getElementById("dicePurpose").value.trim();
+    const res = await callTool("roll_dice", { expression, purpose, log_to_ledger: true });
+    const r = res.roll;
+    const crit = r.is_natural_max ? " [NAT MAX!]" : (r.is_natural_one ? " [NAT 1!]" : "");
+    document.getElementById("diceOutput").innerHTML =
+      `<strong style="color:var(--accent); font-size:16px;">Total: ${r.total}${crit}</strong> &nbsp; (${esc(r.expression)} &rarr; rolls [${r.rolls.join(', ')}], kept [${r.kept.join(', ')}], mod ${r.modifier >= 0 ? '+' : ''}${r.modifier})`;
+    refreshAll();
+  } catch (e) { toast(e.message); }
+}
+function quickRoll(expr) { document.getElementById("diceExpr").value = expr; rollDiceUi(); }
+
+async function quickLogEvent() {
+  try {
+    const title = document.getElementById("quickEvTitle").value.trim();
+    const details = document.getElementById("quickEvDetails").value.trim();
+    if (!title) return toast("Enter an event title first.");
+    const res = await callTool("log_event", { title, details });
+    document.getElementById("quickEvTitle").value = "";
+    document.getElementById("quickEvDetails").value = "";
+    toast(`Logged event #${res.event_seq}`);
+    refreshAll();
+  } catch (e) { toast(e.message); }
+}
+
+async function forceCompile() {
+  try {
+    const r = await callTool("compile_docs", {});
+    toast(`Compiled ${r.character_files} chars, ${r.place_files} places, ${r.item_files || 0} items, ${r.text_files || 0} texts, ${r.lore_files} lore docs.`);
+  } catch (e) { toast(e.message); }
+}
+
+// ========================================================= OMNI SEARCH
+async function runOmniSearch() {
+  const q = document.getElementById("omniInput").value.trim();
+  if (!q) return;
+  try {
+    const r = await api(`/api/search?q=${encodeURIComponent(q)}&limit=10`);
+    const card = document.getElementById("omniResultsCard");
+    card.style.display = "block";
+    document.getElementById("omniResultsTitle").textContent = `Omni-Search Results for "${q}"`;
+    let html = '<div class="grid-3">';
+    html += `<div><strong>Characters (${r.characters.length}) &amp; Places (${r.places.length})</strong><ul>` +
+      r.characters.map(c => `<li><a onclick="jumpToChar('${esc(c.id)}')">${esc(c.name)}</a> <span class="muted">(${esc(c.current_location || 'unknown')})</span></li>`).join("") +
+      r.places.map(p => `<li><a onclick="jumpToPlace('${esc(p.id)}')">${esc(p.name)}</a> <span class="muted">(${esc(p.terrain)})</span></li>`).join("") + `</ul></div>`;
+    html += `<div><strong>Items (${(r.items||[]).length}) &amp; Histories (${(r.histories||[]).length})</strong><ul>` +
+      (r.items||[]).map(it => `<li><a onclick="jumpToItem('${esc(it.id)}')">${esc(it.name)}</a> <span class="pill warn">${esc(it.item_type)}</span></li>`).join("") +
+      (r.histories||[]).map(h => `<li><a onclick="switchTab('histories'); document.getElementById('hf_entity').value='${esc(h.entity_id)}'; loadHistories();">${esc(h.title)}</a> <span class="muted">(${esc(h.entity_id)} • ${esc(h.era_or_date)})</span></li>`).join("") + `</ul></div>`;
+    html += `<div><strong>Lore (${r.lore.length}), Texts (${(r.texts||[]).length}), Docs (${(r.attachments||[]).length})</strong><ul>` +
+      r.lore.map(l => `<li><a onclick="jumpToLore('${esc(l.id)}')">${esc(l.title)}</a> <span class="pill ${esc(l.visibility)}">${esc(l.category)}</span></li>`).join("") +
+      (r.texts||[]).map(t => `<li><a onclick="jumpToText('${esc(t.id)}')">${esc(t.title)}</a> <span class="pill warn">${esc(t.medium)}</span></li>`).join("") +
+      (r.attachments||[]).map(a => `<li><a onclick="jumpToAttachment('${esc(a.id)}')">${esc(a.title)}</a> <span class="pill pc">${esc(a.category)}</span></li>`).join("") +
+      `</ul></div>`;
+    html += '</div>';
+    if (r.events.length) {
+      html += `<div style="margin-top:8px;"><strong>Matching Events (${r.events.length})</strong><ul style="font-size:12px;">` +
+        r.events.slice(-6).map(e => `<li><span class="mono">[#${e.seq}]</span> ${esc(e.summary)}</li>`).join("") + `</ul></div>`;
+    }
+    document.getElementById("omniResultsBody").innerHTML = html;
+  } catch (e) { toast(e.message); }
+}
+document.getElementById("omniInput").addEventListener("keydown", e => { if (e.key === "Enter") runOmniSearch(); });
+
+function jumpToChar(id) { switchTab("characters"); selectChar(id); }
+function jumpToPlace(id) { switchTab("places"); selectPlace(id); }
+function jumpToItem(id) { switchTab("items"); selectItem(id); }
+function jumpToLore(id) { switchTab("lore"); selectLore(id); }
+function jumpToText(id) { switchTab("texts"); selectText(id); }
+function jumpToAttachment(id) { switchTab("attachments"); selectAttachment(id); }
+
+// ========================================================= CHARACTERS
+function clearCharFilters() {
+  ["cf_query","cf_kind","cf_loc","cf_item","cf_skill","cf_tech","cf_cond","cf_faction"].forEach(i => document.getElementById(i).value = "");
+  loadCharacters();
+}
+
+async function loadCharacters() {
+  const params = new URLSearchParams();
+  const map = { query:"cf_query", kind:"cf_kind", location_id:"cf_loc", has_item:"cf_item", has_skill:"cf_skill", has_technique:"cf_tech", has_condition:"cf_cond", faction:"cf_faction" };
+  for (const [k, id] of Object.entries(map)) { const v = document.getElementById(id).value.trim(); if (v) params.set(k, v); }
+  const data = await api("/api/characters?" + params.toString());
+  document.getElementById("charCountLabel").textContent = `${data.count} matching character(s)`;
+  document.getElementById("charList").innerHTML = data.characters.map(cp => {
+    const b = cp.baseline, c = cp.current;
+    const hp = c.resources["HP"];
+    const pct = hp && hp.max > 0 ? Math.round((hp.current / hp.max) * 100) : 100;
+    const barCls = pct <= 35 ? "low" : pct <= 70 ? "mid" : "";
+    const sel = STATE.selectedChar === b.id ? "selected" : "";
+    return `<div class="roster-item ${sel}" onclick="selectChar('${esc(b.id)}')">
+      <div class="row" style="justify-content:space-between;">
+        <strong>${esc(b.name)}</strong>
+        <span class="pill ${esc(b.kind)}">${esc(b.kind)}</span>
+      </div>
+      <div class="muted" style="font-size:12px;">${esc(b.archetype || b.title || '')} &bull; @ ${esc(c.current_location || 'unknown')}</div>
+      ${hp ? `<div style="font-size:11.5px; margin-top:4px;">HP ${hp.current}/${hp.max}<div class="bar-wrap"><div class="bar-fill ${barCls}" style="width:${pct}%"></div></div></div>` : ''}
+      ${c.conditions.length ? `<div style="margin-top:6px;">${c.conditions.map(cd => `<span class="pill ${esc(cd.kind)}">${esc(cd.name)}</span>`).join(' ')}</div>` : ''}
+    </div>`;
+  }).join("") || '<div class="muted">No characters match these filters.</div>';
+
+  if (STATE.selectedChar) {
+    selectChar(STATE.selectedChar, null, true);
+  } else if (data.characters.length) {
+    selectChar(data.characters[0].baseline.id);
+  }
+}
+
+async function selectChar(id, asOfSeq = null, quiet = false) {
+  STATE.selectedChar = id;
+  if (!quiet) {
+    document.querySelectorAll("#charList .roster-item").forEach(el => el.classList.remove("selected"));
+  }
+  const qs = asOfSeq ? `?as_of_seq=${asOfSeq}` : "";
+  const data = await api(`/api/characters/${encodeURIComponent(id)}${qs}`);
+  const b = data.character.baseline;
+  const c = data.character.current;
+  const logs = data.character.event_log || [];
+  const rels = data.relations || [];
+  const seqVal = asOfSeq || STATE.maxSeq;
+
+  const resHtml = Object.entries(c.resources).map(([k, r]) => {
+    const pct = r.max > 0 ? Math.round((r.current / r.max) * 100) : 0;
+    const cls = k.toLowerCase().includes("hp") ? (pct<=35?"low":pct<=70?"mid":"") : "qi";
+    return `<div style="margin-bottom:8px;">
+      <div class="row" style="justify-content:space-between;">
+        <strong>${esc(k)}</strong>
+        <div class="row">
+          <span class="mono">${r.current}/${r.max} ${esc(r.unit)}</span>
+          <button class="sm" onclick="quickRes('${esc(b.id)}','${esc(k)}',-5)">-5</button>
+          <button class="sm" onclick="quickRes('${esc(b.id)}','${esc(k)}',-1)">-1</button>
+          <button class="sm" onclick="quickRes('${esc(b.id)}','${esc(k)}',+1)">+1</button>
+          <button class="sm" onclick="quickRes('${esc(b.id)}','${esc(k)}',+5)">+5</button>
+        </div>
+      </div>
+      <div class="bar-wrap"><div class="bar-fill ${cls}" style="width:${pct}%"></div></div>
+    </div>`;
+  }).join("") || '<div class="muted">No resources tracked.</div>';
+
+  const statsHtml = Object.entries(c.stats).map(([k, v]) => {
+    const init = b.initial_stats[k] ?? 0;
+    const d = v - init;
+    return `<span class="pill">${esc(k)}: <strong>${v}</strong>${d !== 0 ? ` (${d>0?'+':''}${d})` : ''}</span>`;
+  }).join(" ");
+
+  document.getElementById("charDetail").innerHTML = `
+    <div class="row" style="justify-content:space-between; margin-bottom:10px;">
+      <div>
+        <h2 style="margin:0;">${esc(b.name)} <span class="muted" style="font-weight:400;">${esc(b.title ? '— ' + b.title : '')}</span></h2>
+        <div class="muted" style="font-size:12px;">ID: <span class="mono">${esc(b.id)}</span> &bull; ${esc(b.origin)} &bull; ${esc(b.archetype)} &bull; Faction: ${esc(b.faction || 'None')}</div>
+      </div>
+      <div class="row">
+        <button class="sm" onclick="viewDocModal('characters/${esc(b.id)}.md')">View Compiled .md</button>
+      </div>
+    </div>
+
+    <div class="card" style="background:var(--bg2); padding:10px;">
+      <div class="row" style="justify-content:space-between;">
+        <span style="font-size:12px;"><strong>Time-Travel Inspector:</strong> Viewing state at event <span class="mono">#${seqVal}</span> ${asOfSeq ? '(Historical)' : '(Live)'}</span>
+        ${asOfSeq ? `<button class="sm primary" onclick="selectChar('${esc(b.id)}', null)">Return to Live</button>` : ''}
+      </div>
+      <input type="range" min="1" max="${STATE.maxSeq}" value="${seqVal}" style="width:100%; margin-top:6px;"
+        onchange="selectChar('${esc(b.id)}', Number(this.value) === STATE.maxSeq ? null : Number(this.value))" />
+    </div>
+
+    <div class="section-banner current">
+      <span>2. Current Status (Projected)</span>
+      <span class="pill">${esc(c.alive_status)} &bull; @ ${esc(c.current_location || 'unknown')}</span>
+    </div>
+    ${resHtml}
+    <div class="row" style="margin:10px 0;">${statsHtml}</div>
+
+    <div class="row" style="margin:10px 0; padding:8px; background:var(--bg2); border-radius:7px;">
+      <input id="qm_place" placeholder="Move to place slug..." style="width:160px" />
+      <button class="sm" onclick="quickMoveChar('${esc(b.id)}')">Move</button>
+      <input id="qm_cond" placeholder="Add condition..." style="width:150px" />
+      <button class="sm" onclick="quickAddCond('${esc(b.id)}')">+Cond</button>
+      <input id="qm_item" placeholder="Acquire item..." style="width:150px" />
+      <button class="sm" onclick="quickAddItem('${esc(b.id)}')">+Item</button>
+    </div>
+
+    <div class="grid-2">
+      <div>
+        <h3>Active Conditions</h3>
+        ${c.conditions.map(cd => `<div class="row" style="justify-content:space-between; margin-bottom:4px;">
+          <span><span class="pill ${esc(cd.kind)}">${esc(cd.name)}</span> <span class="muted">${esc(cd.duration)}</span></span>
+          <button class="sm" onclick="quickRemoveCond('${esc(b.id)}','${esc(cd.name)}')">Clear</button>
+        </div>`).join("") || '<div class="muted">None active.</div>'}
+
+        <h3 style="margin-top:12px;">Equipment &amp; Inventory</h3>
+        <table><tr><th>Item</th><th>Qty</th><th>Slot</th><th>Action</th></tr>
+        ${c.equipment.map(i => `<tr>
+          <td><strong>${esc(i.name)}</strong> ${i.equipped ? '<span class="pill buff">Equipped</span>' : ''}</td>
+          <td>${i.quantity}</td><td>${esc(i.slot || '—')}</td>
+          <td><button class="sm" onclick="toggleEquip('${esc(b.id)}','${esc(i.name)}',${!i.equipped})">${i.equipped ? 'Unequip' : 'Equip'}</button></td>
+        </tr>`).join("")}</table>
+      </div>
+      <div>
+        <h3>Skills</h3>
+        <table><tr><th>Skill</th><th>Rank</th><th>Mod</th></tr>
+        ${c.skills.map(s => `<tr><td><strong>${esc(s.name)}</strong></td><td>${esc(s.rank)}</td><td>${esc(s.modifier||'—')}</td></tr>`).join("")}</table>
+
+        <h3 style="margin-top:12px;">Techniques &amp; Abilities</h3>
+        <table><tr><th>Technique</th><th>Cost</th><th>Mastery</th><th>Effect</th></tr>
+        ${c.techniques.map(t => `<tr><td><strong>${esc(t.name)}</strong></td><td>${esc(t.cost)}</td><td>${esc(t.mastery)}</td><td>${esc(t.effect)}</td></tr>`).join("")}</table>
+      </div>
+    </div>
+
+    ${rels.length ? `<h3 style="margin-top:12px;">Knowledge Graph Relations</h3><table><tr><th>Relation</th><th>Target</th><th>Strength</th><th>Notes</th></tr>` +
+      rels.map(r => `<tr><td><span class="pill">${esc(r.relation_type)}</span></td><td>${esc(r.source_id === b.id ? r.target_id : r.source_id)}</td><td>${r.strength ?? '—'}</td><td>${esc(r.notes)}</td></tr>`).join("") + `</table>` : ''}
+
+    <div class="section-banner"><span>1. Initial / Baseline Profile (Immutable Reference)</span><span class="muted">${esc(b.created_at_world_time)}</span></div>
+    <div style="font-size:12.5px; line-height:1.5;">
+      ${b.appearance ? `<div><strong>Appearance:</strong> ${esc(b.appearance)}</div>` : ''}
+      ${b.personality ? `<div><strong>Personality:</strong> ${esc(b.personality)}</div>` : ''}
+      ${b.backstory ? `<div><strong>Backstory:</strong> ${esc(b.backstory)}</div>` : ''}
+      <div class="muted" style="margin-top:6px;">Initial Gear: ${(b.initial_equipment||[]).map(i=>i.name).join(', ') || 'None'} | Initial Techniques: ${(b.initial_techniques||[]).map(t=>t.name).join(', ') || 'None'}</div>
+    </div>
+
+    <div class="section-banner log"><span>3. Event &amp; Impact Log (${logs.length})</span></div>
+    <table><tr><th>Seq</th><th>Time</th><th>Summary</th></tr>
+      ${logs.slice().reverse().map(ev => `<tr><td class="mono">#${ev.seq}</td><td style="white-space:nowrap;">${esc(ev.world_time)}</td><td>${esc(ev.summary)}</td></tr>`).join("")}
+    </table>
+  `;
+}
+
+async function quickRes(cid, res, delta) {
+  await callTool("modify_character_resource", { character_id: cid, resource: res, delta, reason: "GM Studio quick adjust" });
+  refreshAll(); selectChar(cid);
+}
+async function quickMoveChar(cid) {
+  const loc = document.getElementById("qm_place").value.trim();
+  if (!loc) return;
+  await callTool("move_character", { character_id: cid, to_place_id: loc });
+  toast("Moved character."); refreshAll(); selectChar(cid);
+}
+async function quickAddCond(cid) {
+  const name = document.getElementById("qm_cond").value.trim();
+  if (!name) return;
+  await callTool("update_character_condition", { character_id: cid, action: "add", name, kind: "condition" });
+  refreshAll(); selectChar(cid);
+}
+async function quickRemoveCond(cid, name) {
+  await callTool("update_character_condition", { character_id: cid, action: "remove", name });
+  refreshAll(); selectChar(cid);
+}
+async function quickAddItem(cid) {
+  const name = document.getElementById("qm_item").value.trim();
+  if (!name) return;
+  await callTool("update_character_equipment", { character_id: cid, action: "acquire", name, quantity: 1 });
+  refreshAll(); selectChar(cid);
+}
+async function toggleEquip(cid, name, equipped) {
+  await callTool("update_character_equipment", { character_id: cid, action: equipped ? "equip" : "unequip", name });
+  refreshAll(); selectChar(cid);
+}
+
+// ========================================================= PLACES
+function clearPlaceFilters() {
+  ["pf_query","pf_type","pf_terrain","pf_weather","pf_season","pf_landmark","pf_lstatus","pf_char"].forEach(i => document.getElementById(i).value = "");
+  loadPlaces();
+}
+
+async function loadPlaces() {
+  const params = new URLSearchParams();
+  const map = { query:"pf_query", place_type:"pf_type", terrain:"pf_terrain", weather:"pf_weather", season_effect:"pf_season", has_landmark:"pf_landmark", landmark_status:"pf_lstatus", has_character:"pf_char" };
+  for (const [k, id] of Object.entries(map)) { const v = document.getElementById(id).value.trim(); if (v) params.set(k, v); }
+  const data = await api("/api/places?" + params.toString());
+  document.getElementById("placeCountLabel").textContent = `${data.count} matching place(s)`;
+  document.getElementById("placeList").innerHTML = data.places.map(pp => {
+    const b = pp.baseline, c = pp.current;
+    const sel = STATE.selectedPlace === b.id ? "selected" : "";
+    return `<div class="roster-item ${sel}" onclick="selectPlace('${esc(b.id)}')">
+      <div class="row" style="justify-content:space-between;">
+        <strong>${esc(b.name)}</strong>
+        <span class="pill">${esc(b.place_type)}</span>
+      </div>
+      <div class="muted" style="font-size:12px;">${esc(b.terrain)}</div>
+      <div style="font-size:12px; margin-top:4px;">${esc(c.current_season)} &bull; ${esc(c.current_weather)} &bull; <strong>${c.present_characters.length}</strong> present</div>
+    </div>`;
+  }).join("") || '<div class="muted">No places match these filters.</div>';
+
+  if (STATE.selectedPlace) selectPlace(STATE.selectedPlace);
+  else if (data.places.length) selectPlace(data.places[0].baseline.id);
+}
+
+async function selectPlace(id) {
+  STATE.selectedPlace = id;
+  const data = await api(`/api/places/${encodeURIComponent(id)}`);
+  const b = data.place.baseline, c = data.place.current, logs = data.place.event_log || [], hists = data.histories || [];
+
+  const seasons = Object.entries(b.seasonal_profiles || {}).map(([s, d]) => {
+    const cur = s.toLowerCase() === c.current_season.toLowerCase();
+    return `<tr style="${cur ? 'background:var(--accent-dim);' : ''}"><td><strong>${esc(s)}</strong>${cur ? ' (Current)' : ''}</td><td>${esc(d)}</td></tr>`;
+  }).join("");
+
+  document.getElementById("placeDetail").innerHTML = `
+    <div class="row" style="justify-content:space-between;">
+      <div>
+        <h2 style="margin:0;">${esc(b.name)}</h2>
+        <div class="muted" style="font-size:12px;">ID: <span class="mono">${esc(b.id)}</span> &bull; Type: ${esc(b.place_type)} &bull; Terrain: ${esc(b.terrain)} &bull; Climate: ${esc(b.climate)}</div>
+      </div>
+      <div class="row">
+        <button class="sm" onclick="openHistoryModal('${esc(b.id)}', 'place')">+ Add History</button>
+        <button class="sm" onclick="viewDocModal('places/${esc(b.id)}.md')">View Compiled .md</button>
+      </div>
+    </div>
+
+    <div class="section-banner current"><span>2. Current Status</span><span>${esc(c.current_season)} &bull; ${esc(c.current_weather)} &bull; Danger: ${esc(c.danger_level)}</span></div>
+    <div class="row" style="margin-bottom:10px; padding:8px; background:var(--bg2); border-radius:7px;">
+      <input id="qp_weather" placeholder="New local weather..." style="flex:1" />
+      <button class="sm" onclick="quickPlaceWeather('${esc(b.id)}')">Set Weather</button>
+      <input id="qp_cond" placeholder="Add local hazard/condition..." style="flex:1" />
+      <button class="sm" onclick="quickPlaceCond('${esc(b.id)}', true)">+Cond</button>
+    </div>
+
+    <div class="grid-2">
+      <div>
+        <h3>Characters Currently Present</h3>
+        ${c.present_characters.map(cid => `<a class="pill pc" onclick="jumpToChar('${esc(cid)}')">${esc(cid)}</a>`).join(" ") || '<span class="muted">None present.</span>'}
+        <h3 style="margin-top:12px;">Active Local Conditions</h3>
+        ${c.active_conditions.map(ac => `<span class="pill warn">${esc(ac)}</span>`).join(" ") || '<span class="muted">None active.</span>'}
+      </div>
+      <div>
+        <h3>Connected Routes &amp; Exits</h3>
+        <table><tr><th>Destination</th><th>Travel Time</th><th>Status</th></tr>
+        ${c.routes.map(r => `<tr><td><a onclick="selectPlace('${esc(r.destination_id)}')">${esc(r.destination_id)}</a></td><td>${esc(r.travel_time)}</td><td><span class="pill">${esc(r.status)}</span></td></tr>`).join("")}</table>
+      </div>
+    </div>
+
+    <h3 style="margin-top:14px;">Places of Significance (Landmarks)</h3>
+    <table><tr><th>Landmark</th><th>Kind</th><th>Current Status</th><th>Description</th></tr>
+      ${c.landmarks.map(l => `<tr><td><strong>${esc(l.name)}</strong></td><td>${esc(l.kind)}</td><td><span class="pill warn">${esc(l.status)}</span></td><td>${esc(l.description)}</td></tr>`).join("")}
+    </table>
+
+    <div class="section-banner"><span>1. Baseline Geography &amp; Seasonal Profiles</span></div>
+    <p style="margin-top:0;">${esc(b.description)}</p>
+    ${seasons ? `<table><tr><th>Season</th><th>Terrain &amp; Environmental Effects</th></tr>${seasons}</table>` : ''}
+
+    ${hists.length ? `<div class="section-banner"><span>Historical Chronicle (${hists.length})</span><button class="sm" onclick="openHistoryModal('${esc(b.id)}', 'place')">+ Record Entry</button></div>
+      <table><tr><th>Era / Date</th><th>Event</th><th>Details &amp; Significance</th></tr>
+      ${hists.map(h => `<tr><td style="white-space:nowrap;"><strong>${esc(h.era_or_date)}</strong></td><td><strong>${esc(h.title)}</strong> <span class="pill ${esc(h.visibility)}">${esc(h.visibility)}</span></td><td>${esc(h.details)}${h.significance ? `<div class="muted" style="margin-top:3px;"><em>Significance: ${esc(h.significance)}</em></div>` : ''}</td></tr>`).join("")}
+      </table>` : ''}
+
+    <div class="section-banner log"><span>3. Place Event &amp; History Log (${logs.length})</span></div>
+    <table><tr><th>Seq</th><th>Time</th><th>Summary</th></tr>
+      ${logs.slice().reverse().map(ev => `<tr><td class="mono">#${ev.seq}</td><td style="white-space:nowrap;">${esc(ev.world_time)}</td><td>${esc(ev.summary)}</td></tr>`).join("")}
+    </table>
+  `;
+}
+
+async function quickPlaceWeather(pid) {
+  const weather = document.getElementById("qp_weather").value.trim();
+  if (!weather) return;
+  await callTool("update_place", { place_id: pid, action: "weather", weather });
+  refreshAll(); selectPlace(pid);
+}
+async function quickPlaceCond(pid, add) {
+  const condition = document.getElementById("qp_cond").value.trim();
+  if (!condition) return;
+  await callTool("update_place", { place_id: pid, action: add ? "add_condition" : "remove_condition", condition });
+  refreshAll(); selectPlace(pid);
+}
+
+// ========================================================= ITEMS & RELICS
+function clearItemFilters() {
+  ["if_query","if_type","if_holder","if_owner","if_cond","if_text"].forEach(i => document.getElementById(i).value = "");
+  loadItems();
+}
+
+async function loadItems() {
+  const params = new URLSearchParams();
+  const map = { query:"if_query", item_type:"if_type", current_holder_id:"if_holder", previous_owner:"if_owner", condition:"if_cond", has_linked_text:"if_text" };
+  for (const [k, id] of Object.entries(map)) { const v = document.getElementById(id).value.trim(); if (v) params.set(k, v); }
+  const data = await api("/api/items?" + params.toString());
+  document.getElementById("itemCountLabel").textContent = `${data.count} matching item(s)/relic(s)`;
+  document.getElementById("itemList").innerHTML = data.items.map(it => {
+    const sel = STATE.selectedItem === it.id ? "selected" : "";
+    return `<div class="roster-item ${sel}" onclick="selectItem('${esc(it.id)}')">
+      <div class="row" style="justify-content:space-between;">
+        <strong>${esc(it.name)}</strong>
+        <span class="pill warn">${esc(it.item_type)}</span>
+      </div>
+      <div class="muted" style="font-size:12px;">Holder: <strong>${esc(it.current_holder_id || 'Unknown')}</strong> &bull; ${esc(it.condition_or_durability)}</div>
+      ${it.significance ? `<div style="font-size:12px; margin-top:4px;">${esc(it.significance)}</div>` : ''}
+    </div>`;
+  }).join("") || '<div class="muted">No carryable items or artifacts cataloged yet.</div>';
+
+  if (STATE.selectedItem) selectItem(STATE.selectedItem);
+  else if (data.items.length) selectItem(data.items[0].id);
+}
+
+async function selectItem(id) {
+  STATE.selectedItem = id;
+  try {
+    const data = await api(`/api/items/${encodeURIComponent(id)}`);
+    const it = data.item;
+    const hists = data.histories || [];
+    const logs = data.event_log || [];
+    document.getElementById("itemDetail").innerHTML = `
+      <div class="row" style="justify-content:space-between; margin-bottom:8px;">
+        <div>
+          <h2 style="margin:0;">${esc(it.name)}</h2>
+          <div class="muted" style="font-size:12px;">
+            ID: <span class="mono">${esc(it.id)}</span> &bull; Type: <strong>${esc(it.item_type)}</strong>
+            ${it.rarity_or_tier ? ` &bull; Tier: ${esc(it.rarity_or_tier)}` : ''} &bull; Condition: ${esc(it.condition_or_durability)}
+          </div>
+        </div>
+        <div class="row">
+          ${it.linked_text_id ? `<button class="sm primary" onclick="jumpToText('${esc(it.linked_text_id)}')">Read Linked Book/Scroll</button>` : ''}
+          <button class="sm" onclick="openHistoryModal('${esc(it.id)}', 'item')">+ Add History</button>
+          <button class="sm" onclick="viewDocModal('items/${esc(it.id)}.md')">View Compiled .md</button>
+        </div>
+      </div>
+
+      <div class="row" style="margin-bottom:10px;">
+        <span class="pill pc">Current Holder: ${esc(it.current_holder_id || 'Unknown')}</span>
+        ${it.slot ? `<span class="pill">Slot: ${esc(it.slot)}</span>` : ''}
+        ${it.quantity > 1 ? `<span class="pill">Qty: ${it.quantity}</span>` : ''}
+        ${(it.previous_owners||[]).length ? `<span class="pill warn">Previous Owners: ${esc(it.previous_owners.join(' → '))}</span>` : ''}
+      </div>
+
+      <div class="row" style="margin-bottom:12px; padding:8px; background:var(--bg2); border-radius:7px;">
+        <input id="qi_holder" placeholder="Transfer to char/place slug..." style="width:180px" />
+        <input id="qi_cond" placeholder="New condition (optional)..." style="width:160px" />
+        <input id="qi_reason" placeholder="Reason / how it changed hands..." style="flex:1" />
+        <button class="sm primary" onclick="transferItemUi('${esc(it.id)}')">Transfer / Update</button>
+      </div>
+
+      ${it.origin_and_maker ? `<p><strong>Origin &amp; Maker:</strong> ${esc(it.origin_and_maker)}</p>` : ''}
+      ${it.description ? `<p><strong>Description:</strong> ${esc(it.description)}</p>` : ''}
+      ${it.significance ? `<p><strong>Story Significance:</strong> ${esc(it.significance)}</p>` : ''}
+      ${it.properties_and_effects ? `<h3>Properties &amp; Effects</h3><div class="pre-box" style="font-family:var(--sans);">${esc(it.properties_and_effects)}</div>` : ''}
+      ${it.gm_notes ? `<div class="card" style="background:rgba(248,113,113,0.08); border-color:rgba(248,113,113,0.35); margin-top:10px;"><strong>GM Notes (Hidden):</strong> ${esc(it.gm_notes)}</div>` : ''}
+
+      <div class="section-banner"><span>Historical Chronicle (${hists.length})</span><button class="sm" onclick="openHistoryModal('${esc(it.id)}', 'item')">+ Record Entry</button></div>
+      ${hists.length ? `<table><tr><th>Era / Date</th><th>Event</th><th>Details &amp; Significance</th></tr>` +
+        hists.map(h => `<tr><td style="white-space:nowrap;"><strong>${esc(h.era_or_date)}</strong></td><td><strong>${esc(h.title)}</strong> <span class="pill ${esc(h.visibility)}">${esc(h.visibility)}</span></td><td>${esc(h.details)}${h.significance ? `<div class="muted" style="margin-top:3px;"><em>Significance: ${esc(h.significance)}</em></div>` : ''}</td></tr>`).join("") + `</table>`
+        : '<div class="muted" style="margin-bottom:10px;">No historical chronicle entries yet. Click "+ Record Entry" to document what has happened to this item.</div>'}
+
+      <div class="section-banner log"><span>Live Provenance &amp; Event Log (${logs.length})</span></div>
+      <table><tr><th>Seq</th><th>Time</th><th>Summary</th></tr>
+        ${logs.slice().reverse().map(ev => `<tr><td class="mono">#${ev.seq}</td><td style="white-space:nowrap;">${esc(ev.world_time)}</td><td>${esc(ev.summary)}</td></tr>`).join("")}
+      </table>
+    `;
+  } catch (e) { toast(e.message); }
+}
+
+async function transferItemUi(itemId) {
+  try {
+    const to_holder_id = document.getElementById("qi_holder").value.trim() || undefined;
+    const condition_or_durability = document.getElementById("qi_cond").value.trim() || undefined;
+    const notes = document.getElementById("qi_reason").value.trim() || "Transferred in GM Studio";
+    const res = await callTool("transfer_catalog_item", { item_id: itemId, to_holder_id, condition_or_durability, notes });
+    toast(res.summary);
+    refreshAll(); selectItem(itemId);
+  } catch (e) { toast(e.message); }
+}
+
+async function submitNewItem() {
+  try {
+    const previous_owners = document.getElementById("ni_prev").value.split(",").map(s=>s.trim()).filter(Boolean);
+    const properties_and_effects = document.getElementById("ni_props").value.trim();
+    const keywords = document.getElementById("ni_kw").value.split(",").map(s=>s.trim()).filter(Boolean);
+    const res = await callTool("upsert_item", {
+      name: document.getElementById("ni_name").value.trim(),
+      item_type: document.getElementById("ni_type").value,
+      rarity_or_tier: document.getElementById("ni_rarity").value.trim(),
+      condition_or_durability: document.getElementById("ni_cond").value.trim(),
+      current_holder_id: document.getElementById("ni_holder").value.trim() || undefined,
+      slot: document.getElementById("ni_slot").value.trim() || undefined,
+      origin_and_maker: document.getElementById("ni_origin").value.trim(),
+      previous_owners,
+      description: document.getElementById("ni_desc").value.trim(),
+      significance: document.getElementById("ni_sig").value.trim(),
+      properties_and_effects,
+      linked_text_id: document.getElementById("ni_text").value.trim() || undefined,
+      keywords,
+      gm_notes: document.getElementById("ni_gm").value.trim()
+    });
+    closeModals(); toast("Cataloged item: " + res.item.name);
+    STATE.selectedItem = res.item.id;
+    refreshAll();
+  } catch (e) { toast(e.message); }
+}
+
+// ========================================================= ENTITY HISTORIES
+function clearHistoryFilters() {
+  ["hf_query","hf_entity","hf_kind","hf_era","hf_vis"].forEach(i => document.getElementById(i).value = "");
+  loadHistories();
+}
+
+function openHistoryModal(entityId = "", entityKind = "place") {
+  document.getElementById("nh_entity").value = entityId;
+  document.getElementById("nh_kind").value = entityKind;
+  openModal("modalHistory");
+}
+
+async function loadHistories() {
+  const params = new URLSearchParams();
+  const map = { query:"hf_query", entity_id:"hf_entity", entity_kind:"hf_kind", era_or_date:"hf_era", visibility:"hf_vis" };
+  for (const [k, id] of Object.entries(map)) { const v = document.getElementById(id).value.trim(); if (v) params.set(k, v); }
+  const data = await api("/api/histories?" + params.toString());
+  document.getElementById("historyHeading").textContent = `Historical Chronicles (${data.count} entries)`;
+  document.getElementById("historyTable").innerHTML = data.histories.length
+    ? `<table><tr><th>Entity</th><th>Kind</th><th>Era / Date</th><th>Title</th><th>Details &amp; Significance</th><th>Visibility</th></tr>` +
+      data.histories.map(h => `<tr>
+        <td class="mono">${esc(h.entity_id)}</td>
+        <td><span class="pill warn">${esc(h.entity_kind)}</span></td>
+        <td style="white-space:nowrap;"><strong>${esc(h.era_or_date)}</strong></td>
+        <td><strong>${esc(h.title)}</strong></td>
+        <td>${esc(h.details)}${h.significance ? `<div class="muted" style="margin-top:3px;"><em>Significance: ${esc(h.significance)}</em></div>` : ''}</td>
+        <td><span class="pill ${esc(h.visibility)}">${esc(h.visibility)}</span></td>
+      </tr>`).join("") + `</table>`
+    : '<div class="muted">No historical chronicle entries match these filters yet.</div>';
+}
+
+async function submitNewHistory() {
+  try {
+    const related_ids = document.getElementById("nh_rel").value.split(",").map(s=>s.trim()).filter(Boolean);
+    const res = await callTool("add_entity_history", {
+      entity_id: document.getElementById("nh_entity").value.trim(),
+      entity_kind: document.getElementById("nh_kind").value,
+      era_or_date: document.getElementById("nh_era").value.trim(),
+      sort_order: Number(document.getElementById("nh_order").value) || 0,
+      title: document.getElementById("nh_title").value.trim(),
+      details: document.getElementById("nh_details").value.trim(),
+      significance: document.getElementById("nh_sig").value.trim(),
+      visibility: document.getElementById("nh_vis").value,
+      related_ids
+    });
+    closeModals(); toast("Recorded history: " + res.history.title);
+    ["nh_title","nh_details","nh_sig"].forEach(i => document.getElementById(i).value = "");
+    refreshAll();
+  } catch (e) { toast(e.message); }
+}
+
+// ========================================================= LORE
+function clearLoreFilters() {
+  ["lf_query","lf_cat","lf_vis","lf_kw","lf_rel"].forEach(i => document.getElementById(i).value = "");
+  loadLore();
+}
+
+async function loadLore() {
+  const params = new URLSearchParams();
+  const map = { query:"lf_query", category:"lf_cat", visibility:"lf_vis", keyword:"lf_kw", related_to:"lf_rel" };
+  for (const [k, id] of Object.entries(map)) { const v = document.getElementById(id).value.trim(); if (v) params.set(k, v); }
+  const data = await api("/api/lore?" + params.toString());
+  document.getElementById("loreCountLabel").textContent = `${data.count} matching lore entry(ies)`;
+  window._loreCache = {};
+  document.getElementById("loreList").innerHTML = data.entries.map(l => {
+    window._loreCache[l.id] = l;
+    const sel = STATE.selectedLore === l.id ? "selected" : "";
+    return `<div class="roster-item ${sel}" onclick="selectLore('${esc(l.id)}')">
+      <div class="row" style="justify-content:space-between;">
+        <strong>${esc(l.title)}</strong>
+        <span class="pill ${esc(l.visibility)}">${esc(l.visibility)}</span>
+      </div>
+      <div class="muted" style="font-size:12px;">${esc(l.category)} ${l.always_include ? '• Always-On' : ''}</div>
+      <div style="font-size:12px; margin-top:4px;">${esc(l.summary)}</div>
+    </div>`;
+  }).join("") || '<div class="muted">No lore entries match these filters.</div>';
+
+  if (STATE.selectedLore && window._loreCache[STATE.selectedLore]) selectLore(STATE.selectedLore);
+  else if (data.entries.length) selectLore(data.entries[0].id);
+}
+
+function selectLore(id) {
+  STATE.selectedLore = id;
+  const l = (window._loreCache || {})[id];
+  if (!l) return;
+  document.getElementById("loreDetail").innerHTML = `
+    <div class="row" style="justify-content:space-between; margin-bottom:8px;">
+      <div>
+        <h2 style="margin:0;">${esc(l.title)}</h2>
+        <div class="muted" style="font-size:12px;">ID: <span class="mono">${esc(l.id)}</span> &bull; Category: ${esc(l.category)} &bull; <span class="pill ${esc(l.visibility)}">${esc(l.visibility)}</span></div>
+      </div>
+    </div>
+    ${l.summary ? `<p><em>${esc(l.summary)}</em></p>` : ''}
+    <div class="pre-box" style="font-family:var(--sans); font-size:13.5px;">${esc(l.body)}</div>
+    <div style="margin-top:10px;"><strong>Auto-Trigger Keywords:</strong> ${(l.keywords||[]).map(k=>`<span class="pill">${esc(k)}</span>`).join(' ') || 'None'}</div>
+    <div style="margin-top:6px;"><strong>Cross-References:</strong> ${(l.related_ids||[]).map(r=>`<span class="pill pc">${esc(r)}</span>`).join(' ') || 'None'}</div>
+  `;
+}
+
+// ========================================================= BOOKS, SCROLLS & TEXTS
+function clearTextFilters() {
+  ["tf_query","tf_medium","tf_subject","tf_lang","tf_status","tf_reader","tf_holder"].forEach(i => document.getElementById(i).value = "");
+  loadTexts();
+}
+
+async function loadTexts() {
+  const params = new URLSearchParams();
+  const map = { query:"tf_query", medium:"tf_medium", subject:"tf_subject", language:"tf_lang", read_status:"tf_status", read_by:"tf_reader", holder_or_location_id:"tf_holder" };
+  for (const [k, id] of Object.entries(map)) { const v = document.getElementById(id).value.trim(); if (v) params.set(k, v); }
+  const data = await api("/api/texts?" + params.toString());
+  document.getElementById("textCountLabel").textContent = `${data.count} matching book(s)/scroll(s)`;
+  document.getElementById("textList").innerHTML = data.texts.map(t => {
+    const sel = STATE.selectedText === t.id ? "selected" : "";
+    return `<div class="roster-item ${sel}" onclick="selectText('${esc(t.id)}')">
+      <div class="row" style="justify-content:space-between;">
+        <strong>${esc(t.title)}</strong>
+        <span class="pill warn">${esc(t.medium)}</span>
+      </div>
+      <div class="muted" style="font-size:12px;">${esc(t.subject)} &bull; ${esc(t.language)} &bull; <span class="pill">${esc(t.read_status)}</span></div>
+      <div style="font-size:12px; margin-top:4px;">${esc(t.summary || 'No outward summary')}</div>
+    </div>`;
+  }).join("") || '<div class="muted">No books, scrolls, or story texts match these filters.</div>';
+
+  if (STATE.selectedText) selectText(STATE.selectedText);
+  else if (data.texts.length) selectText(data.texts[0].id);
+}
+
+async function selectText(id) {
+  STATE.selectedText = id;
+  try {
+    const data = await api(`/api/texts/${encodeURIComponent(id)}`);
+    const t = data.text;
+    const hists = data.histories || [];
+    const logs = data.event_log || [];
+    document.getElementById("textDetail").innerHTML = `
+      <div class="row" style="justify-content:space-between; margin-bottom:8px;">
+        <div>
+          <h2 style="margin:0;">${esc(t.title)}</h2>
+          <div class="muted" style="font-size:12px;">
+            ID: <span class="mono">${esc(t.id)}</span> &bull; Medium: <strong>${esc(t.medium)}</strong> &bull;
+            Subject: ${esc(t.subject)} &bull; Author: ${esc(t.author || 'Unknown')} &bull; Language: ${esc(t.language)}
+          </div>
+        </div>
+        <div class="row">
+          <button class="sm" onclick="openHistoryModal('${esc(t.id)}', 'text')">+ Add History</button>
+          <button class="sm" onclick="viewDocModal('texts/${esc(t.id)}.md')">View Compiled .md</button>
+        </div>
+      </div>
+
+      <div class="row" style="margin-bottom:10px;">
+        <span class="pill warn">Status: ${esc(t.read_status)}</span>
+        <span class="pill">Condition: ${esc(t.condition)}</span>
+        <span class="pill pc">Holder/Location: ${esc(t.holder_or_location_id || 'Unknown')}</span>
+        <span class="pill buff">Read By: ${(t.read_by||[]).join(', ') || 'None yet'}</span>
+      </div>
+
+      <div class="row" style="margin-bottom:12px; padding:8px; background:var(--bg2); border-radius:7px;">
+        <input id="qt_reader" placeholder="Reader char slug..." style="width:140px" />
+        <select id="qt_status">
+          <option value="">Keep status</option>
+          <option value="discovered_unread">Discovered (Unread)</option>
+          <option value="partially_read">Partially Read</option>
+          <option value="read">Read</option>
+          <option value="deciphered">Deciphered</option>
+        </select>
+        <input id="qt_holder" placeholder="Move to holder/place..." style="width:150px" />
+        <button class="sm primary" onclick="recordReadingUi('${esc(t.id)}')">Record Study / Update</button>
+      </div>
+
+      ${t.summary ? `<p><strong>Outward Overview:</strong> <em>${esc(t.summary)}</em></p>` : ''}
+
+      <div class="section-banner current"><span>Readable In-World Text &amp; Rituals</span></div>
+      <div class="pre-box" style="font-family:var(--sans); font-size:13.5px;">${esc(t.content)}</div>
+
+      ${(t.mechanics_or_unlocks||[]).length ? `<h3 style="margin-top:12px;">Story Unlocks &amp; Ritual Effects</h3><ul>` +
+        t.mechanics_or_unlocks.map(u => `<li>${esc(u)}</li>`).join("") + `</ul>` : ''}
+
+      ${t.gm_notes ? `<div class="card" style="background:rgba(248,113,113,0.08); border-color:rgba(248,113,113,0.35); margin-top:10px;">
+        <strong>GM Notes (Hidden):</strong> ${esc(t.gm_notes)}</div>` : ''}
+
+      ${hists.length ? `<div class="section-banner"><span>Historical Chronicle (${hists.length})</span><button class="sm" onclick="openHistoryModal('${esc(t.id)}', 'text')">+ Record Entry</button></div>
+        <table><tr><th>Era / Date</th><th>Event</th><th>Details &amp; Significance</th></tr>
+        ${hists.map(h => `<tr><td style="white-space:nowrap;"><strong>${esc(h.era_or_date)}</strong></td><td><strong>${esc(h.title)}</strong> <span class="pill ${esc(h.visibility)}">${esc(h.visibility)}</span></td><td>${esc(h.details)}${h.significance ? `<div class="muted" style="margin-top:3px;"><em>Significance: ${esc(h.significance)}</em></div>` : ''}</td></tr>`).join("")}
+        </table>` : ''}
+
+      <div class="section-banner log"><span>Provenance &amp; Reading Log (${logs.length})</span></div>
+      <table><tr><th>Seq</th><th>Time</th><th>Summary</th></tr>
+        ${logs.slice().reverse().map(ev => `<tr><td class="mono">#${ev.seq}</td><td style="white-space:nowrap;">${esc(ev.world_time)}</td><td>${esc(ev.summary)}</td></tr>`).join("")}
+      </table>
+    `;
+  } catch (e) { toast(e.message); }
+}
+
+async function recordReadingUi(textId) {
+  try {
+    const reader_id = document.getElementById("qt_reader").value.trim() || undefined;
+    const read_status = document.getElementById("qt_status").value || undefined;
+    const holder_or_location_id = document.getElementById("qt_holder").value.trim() || undefined;
+    const res = await callTool("record_text_reading", { text_id: textId, reader_id, read_status, holder_or_location_id, notes: "Updated in GM Studio" });
+    toast(res.summary);
+    refreshAll(); selectText(textId);
+  } catch (e) { toast(e.message); }
+}
+
+async function submitNewText() {
+  try {
+    const unlocks = document.getElementById("nt_unlocks").value.split("\n").map(s=>s.trim()).filter(Boolean);
+    const keywords = document.getElementById("nt_kw").value.split(",").map(s=>s.trim()).filter(Boolean);
+    const related_ids = document.getElementById("nt_rel").value.split(",").map(s=>s.trim()).filter(Boolean);
+    const res = await callTool("upsert_text", {
+      title: document.getElementById("nt_title").value.trim(),
+      medium: document.getElementById("nt_medium").value,
+      subject: document.getElementById("nt_subject").value.trim(),
+      author: document.getElementById("nt_author").value.trim(),
+      language: document.getElementById("nt_lang").value.trim(),
+      condition: document.getElementById("nt_cond").value.trim(),
+      read_status: document.getElementById("nt_status").value,
+      holder_or_location_id: document.getElementById("nt_holder").value.trim() || undefined,
+      summary: document.getElementById("nt_summary").value.trim(),
+      content: document.getElementById("nt_content").value.trim(),
+      mechanics_or_unlocks: unlocks,
+      gm_notes: document.getElementById("nt_gm").value.trim(),
+      keywords, related_ids
+    });
+    closeModals(); toast("Cataloged text: " + res.text.title);
+    STATE.selectedText = res.text.id;
+    refreshAll();
+  } catch (e) { toast(e.message); }
+}
+
+// ========================================================= ATTACHED DOCS & MEDIA
+function clearAttachmentFilters() {
+  ["af_query","af_cat","af_mime","af_vis","af_rel"].forEach(i => document.getElementById(i).value = "");
+  loadAttachments();
+}
+
+async function loadAttachments() {
+  const params = new URLSearchParams();
+  const map = { query:"af_query", category:"af_cat", mime_type:"af_mime", visibility:"af_vis", related_to:"af_rel" };
+  for (const [k, id] of Object.entries(map)) { const v = document.getElementById(id).value.trim(); if (v) params.set(k, v); }
+  const data = await api("/api/attachments?" + params.toString());
+  document.getElementById("attachCountLabel").textContent = `${data.count} attached doc(s)/file(s)`;
+  document.getElementById("attachList").innerHTML = data.attachments.map(a => {
+    const sel = STATE.selectedAttachment === a.id ? "selected" : "";
+    return `<div class="roster-item ${sel}" onclick="selectAttachment('${esc(a.id)}')">
+      <div class="row" style="justify-content:space-between;">
+        <strong>${esc(a.title)}</strong>
+        <span class="pill pc">${esc(a.category)}</span>
+      </div>
+      <div class="muted" style="font-size:12px;">${esc(a.stored_filename)} &bull; ${esc(a.mime_type)} &bull; ${a.size_bytes} B</div>
+      <div style="font-size:12px; margin-top:4px;">${esc(a.summary || '')}</div>
+    </div>`;
+  }).join("") || '<div class="muted">No attached docs or media files yet.</div>';
+
+  if (STATE.selectedAttachment) selectAttachment(STATE.selectedAttachment);
+  else if (data.attachments.length) selectAttachment(data.attachments[0].id);
+}
+
+async function selectAttachment(id) {
+  STATE.selectedAttachment = id;
+  try {
+    const data = await api(`/api/attachments/${encodeURIComponent(id)}`);
+    const a = data.attachment;
+    const logs = data.event_log || [];
+    const isImg = (a.mime_type || "").startsWith("image/");
+    const fileUrl = data.file_url;
+    document.getElementById("attachDetail").innerHTML = `
+      <div class="row" style="justify-content:space-between; margin-bottom:8px;">
+        <div>
+          <h2 style="margin:0;">${esc(a.title)}</h2>
+          <div class="muted" style="font-size:12px;">ID: <span class="mono">${esc(a.id)}</span> &bull; URI: <span class="mono">${esc(data.mcp_uri)}</span> &bull; Path: <span class="mono">${esc(a.relative_path)}</span></div>
+        </div>
+        <div class="row">
+          <a href="${esc(fileUrl)}" target="_blank"><button class="sm primary">Open / Download File</button></a>
+          <button class="sm" onclick="navigator.clipboard.writeText('${esc(data.mcp_uri)}'); toast('Copied MCP URI!');">Copy URI</button>
+        </div>
+      </div>
+
+      <div class="row" style="margin-bottom:10px;">
+        <span class="pill pc">${esc(a.category)}</span>
+        <span class="pill ${esc(a.visibility)}">${esc(a.visibility)}</span>
+        <span class="pill">${esc(a.mime_type)}</span>
+        <span class="pill">${a.size_bytes} bytes</span>
+      </div>
+
+      ${isImg ? `<div style="margin:10px 0;"><img src="${esc(fileUrl)}" alt="${esc(a.title)}" style="max-width:100%; max-height:360px; border-radius:8px; border:1px solid var(--border);" /></div>` : ''}
+      ${a.summary ? `<p><strong>Summary:</strong> ${esc(a.summary)}</p>` : ''}
+      ${a.extracted_notes ? `<h3>Extracted Notes</h3><div class="pre-box" style="font-family:var(--sans);">${esc(a.extracted_notes)}</div>` : ''}
+      ${data.text_content ? `<h3 style="margin-top:12px;">Copied File Contents</h3><div class="pre-box">${esc(data.text_content)}</div>` : ''}
+
+      <div class="section-banner log"><span>Provenance Log (${logs.length})</span></div>
+      <table><tr><th>Seq</th><th>Time</th><th>Summary</th></tr>
+        ${logs.slice().reverse().map(ev => `<tr><td class="mono">#${ev.seq}</td><td style="white-space:nowrap;">${esc(ev.world_time)}</td><td>${esc(ev.summary)}</td></tr>`).join("")}
+      </table>
+    `;
+  } catch (e) { toast(e.message); }
+}
+
+async function submitNewAttachment() {
+  try {
+    const title = document.getElementById("na_title").value.trim();
+    const category = document.getElementById("na_cat").value;
+    const visibility = document.getElementById("na_vis").value;
+    const summary = document.getElementById("na_summary").value.trim();
+    const extracted_notes = document.getElementById("na_notes").value.trim();
+    const keywords = document.getElementById("na_kw").value.split(",").map(s=>s.trim()).filter(Boolean);
+    const related_ids = document.getElementById("na_rel").value.split(",").map(s=>s.trim()).filter(Boolean);
+    const fileInput = document.getElementById("na_file");
+    const srcPath = document.getElementById("na_src").value.trim();
+    const textContent = document.getElementById("na_text_content").value;
+    const customFilename = document.getElementById("na_filename").value.trim() || undefined;
+    const appendMode = document.getElementById("na_append").checked;
+
+    if (textContent && textContent.trim().length > 0 && !(fileInput.files && fileInput.files.length > 0) && !srcPath) {
+      const res = await callTool("create_reference_doc", {
+        title, category, visibility, summary, extracted_notes, keywords, related_ids,
+        content: textContent,
+        filename: customFilename,
+        append: appendMode
+      });
+      closeModals(); toast((appendMode ? "Appended to: " : "Created ref doc: ") + res.relative_path);
+      STATE.selectedAttachment = res.id;
+      document.getElementById("na_text_content").value = "";
+      document.getElementById("na_append").checked = false;
+      refreshAll();
+      return;
+    }
+
+    let payload = { title, category, visibility, summary, extracted_notes, keywords, related_ids };
+    if (fileInput.files && fileInput.files.length > 0) {
+      const f = fileInput.files[0];
+      const b64 = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result));
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(f);
+      });
+      payload.filename = f.name;
+      payload.base64_content = b64;
+      if (f.type) payload.mime_type = f.type;
+    } else if (srcPath) {
+      payload.source_path = srcPath;
+    } else {
+      return toast("Choose a file to upload, specify a local source path, or paste reference content.");
+    }
+
+    const res = await callTool("import_attachment", payload);
+    closeModals(); toast("Copied & attached: " + res.relative_path);
+    STATE.selectedAttachment = res.id;
+    fileInput.value = "";
+    refreshAll();
+  } catch (e) { toast(e.message); }
+}
+
+// ========================================================= KNOWLEDGE GRAPH
+async function loadGraph() {
+  const params = new URLSearchParams();
+  const map = { entity_id:"gf_entity", hops:"gf_hops", relation_type:"gf_type", min_strength:"gf_min", query:"gf_q" };
+  for (const [k, id] of Object.entries(map)) { const v = document.getElementById(id).value.trim(); if (v) params.set(k, v); }
+  const data = await api("/api/relations?" + params.toString());
+  const rels = data.relations || [];
+  renderSvgGraph(rels);
+  document.getElementById("graphTable").innerHTML = rels.length ? `<table><tr><th>Source</th><th>Relation</th><th>Target</th><th>Strength</th><th>Notes</th></tr>` +
+    rels.map(r => `<tr><td class="mono">${esc(r.source_id)}</td><td><span class="pill">${esc(r.relation_type)}</span></td><td class="mono">${esc(r.target_id)}</td><td>${r.strength ?? '—'}</td><td>${esc(r.notes)}</td></tr>`).join("") + `</table>`
+    : '<div class="muted">No relations match these filters.</div>';
+}
+
+function renderSvgGraph(rels) {
+  const svg = document.getElementById("graphSvg");
+  const nodeSet = new Set();
+  rels.forEach(r => { nodeSet.add(r.source_id); nodeSet.add(r.target_id); });
+  const nodes = Array.from(nodeSet);
+  if (!nodes.length) { svg.innerHTML = `<text x="450" y="170" fill="#8f9bb3" text-anchor="middle">No graph edges to display.</text>`; return; }
+  const cx = 450, cy = 170, rad = Math.min(260, 90 + nodes.length * 16);
+  const pos = {};
+  nodes.forEach((n, i) => {
+    const a = (2 * Math.PI * i) / nodes.length - Math.PI / 2;
+    pos[n] = { x: cx + Math.cos(a) * rad, y: cy + Math.sin(a) * Math.min(125, rad * 0.55) };
+  });
+  let html = "";
+  rels.forEach(r => {
+    const p1 = pos[r.source_id], p2 = pos[r.target_id];
+    const mx = (p1.x + p2.x) / 2, my = (p1.y + p2.y) / 2;
+    const color = r.strength != null ? (r.strength >= 0 ? "#34d399" : "#f87171") : "#38bdf8";
+    html += `<line x1="${p1.x}" y1="${p1.y}" x2="${p2.x}" y2="${p2.y}" stroke="${color}" stroke-width="2" stroke-opacity="0.7" />`;
+    html += `<rect x="${mx-58}" y="${my-10}" width="116" height="18" rx="4" fill="#121722" stroke="${color}" stroke-opacity="0.5"/>`;
+    html += `<text x="${mx}" y="${my+3}" fill="#e6ebf5" font-size="10" text-anchor="middle">${esc(r.relation_type)}${r.strength!=null?' ('+(r.strength>0?'+':'')+r.strength+')':''}</text>`;
+  });
+  nodes.forEach(n => {
+    const p = pos[n];
+    html += `<g style="cursor:pointer" onclick="document.getElementById('gf_entity').value='${esc(n)}'; loadGraph();">
+      <rect x="${p.x-72}" y="${p.y-16}" width="144" height="32" rx="16" fill="#1b2436" stroke="#e89b3c" stroke-width="1.5"/>
+      <text x="${p.x}" y="${p.y+4}" fill="#e6ebf5" font-size="11.5" font-weight="600" text-anchor="middle">${esc(n)}</text>
+    </g>`;
+  });
+  svg.innerHTML = html;
+}
+
+// ========================================================= TIMELINE
+function clearEventFilters() {
+  ["ef_query","ef_entity","ef_loc","ef_type","ef_time","ef_sess"].forEach(i => document.getElementById(i).value = "");
+  loadTimeline();
+}
+
+async function loadTimeline() {
+  const params = new URLSearchParams();
+  const map = { query:"ef_query", entity_id:"ef_entity", location_id:"ef_loc", event_type:"ef_type", world_time_contains:"ef_time", session_number:"ef_sess" };
+  for (const [k, id] of Object.entries(map)) { const v = document.getElementById(id).value.trim(); if (v) params.set(k, v); }
+  const data = await api("/api/events?" + params.toString());
+  document.getElementById("timelineHeading").textContent = `Campaign Event Ledger (${data.count} events)`;
+  document.getElementById("timelineTable").innerHTML = `<table><tr><th>Seq</th><th>Sess</th><th>In-World Time</th><th>Location</th><th>Summary</th><th>Action</th></tr>` +
+    data.events.slice().reverse().map(ev => `<tr>
+      <td class="mono">#${ev.seq}</td><td>S${ev.session_number}</td><td style="white-space:nowrap;">${esc(ev.world_time)}</td>
+      <td>${ev.location_id ? `<a onclick="jumpToPlace('${esc(ev.location_id)}')">${esc(ev.location_id)}</a>` : '—'}</td>
+      <td>${esc(ev.summary)}</td>
+      <td><button class="sm danger" onclick="rollbackUi(${ev.seq})">Rewind</button></td>
+    </tr>`).join("") + `</table>`;
+}
+
+async function rollbackUi(seq) {
+  if (!confirm(`Safely rewind the entire campaign to Event #${seq}? (A timestamped backup of campaign.db will be created automatically first.)`)) return;
+  try {
+    const r = await callTool("rollback_to_event", { to_seq: seq });
+    toast(`Rewound to #${seq}. Backup saved.`);
+    refreshAll();
+  } catch (e) { toast(e.message); }
+}
+
+// ========================================================= DIAGNOSTICS & CLEANUP
+let LAST_DIAG_FINDINGS = [];
+
+async function loadDiagnostics() {
+  try {
+    const r = await api("/api/diagnostics");
+    LAST_DIAG_FINDINGS = r.findings || [];
+    document.getElementById("diagHeading").textContent = r.healthy
+      ? "Campaign Diagnostics — Healthy"
+      : `Campaign Diagnostics — ${r.error_count} Error(s), ${r.warning_count} Warning(s)`;
+    document.getElementById("diagSummary").innerHTML = `
+      <span class="pill ${r.healthy ? 'buff' : 'debuff'}">${r.healthy ? 'HEALTHY' : 'NEEDS ATTENTION'}</span>
+      <span class="pill debuff">Errors: ${r.error_count}</span>
+      <span class="pill warn">Warnings: ${r.warning_count}</span>
+      <span class="pill pc">Info: ${r.info_count}</span>
+      <span class="pill ${r.ledger_hash_chain_valid ? 'buff' : 'debuff'}">SHA-256 Chain: ${r.ledger_hash_chain_valid ? 'Verified' : 'CORRUPTED'}</span>
+    `;
+    if (!LAST_DIAG_FINDINGS.length) {
+      document.getElementById("diagFindings").innerHTML = '<div class="muted">No mislabeled entries, broken links, duplicates, or stale docs found!</div>';
+      return;
+    }
+    document.getElementById("diagFindings").innerHTML = `<table>
+      <tr><th>Severity</th><th>Code</th><th>Register : Entity</th><th>Details</th><th>Suggested Fix</th></tr>` +
+      LAST_DIAG_FINDINGS.map((f, idx) => {
+        const sevCls = f.severity === 'error' ? 'debuff' : (f.severity === 'warning' ? 'warn' : 'pc');
+        const hasPlaceholder = f.suggested_args && JSON.stringify(f.suggested_args).includes("<");
+        const btn = f.suggested_tool
+          ? (hasPlaceholder
+              ? `<span class="muted mono" style="font-size:11px;">${esc(f.suggested_tool)}</span>`
+              : `<button class="sm primary" onclick="applyDiagFix(${idx})">Fix (${esc(f.suggested_tool)})</button>`)
+          : '<span class="muted">—</span>';
+        return `<tr>
+          <td><span class="pill ${sevCls}">${esc(f.severity)}</span></td>
+          <td class="mono" style="font-size:11.5px;">${esc(f.code)}</td>
+          <td class="mono">${esc(f.register)}:${esc(f.entity_id)}</td>
+          <td>${esc(f.message)}</td>
+          <td>${btn}</td>
+        </tr>`;
+      }).join("") + `</table>`;
+  } catch (e) { toast(e.message); }
+}
+
+async function applyDiagFix(idx) {
+  const f = LAST_DIAG_FINDINGS[idx];
+  if (!f || !f.suggested_tool) return;
+  try {
+    await callTool(f.suggested_tool, f.suggested_args || {});
+    toast(`Applied ${f.suggested_tool} for ${f.entity_id}`);
+    refreshAll();
+    loadDiagnostics();
+  } catch (e) { toast(e.message); }
+}
+
+async function runCleanupUi(dryRun) {
+  try {
+    const r = await callTool("cleanup_campaign", { dry_run: dryRun });
+    const box = document.getElementById("diagCleanupOut");
+    box.style.display = "block";
+    box.textContent = (dryRun ? "[DRY RUN PREVIEW]\n" : "[CLEANUP APPLIED]\n") +
+      (r.actions && r.actions.length ? r.actions.join("\n") : "Campaign is already spotless — no cleanup actions needed.");
+    if (!dryRun) { toast("Cleanup applied."); refreshAll(); loadDiagnostics(); }
+  } catch (e) { toast(e.message); }
+}
+
+async function submitReclassify() {
+  try {
+    const from_register = document.getElementById("rc_from").value;
+    const to_register = document.getElementById("rc_to").value;
+    const entity_id = document.getElementById("rc_id").value.trim();
+    const new_id = document.getElementById("rc_new_id").value.trim() || undefined;
+    const histTarget = document.getElementById("rc_hist_target").value.trim();
+    const reason = document.getElementById("rc_reason").value.trim();
+    if (!entity_id) return toast("Enter an entity ID to move.");
+    const overrides = histTarget ? { target_entity_id: histTarget } : {};
+    const res = await callTool("reclassify_entity", { from_register, entity_id, to_register, new_id, overrides, reason });
+    toast(res.summary);
+    document.getElementById("rc_id").value = "";
+    refreshAll(); loadDiagnostics();
+  } catch (e) { toast(e.message); }
+}
+
+async function submitRenameOrMerge() {
+  try {
+    const register = document.getElementById("rm_reg").value;
+    const old_id = document.getElementById("rm_old").value.trim();
+    const new_id = document.getElementById("rm_new").value.trim();
+    const allow_merge = document.getElementById("rm_merge").checked;
+    const reason = document.getElementById("rm_reason").value.trim();
+    if (!old_id || !new_id) return toast("Enter both Old Slug and New Slug.");
+    const res = await callTool("rename_or_merge_entity", { register, old_id, new_id, allow_merge, reason });
+    toast(res.summary);
+    document.getElementById("rm_old").value = "";
+    refreshAll(); loadDiagnostics();
+  } catch (e) { toast(e.message); }
+}
+
+async function submitDeleteEntity() {
+  const register = document.getElementById("del_reg").value;
+  const entity_id = document.getElementById("del_id").value.trim();
+  const reason = document.getElementById("del_reason").value.trim();
+  if (!entity_id) return toast("Enter an entity ID to delete.");
+  if (!confirm(`Delete ${register} '${entity_id}'? (Its stale .md doc will be pruned and an audit event logged.)`)) return;
+  try {
+    const res = await callTool("delete_entity", { register, entity_id, reason });
+    toast(res.summary);
+    document.getElementById("del_id").value = "";
+    refreshAll(); loadDiagnostics();
+  } catch (e) { toast(e.message); }
+}
+
+// ========================================================= AI CONTEXT & SCHEMAS
+async function runAiContext() {
+  try {
+    const place_id = document.getElementById("ai_place").value.trim() || undefined;
+    const rawChars = document.getElementById("ai_chars").value.trim();
+    const character_ids = rawChars ? rawChars.split(",").map(s => s.trim()).filter(Boolean) : [];
+    const scene_text = document.getElementById("ai_scene").value.trim();
+    const include_gm_secrets = document.getElementById("ai_secrets").value === "true";
+    const fmt = document.getElementById("ai_fmt").value;
+    const r = await api("/api/context", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ place_id, character_ids, scene_text, include_gm_secrets })
+    });
+    document.getElementById("aiStats").textContent =
+      `Markdown: ~${r.stats.approx_markdown_tokens} tokens (${r.stats.markdown_chars} chars) | JSON: ~${r.stats.approx_json_tokens} tokens | Triggered Lore: ${r.packet.triggered_lore.length}`;
+    document.getElementById("aiContextOutput").textContent =
+      fmt === "markdown" ? r.markdown : JSON.stringify(r.packet, null, 2);
+  } catch (e) { toast(e.message); }
+}
+function copyAiOutput() { navigator.clipboard.writeText(document.getElementById("aiContextOutput").textContent); toast("Copied AI Context!"); }
+
+async function loadToolSchema(fmt) {
+  const data = await api(`/api/tools?format=${fmt}`);
+  document.getElementById("schemaOutput").textContent = JSON.stringify(data, null, 2);
+}
+async function loadOpenApi() {
+  const data = await api("/api/openapi.json");
+  document.getElementById("schemaOutput").textContent = JSON.stringify(data, null, 2);
+}
+function copySchemaBox() { navigator.clipboard.writeText(document.getElementById("schemaOutput").textContent); toast("Copied schema JSON!"); }
+
+async function viewDocModal(relPath) {
+  const md = await api(`/api/docs/${relPath}`);
+  alert(`Compiled Markdown Preview (${relPath}) — also saved on disk under docs/${relPath}:\n\n` + md.slice(0, 1800) + (md.length > 1800 ? "\n\n... (truncated in alert; view full file on disk)" : ""));
+}
+
+// ========================================================= CREATE FORM SUBMITS
+async function submitNewChar() {
+  try {
+    const hp = Number(document.getElementById("nc_hp").value) || 30;
+    const tags = document.getElementById("nc_tags").value.split(",").map(s=>s.trim()).filter(Boolean);
+    const res = await callTool("create_character", {
+      name: document.getElementById("nc_name").value.trim(),
+      title: document.getElementById("nc_title").value.trim(),
+      kind: document.getElementById("nc_kind").value,
+      archetype: document.getElementById("nc_arch").value.trim(),
+      origin: document.getElementById("nc_origin").value.trim(),
+      faction: document.getElementById("nc_faction").value.trim(),
+      initial_location: document.getElementById("nc_loc").value.trim() || null,
+      appearance: document.getElementById("nc_app").value.trim(),
+      backstory: document.getElementById("nc_back").value.trim(),
+      initial_resources: { HP: { current: hp, max: hp, unit: "" } },
+      tags
+    });
+    closeModals(); toast("Created character: " + res.character.baseline.name);
+    STATE.selectedChar = res.character.baseline.id;
+    refreshAll();
+  } catch (e) { toast(e.message); }
+}
+
+async function submitNewPlace() {
+  try {
+    const seasonal_profiles = {};
+    ["Spring","Summer","Autumn","Winter"].forEach(s => {
+      const v = document.getElementById("np_s_" + s.toLowerCase()).value.trim();
+      if (v) seasonal_profiles[s] = v;
+    });
+    const res = await callTool("create_place", {
+      name: document.getElementById("np_name").value.trim(),
+      place_type: document.getElementById("np_type").value.trim(),
+      terrain: document.getElementById("np_terrain").value.trim(),
+      climate: document.getElementById("np_climate").value.trim(),
+      initial_weather: document.getElementById("np_weather").value.trim(),
+      initial_danger_level: document.getElementById("np_danger").value.trim(),
+      initial_faction: document.getElementById("np_faction").value.trim() || null,
+      parent_place: document.getElementById("np_parent").value.trim() || null,
+      description: document.getElementById("np_desc").value.trim(),
+      seasonal_profiles
+    });
+    closeModals(); toast("Created place: " + res.place.baseline.name);
+    STATE.selectedPlace = res.place.baseline.id;
+    refreshAll();
+  } catch (e) { toast(e.message); }
+}
+
+async function submitNewLore() {
+  try {
+    const keywords = document.getElementById("nl_kw").value.split(",").map(s=>s.trim()).filter(Boolean);
+    const related_ids = document.getElementById("nl_rel").value.split(",").map(s=>s.trim()).filter(Boolean);
+    const res = await callTool("upsert_lore", {
+      title: document.getElementById("nl_title").value.trim(),
+      category: document.getElementById("nl_cat").value.trim(),
+      visibility: document.getElementById("nl_vis").value,
+      always_include: document.getElementById("nl_always").value === "true",
+      summary: document.getElementById("nl_summary").value.trim(),
+      body: document.getElementById("nl_body").value.trim(),
+      keywords, related_ids
+    });
+    closeModals(); toast("Saved lore: " + res.lore.title);
+    STATE.selectedLore = res.lore.id;
+    refreshAll();
+  } catch (e) { toast(e.message); }
+}
+
+async function submitNewClock() {
+  try {
+    const res = await callTool("manage_clock", {
+      action: "create",
+      name: document.getElementById("ncl_name").value.trim(),
+      kind: document.getElementById("ncl_kind").value,
+      segments: Number(document.getElementById("ncl_seg").value) || 6,
+      filled: Number(document.getElementById("ncl_fill").value) || 0,
+      description: document.getElementById("ncl_desc").value.trim()
+    });
+    closeModals(); toast(res.summary); refreshAll();
+  } catch (e) { toast(e.message); }
+}
+
+async function submitNewRelation() {
+  try {
+    const strVal = document.getElementById("nr_str").value.trim();
+    const res = await callTool("upsert_relation", {
+      source_id: document.getElementById("nr_src").value.trim(),
+      relation_type: document.getElementById("nr_type").value.trim(),
+      target_id: document.getElementById("nr_tgt").value.trim(),
+      strength: strVal === "" ? null : Number(strVal),
+      notes: document.getElementById("nr_notes").value.trim()
+    });
+    closeModals(); toast(res.summary); refreshAll();
+  } catch (e) { toast(e.message); }
+}
+
+async function submitNewSession() {
+  try {
+    const res = await callTool("start_new_session", {
+      title: document.getElementById("ns_title").value.trim(),
+      summary: document.getElementById("ns_summary").value.trim()
+    });
+    closeModals(); toast(`Started Session ${res.session_number}`); refreshAll();
+  } catch (e) { toast(e.message); }
+}
+
+async function submitRest() {
+  try {
+    const character_ids = document.getElementById("rest_chars").value.split(",").map(s=>s.trim()).filter(Boolean);
+    const clear_conditions = document.getElementById("rest_conds").value.split(",").map(s=>s.trim()).filter(Boolean);
+    const rest_type = document.getElementById("rest_type").value;
+    const notes = document.getElementById("rest_notes").value.trim();
+    const res = await callTool("rest_characters", { character_ids, rest_type, clear_conditions, notes });
+    closeModals(); toast(`Applied ${rest_type} rest (${res.applied_changes.length} updates).`); refreshAll();
+  } catch (e) { toast(e.message); }
+}
+
+refreshAll();
+</script>
+</body>
+</html>
