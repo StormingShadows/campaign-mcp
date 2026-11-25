@@ -8,8 +8,11 @@ use crate::models::{
     CampaignMeta, CatalogItem, CharacterBaseline, EntityHistoryEntry, EventPayload, GraphRelation,
     LoreEntry, PlaceBaseline, ProgressClock, StoryAttachment, StoryText, WorldClock, WorldEvent,
 };
+use crate::routines::CharacterRoutine;
+use crate::signals::EngineSignal;
 use crate::world_sim::{
-    CraftingProject, CrimeRecord, InjuryRecord, ItemEconomics, JurisdictionRecord, PlaceSpatialExt,
+    CharacterProgressionTrack, CraftingProject, CrimeRecord, InjuryRecord, ItemEconomics,
+    JurisdictionRecord, MapGrid, MapGridCell, PlaceSpatialExt, ProgressionLadder,
     ReputationStanding, SettlementMarket, TravelRoute,
 };
 use anyhow::{anyhow, bail, Context, Result};
@@ -219,6 +222,9 @@ impl CampaignDb {
                 keywords_json TEXT NOT NULL,
                 tags_json TEXT NOT NULL,
                 related_ids_json TEXT NOT NULL,
+                garment_measurements_json TEXT NOT NULL DEFAULT '{}',
+                garment_cut TEXT NOT NULL DEFAULT '',
+                garment_taper TEXT NOT NULL DEFAULT '',
                 created_at_world_time TEXT NOT NULL,
                 updated_at_world_time TEXT NOT NULL
             );
@@ -503,10 +509,132 @@ impl CampaignDb {
                 status TEXT NOT NULL,
                 project_json TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS progression_ladders (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                ladder_json TEXT NOT NULL,
+                updated_at_world_time TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS character_progression (
+                character_id TEXT NOT NULL,
+                track_id TEXT NOT NULL,
+                track_kind TEXT NOT NULL,
+                status TEXT NOT NULL,
+                track_json TEXT NOT NULL,
+                updated_at_world_time TEXT NOT NULL,
+                PRIMARY KEY (character_id, track_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS map_grids (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                scale_kind TEXT NOT NULL,
+                grid_json TEXT NOT NULL,
+                updated_at_world_time TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS map_grid_cells (
+                grid_id TEXT NOT NULL,
+                x INTEGER NOT NULL,
+                y INTEGER NOT NULL,
+                place_id TEXT,
+                cell_json TEXT NOT NULL,
+                updated_at_world_time TEXT NOT NULL,
+                PRIMARY KEY (grid_id, x, y)
+            );
+            CREATE INDEX IF NOT EXISTS idx_map_grid_cells_place ON map_grid_cells(place_id);
+
+            CREATE INDEX IF NOT EXISTS idx_char_prog_char ON character_progression(character_id);
+
+            CREATE TABLE IF NOT EXISTS engine_signals (
+                id TEXT PRIMARY KEY,
+                dedup_key TEXT NOT NULL,
+                code TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                category TEXT NOT NULL,
+                status TEXT NOT NULL,
+                visibility TEXT NOT NULL,
+                signal_json TEXT NOT NULL,
+                updated_at_world_time TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_engine_signals_status ON engine_signals(status, severity);
+            CREATE INDEX IF NOT EXISTS idx_engine_signals_dedup ON engine_signals(dedup_key);
+
+            CREATE TABLE IF NOT EXISTS character_routines (
+                id TEXT PRIMARY KEY,
+                character_id TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                routine_json TEXT NOT NULL,
+                updated_at_world_time TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_character_routines_char ON character_routines(character_id);
             ",
         )?;
         self.ensure_event_causal_columns()?;
         self.ensure_relation_extended_columns()?;
+        self.ensure_catalog_item_garment_columns()?;
+        self.ensure_clock_extended_columns()?;
+        Ok(())
+    }
+
+    fn ensure_clock_extended_columns(&self) -> Result<()> {
+        let mut stmt = self.conn.prepare("PRAGMA table_info(clocks)")?;
+        let cols: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .collect();
+        if !cols.iter().any(|c| c == "cadence_hours") {
+            self.conn
+                .execute("ALTER TABLE clocks ADD COLUMN cadence_hours INTEGER", [])?;
+        }
+        if !cols.iter().any(|c| c == "last_tick_total_hours") {
+            self.conn.execute(
+                "ALTER TABLE clocks ADD COLUMN last_tick_total_hours INTEGER",
+                [],
+            )?;
+        }
+        if !cols.iter().any(|c| c == "consequence_on_fill") {
+            self.conn.execute(
+                "ALTER TABLE clocks ADD COLUMN consequence_on_fill TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
+        if !cols.iter().any(|c| c == "auto_reset") {
+            self.conn.execute(
+                "ALTER TABLE clocks ADD COLUMN auto_reset INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn ensure_catalog_item_garment_columns(&self) -> Result<()> {
+        let mut stmt = self.conn.prepare("PRAGMA table_info(catalog_items)")?;
+        let cols: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .collect();
+        if !cols.iter().any(|c| c == "garment_measurements_json") {
+            self.conn.execute(
+                "ALTER TABLE catalog_items ADD COLUMN garment_measurements_json TEXT NOT NULL DEFAULT '{}'",
+                [],
+            )?;
+        }
+        if !cols.iter().any(|c| c == "garment_cut") {
+            self.conn.execute(
+                "ALTER TABLE catalog_items ADD COLUMN garment_cut TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
+        if !cols.iter().any(|c| c == "garment_taper") {
+            self.conn.execute(
+                "ALTER TABLE catalog_items ADD COLUMN garment_taper TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
         Ok(())
     }
 
@@ -1449,14 +1577,16 @@ impl CampaignDb {
         let kw_json = serde_json::to_string(&item.keywords)?;
         let tags_json = serde_json::to_string(&item.tags)?;
         let rel_json = serde_json::to_string(&item.related_ids)?;
+        let gm_meas_json = serde_json::to_string(&item.garment_measurements)?;
 
         self.conn.execute(
             "INSERT INTO catalog_items
              (id, name, item_type, rarity_or_tier, slot, quantity, equipped, condition_or_durability,
               origin_and_maker, previous_owners_json, current_holder_id, significance,
               properties_and_effects, description, linked_text_id, gm_notes, keywords_json,
-              tags_json, related_ids_json, created_at_world_time, updated_at_world_time)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
+              tags_json, related_ids_json, created_at_world_time, updated_at_world_time,
+              garment_measurements_json, garment_cut, garment_taper)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
              ON CONFLICT(id) DO UPDATE SET
                name = excluded.name,
                item_type = excluded.item_type,
@@ -1476,7 +1606,10 @@ impl CampaignDb {
                keywords_json = excluded.keywords_json,
                tags_json = excluded.tags_json,
                related_ids_json = excluded.related_ids_json,
-               updated_at_world_time = excluded.updated_at_world_time",
+               updated_at_world_time = excluded.updated_at_world_time,
+               garment_measurements_json = excluded.garment_measurements_json,
+               garment_cut = excluded.garment_cut,
+               garment_taper = excluded.garment_taper",
             params![
                 item.id,
                 item.name,
@@ -1499,6 +1632,9 @@ impl CampaignDb {
                 rel_json,
                 item.created_at_world_time,
                 item.updated_at_world_time,
+                gm_meas_json,
+                item.garment_cut,
+                item.garment_taper,
             ],
         )?;
 
@@ -1530,7 +1666,8 @@ impl CampaignDb {
                 "SELECT id, name, item_type, rarity_or_tier, slot, quantity, equipped, condition_or_durability,
                         origin_and_maker, previous_owners_json, current_holder_id, significance,
                         properties_and_effects, description, linked_text_id, gm_notes, keywords_json,
-                        tags_json, related_ids_json, created_at_world_time, updated_at_world_time
+                        tags_json, related_ids_json, created_at_world_time, updated_at_world_time,
+                        garment_measurements_json, garment_cut, garment_taper
                  FROM catalog_items WHERE id = ?1",
                 params![id],
                 row_to_catalog_item,
@@ -1544,7 +1681,8 @@ impl CampaignDb {
             "SELECT id, name, item_type, rarity_or_tier, slot, quantity, equipped, condition_or_durability,
                     origin_and_maker, previous_owners_json, current_holder_id, significance,
                     properties_and_effects, description, linked_text_id, gm_notes, keywords_json,
-                    tags_json, related_ids_json, created_at_world_time, updated_at_world_time
+                    tags_json, related_ids_json, created_at_world_time, updated_at_world_time,
+                    garment_measurements_json, garment_cut, garment_taper
              FROM catalog_items ORDER BY item_type, name",
         )?;
         let rows = stmt.query_map([], row_to_catalog_item)?;
@@ -1565,7 +1703,8 @@ impl CampaignDb {
                     c.condition_or_durability, c.origin_and_maker, c.previous_owners_json,
                     c.current_holder_id, c.significance, c.properties_and_effects, c.description,
                     c.linked_text_id, c.gm_notes, c.keywords_json, c.tags_json, c.related_ids_json,
-                    c.created_at_world_time, c.updated_at_world_time
+                    c.created_at_world_time, c.updated_at_world_time,
+                    c.garment_measurements_json, c.garment_cut, c.garment_taper
              FROM catalog_items_fts f
              JOIN catalog_items c ON c.id = f.id
              WHERE catalog_items_fts MATCH ?1
@@ -1782,6 +1921,24 @@ impl CampaignDb {
         Ok(out)
     }
 
+    pub fn list_events_for_place_or_entity(&self, place_id: &str) -> Result<Vec<WorldEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT e.seq, e.session_number, e.world_time, e.real_timestamp, e.location_id,
+                    e.affected_entities_json, e.summary, e.payload_json, e.prev_hash, e.hash,
+                    e.actor_id, e.causal_event_ids_json, e.visibility
+             FROM events e
+             WHERE e.location_id = ?1
+                OR e.seq IN (SELECT ee.event_seq FROM event_entities ee WHERE ee.entity_id = ?1)
+             ORDER BY e.seq ASC",
+        )?;
+        let rows = stmt.query_map(params![place_id], row_to_event)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     pub fn list_recent_events(&self, limit: usize) -> Result<Vec<WorldEvent>> {
         let mut stmt = self.conn.prepare(
             "SELECT seq, session_number, world_time, real_timestamp, location_id,
@@ -1892,9 +2049,12 @@ impl CampaignDb {
 
     pub fn upsert_clock(&self, clock: &ProgressClock) -> Result<()> {
         let related_json = serde_json::to_string(&clock.related_ids)?;
+        let cadence_i64 = clock.cadence_hours.map(|h| h as i64);
+        let auto_reset_int: i64 = if clock.auto_reset { 1 } else { 0 };
         self.conn.execute(
-            "INSERT INTO clocks (id, name, kind, filled, segments, status, description, related_ids_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "INSERT INTO clocks (id, name, kind, filled, segments, status, description, related_ids_json,
+                                 cadence_hours, last_tick_total_hours, consequence_on_fill, auto_reset)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(id) DO UPDATE SET
                name = excluded.name,
                kind = excluded.kind,
@@ -1902,7 +2062,11 @@ impl CampaignDb {
                segments = excluded.segments,
                status = excluded.status,
                description = excluded.description,
-               related_ids_json = excluded.related_ids_json",
+               related_ids_json = excluded.related_ids_json,
+               cadence_hours = excluded.cadence_hours,
+               last_tick_total_hours = excluded.last_tick_total_hours,
+               consequence_on_fill = excluded.consequence_on_fill,
+               auto_reset = excluded.auto_reset",
             params![
                 clock.id,
                 clock.name,
@@ -1912,6 +2076,10 @@ impl CampaignDb {
                 clock.status,
                 clock.description,
                 related_json,
+                cadence_i64,
+                clock.last_tick_total_hours,
+                clock.consequence_on_fill,
+                auto_reset_int,
             ],
         )?;
         Ok(())
@@ -1920,7 +2088,8 @@ impl CampaignDb {
     pub fn get_clock(&self, id: &str) -> Result<Option<ProgressClock>> {
         self.conn
             .query_row(
-                "SELECT id, name, kind, filled, segments, status, description, related_ids_json
+                "SELECT id, name, kind, filled, segments, status, description, related_ids_json,
+                        cadence_hours, last_tick_total_hours, consequence_on_fill, auto_reset
                  FROM clocks WHERE id = ?1",
                 params![id],
                 row_to_clock,
@@ -1931,7 +2100,8 @@ impl CampaignDb {
 
     pub fn list_clocks(&self) -> Result<Vec<ProgressClock>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, kind, filled, segments, status, description, related_ids_json
+            "SELECT id, name, kind, filled, segments, status, description, related_ids_json,
+                    cadence_hours, last_tick_total_hours, consequence_on_fill, auto_reset
              FROM clocks ORDER BY status, kind, name",
         )?;
         let rows = stmt.query_map([], row_to_clock)?;
@@ -1940,6 +2110,172 @@ impl CampaignDb {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    // -------------------------------------------------------------------------
+    // Active Engine Signal Bus & Standing Character Routines
+    // -------------------------------------------------------------------------
+
+    pub fn upsert_signal(&self, sig: &EngineSignal) -> Result<()> {
+        let json = serde_json::to_string(sig)?;
+        // Deduplicate by dedup_key if an existing row already has this dedup_key
+        if !sig.dedup_key.is_empty() {
+            self.conn.execute(
+                "DELETE FROM engine_signals WHERE dedup_key = ?1 AND id != ?2",
+                params![sig.dedup_key, sig.id],
+            )?;
+        }
+        self.conn.execute(
+            "INSERT INTO engine_signals (id, dedup_key, code, severity, category, status, visibility, signal_json, updated_at_world_time)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(id) DO UPDATE SET
+               dedup_key = excluded.dedup_key,
+               code = excluded.code,
+               severity = excluded.severity,
+               category = excluded.category,
+               status = excluded.status,
+               visibility = excluded.visibility,
+               signal_json = excluded.signal_json,
+               updated_at_world_time = excluded.updated_at_world_time",
+            params![
+                sig.id,
+                sig.dedup_key,
+                sig.code,
+                sig.severity,
+                sig.category,
+                sig.status,
+                sig.visibility,
+                json,
+                sig.updated_at_world_time,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_signal(&self, id_or_dedup: &str) -> Result<Option<EngineSignal>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT signal_json FROM engine_signals WHERE id = ?1 OR dedup_key = ?1 LIMIT 1",
+                params![id_or_dedup],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match raw {
+            Some(s) => Ok(Some(serde_json::from_str(&s)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn list_signals(&self, status_filter: Option<&str>) -> Result<Vec<EngineSignal>> {
+        let mut out = Vec::new();
+        if let Some(st) = status_filter.filter(|s| !s.trim().is_empty()) {
+            let mut stmt = self.conn.prepare(
+                "SELECT signal_json FROM engine_signals WHERE status = ?1 ORDER BY updated_at_world_time DESC, id ASC",
+            )?;
+            let rows = stmt.query_map(params![st], |r| r.get::<_, String>(0))?;
+            for r in rows {
+                out.push(serde_json::from_str(&r?)?);
+            }
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT signal_json FROM engine_signals ORDER BY updated_at_world_time DESC, id ASC",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            for r in rows {
+                out.push(serde_json::from_str(&r?)?);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn update_signal_status(
+        &self,
+        id_or_dedup: &str,
+        new_status: &str,
+        world_time: &str,
+    ) -> Result<Option<EngineSignal>> {
+        if let Some(mut sig) = self.get_signal(id_or_dedup)? {
+            sig.status = new_status.to_string();
+            sig.updated_at_world_time = world_time.to_string();
+            self.upsert_signal(&sig)?;
+            Ok(Some(sig))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn delete_signal(&self, id_or_dedup: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "DELETE FROM engine_signals WHERE id = ?1 OR dedup_key = ?1",
+            params![id_or_dedup],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn upsert_routine(&self, routine: &CharacterRoutine) -> Result<()> {
+        let json = serde_json::to_string(routine)?;
+        self.conn.execute(
+            "INSERT INTO character_routines (id, character_id, enabled, routine_json, updated_at_world_time)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET
+               character_id = excluded.character_id,
+               enabled = excluded.enabled,
+               routine_json = excluded.routine_json,
+               updated_at_world_time = excluded.updated_at_world_time",
+            params![
+                routine.id,
+                routine.character_id,
+                if routine.enabled { 1 } else { 0 },
+                json,
+                routine.updated_at_world_time,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_routine(&self, id: &str) -> Result<Option<CharacterRoutine>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT routine_json FROM character_routines WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match raw {
+            Some(s) => Ok(Some(serde_json::from_str(&s)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn list_routines(&self, character_id: Option<&str>) -> Result<Vec<CharacterRoutine>> {
+        let mut out = Vec::new();
+        if let Some(cid) = character_id.filter(|s| !s.trim().is_empty()) {
+            let mut stmt = self.conn.prepare(
+                "SELECT routine_json FROM character_routines WHERE character_id = ?1 ORDER BY id ASC",
+            )?;
+            let rows = stmt.query_map(params![cid], |r| r.get::<_, String>(0))?;
+            for r in rows {
+                out.push(serde_json::from_str(&r?)?);
+            }
+        } else {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT routine_json FROM character_routines ORDER BY character_id ASC, id ASC")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            for r in rows {
+                out.push(serde_json::from_str(&r?)?);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn delete_routine(&self, id: &str) -> Result<bool> {
+        let n = self
+            .conn
+            .execute("DELETE FROM character_routines WHERE id = ?1", params![id])?;
+        Ok(n > 0)
     }
 
     // -------------------------------------------------------------------------
@@ -2996,6 +3332,263 @@ impl CampaignDb {
         Ok(n > 0)
     }
 
+    // -------------------------------------------------------------------------
+    // Stateful Progression Ladders & Character Parallel Progression Tracks
+    // -------------------------------------------------------------------------
+
+    pub fn upsert_progression_ladder(&self, ladder: &ProgressionLadder) -> Result<()> {
+        let json = serde_json::to_string(ladder)?;
+        self.conn.execute(
+            "INSERT INTO progression_ladders (id, name, kind, ladder_json, updated_at_world_time)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET
+               name = excluded.name,
+               kind = excluded.kind,
+               ladder_json = excluded.ladder_json,
+               updated_at_world_time = excluded.updated_at_world_time",
+            params![
+                ladder.id,
+                ladder.name,
+                ladder.kind,
+                json,
+                ladder.updated_at_world_time
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_progression_ladder(&self, id: &str) -> Result<Option<ProgressionLadder>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT ladder_json FROM progression_ladders WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match raw {
+            Some(s) => Ok(Some(serde_json::from_str(&s)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn list_progression_ladders(&self) -> Result<Vec<ProgressionLadder>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT ladder_json FROM progression_ladders ORDER BY id ASC")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(serde_json::from_str(&r?)?);
+        }
+        Ok(out)
+    }
+
+    pub fn upsert_character_progression(&self, track: &CharacterProgressionTrack) -> Result<()> {
+        let json = serde_json::to_string(track)?;
+        self.conn.execute(
+            "INSERT INTO character_progression (character_id, track_id, track_kind, status, track_json, updated_at_world_time)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(character_id, track_id) DO UPDATE SET
+               track_kind = excluded.track_kind,
+               status = excluded.status,
+               track_json = excluded.track_json,
+               updated_at_world_time = excluded.updated_at_world_time",
+            params![
+                track.character_id,
+                track.track_id,
+                track.track_kind,
+                track.status,
+                json,
+                track.updated_at_world_time
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_character_progression(
+        &self,
+        character_id: &str,
+        track_id: &str,
+    ) -> Result<Option<CharacterProgressionTrack>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT track_json FROM character_progression WHERE character_id = ?1 AND track_id = ?2",
+                params![character_id, track_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match raw {
+            Some(s) => Ok(Some(serde_json::from_str(&s)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn list_character_progressions(
+        &self,
+        character_id: &str,
+    ) -> Result<Vec<CharacterProgressionTrack>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT track_json FROM character_progression WHERE character_id = ?1 ORDER BY track_kind ASC, track_id ASC",
+        )?;
+        let rows = stmt.query_map(params![character_id], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(serde_json::from_str(&r?)?);
+        }
+        Ok(out)
+    }
+
+    pub fn list_all_progressions(&self) -> Result<Vec<CharacterProgressionTrack>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT track_json FROM character_progression ORDER BY character_id ASC, track_kind ASC, track_id ASC",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(serde_json::from_str(&r?)?);
+        }
+        Ok(out)
+    }
+
+    pub fn delete_character_progression(&self, character_id: &str, track_id: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "DELETE FROM character_progression WHERE character_id = ?1 AND track_id = ?2",
+            params![character_id, track_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    // -------------------------------------------------------------------------
+    // Sparse Multi-Scale 2D (x, y) Map Grids & Cells
+    // -------------------------------------------------------------------------
+
+    pub fn upsert_map_grid(&self, grid: &MapGrid) -> Result<()> {
+        let json = serde_json::to_string(grid)?;
+        self.conn.execute(
+            "INSERT INTO map_grids (id, name, scale_kind, grid_json, updated_at_world_time)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET
+               name = excluded.name,
+               scale_kind = excluded.scale_kind,
+               grid_json = excluded.grid_json,
+               updated_at_world_time = excluded.updated_at_world_time",
+            params![
+                grid.id,
+                grid.name,
+                grid.scale_kind,
+                json,
+                grid.updated_at_world_time
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_map_grid(&self, id: &str) -> Result<Option<MapGrid>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT grid_json FROM map_grids WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match raw {
+            Some(s) => Ok(Some(serde_json::from_str(&s)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn list_map_grids(&self) -> Result<Vec<MapGrid>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT grid_json FROM map_grids ORDER BY scale_kind ASC, id ASC")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(serde_json::from_str(&r?)?);
+        }
+        Ok(out)
+    }
+
+    pub fn delete_map_grid(&self, id: &str) -> Result<bool> {
+        self.conn
+            .execute("DELETE FROM map_grid_cells WHERE grid_id = ?1", params![id])?;
+        let n = self
+            .conn
+            .execute("DELETE FROM map_grids WHERE id = ?1", params![id])?;
+        Ok(n > 0)
+    }
+
+    pub fn upsert_map_cell(&self, cell: &MapGridCell) -> Result<()> {
+        let json = serde_json::to_string(cell)?;
+        self.conn.execute(
+            "INSERT INTO map_grid_cells (grid_id, x, y, place_id, cell_json, updated_at_world_time)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(grid_id, x, y) DO UPDATE SET
+               place_id = excluded.place_id,
+               cell_json = excluded.cell_json,
+               updated_at_world_time = excluded.updated_at_world_time",
+            params![
+                cell.grid_id,
+                cell.x,
+                cell.y,
+                cell.place_id,
+                json,
+                cell.updated_at_world_time
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_map_cell(&self, grid_id: &str, x: i32, y: i32) -> Result<Option<MapGridCell>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT cell_json FROM map_grid_cells WHERE grid_id = ?1 AND x = ?2 AND y = ?3",
+                params![grid_id, x, y],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match raw {
+            Some(s) => Ok(Some(serde_json::from_str(&s)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn list_map_cells(&self, grid_id: &str) -> Result<Vec<MapGridCell>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT cell_json FROM map_grid_cells WHERE grid_id = ?1 ORDER BY y ASC, x ASC",
+        )?;
+        let rows = stmt.query_map(params![grid_id], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(serde_json::from_str(&r?)?);
+        }
+        Ok(out)
+    }
+
+    pub fn find_map_cells_for_place(&self, place_id: &str) -> Result<Vec<MapGridCell>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT cell_json FROM map_grid_cells WHERE place_id = ?1 ORDER BY grid_id ASC",
+        )?;
+        let rows = stmt.query_map(params![place_id], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(serde_json::from_str(&r?)?);
+        }
+        Ok(out)
+    }
+
+    pub fn delete_map_cell(&self, grid_id: &str, x: i32, y: i32) -> Result<bool> {
+        let n = self.conn.execute(
+            "DELETE FROM map_grid_cells WHERE grid_id = ?1 AND x = ?2 AND y = ?3",
+            params![grid_id, x, y],
+        )?;
+        Ok(n > 0)
+    }
+
     pub fn delete_text(&self, id: &str) -> Result<bool> {
         let n = self
             .conn
@@ -3327,6 +3920,7 @@ impl CampaignDb {
         self.conn
             .execute("ATTACH DATABASE ?1 AS bak", params![src_str])?;
 
+        // Every canonical base table across all Chronicle phases (FTS5 virtual tables are rebuilt below).
         let tables = [
             "campaign_meta",
             "character_baselines",
@@ -3340,26 +3934,82 @@ impl CampaignDb {
             "event_entities",
             "relations",
             "clocks",
+            "event_causality",
+            "ruleset_profiles",
+            "random_tables",
+            "table_draw_state",
+            "staged_discoveries",
+            "encounters",
+            "character_profiles",
+            "knowledge_claims",
+            "actor_beliefs",
+            "factions",
+            "place_spatial",
+            "travel_routes",
+            "item_economics",
+            "currency_balances",
+            "markets",
+            "jurisdictions",
+            "crime_records",
+            "reputation_scores",
+            "injuries",
+            "crafting_projects",
+            "progression_ladders",
+            "character_progression",
+            "map_grids",
+            "map_grid_cells",
+            "engine_signals",
+            "character_routines",
         ];
 
         let restore_result: Result<()> = (|| {
-            self.conn.execute_batch("PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE;")?;
+            self.conn
+                .execute_batch("PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE;")?;
             for t in &tables {
-                // Only restore tables that exist in the backup snapshot (forward/backward compatible)
+                // Only restore tables that exist in the backup snapshot (forward/backward compatible).
                 let exists: i64 = self.conn.query_row(
                     "SELECT COUNT(*) FROM bak.sqlite_master WHERE type = 'table' AND name = ?1",
                     params![t],
                     |r| r.get(0),
                 )?;
-                self.conn.execute(&format!("DELETE FROM main.{t}"), [])?;
+                self.conn.execute(&format!("DELETE FROM main.\"{t}\""), [])?;
                 if exists > 0 {
-                    self.conn.execute(
-                        &format!("INSERT INTO main.{t} SELECT * FROM bak.{t}"),
-                        [],
-                    )?;
+                    // Compute exact column intersection between main.{t} and bak.{t} so pre-Phase-1/2
+                    // backups (e.g. 10-column `events` or 5-column `relations`) restore seamlessly,
+                    // letting SQLite populate any newly-added columns with their schema defaults!
+                    let main_cols: Vec<String> = {
+                        let mut stmt = self.conn.prepare(&format!("PRAGMA main.table_info(\"{t}\")"))?;
+                        let cols = stmt
+                            .query_map([], |r| r.get::<_, String>(1))?
+                            .filter_map(|r| r.ok())
+                            .collect();
+                        cols
+                    };
+                    let bak_cols: std::collections::BTreeSet<String> = {
+                        let mut stmt = self.conn.prepare(&format!("PRAGMA bak.table_info(\"{t}\")"))?;
+                        let cols = stmt
+                            .query_map([], |r| r.get::<_, String>(1))?
+                            .filter_map(|r| r.ok())
+                            .collect();
+                        cols
+                    };
+                    let common: Vec<String> = main_cols
+                        .into_iter()
+                        .filter(|c| bak_cols.contains(c))
+                        .map(|c| format!("\"{c}\""))
+                        .collect();
+                    if !common.is_empty() {
+                        let col_list = common.join(", ");
+                        self.conn.execute(
+                            &format!(
+                                "INSERT INTO main.\"{t}\" ({col_list}) SELECT {col_list} FROM bak.\"{t}\""
+                            ),
+                            [],
+                        )?;
+                    }
                 }
             }
-            // Rebuild FTS5 virtual tables cleanly from restored base tables
+            // Rebuild all FTS5 virtual tables cleanly from restored base tables
             self.conn.execute_batch(
                 "DELETE FROM lore_fts;
                  INSERT INTO lore_fts (id, title, category, summary, body, keywords, tags)
@@ -3379,9 +4029,32 @@ impl CampaignDb {
                  DELETE FROM events_fts;
                  INSERT INTO events_fts (seq, world_time, summary, details)
                    SELECT seq, world_time, summary, payload_json FROM events;
-                 COMMIT;
-                 PRAGMA foreign_keys = ON;",
+                 DELETE FROM knowledge_claims_fts;
+                 DELETE FROM factions_fts;",
             )?;
+            for claim in self.list_knowledge_claims()? {
+                self.conn.execute(
+                    "INSERT INTO knowledge_claims_fts (id, subject, claim, tags) VALUES (?1, ?2, ?3, ?4)",
+                    params![claim.id, claim.subject, claim.claim, claim.tags.join(" ")],
+                )?;
+            }
+            for faction in self.list_factions()? {
+                self.conn.execute(
+                    "INSERT INTO factions_fts (id, name, faction_type, ideology, origins, notes, tags)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        faction.id,
+                        faction.name,
+                        faction.faction_type,
+                        faction.ideology,
+                        faction.origins,
+                        faction.notes,
+                        faction.tags.join(" ")
+                    ],
+                )?;
+            }
+            self.conn
+                .execute_batch("COMMIT; PRAGMA foreign_keys = ON;")?;
             Ok(())
         })();
 
@@ -3507,6 +4180,9 @@ fn row_to_catalog_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<CatalogItem>
     let kw_json: String = row.get(16)?;
     let tags_json: String = row.get(17)?;
     let rel_json: String = row.get(18)?;
+    let gm_meas_json: String = row.get(21).unwrap_or_else(|_| "{}".to_string());
+    let garment_cut: String = row.get(22).unwrap_or_default();
+    let garment_taper: String = row.get(23).unwrap_or_default();
     Ok(CatalogItem {
         id: row.get(0)?,
         name: row.get(1)?,
@@ -3527,6 +4203,9 @@ fn row_to_catalog_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<CatalogItem>
         keywords: serde_json::from_str(&kw_json).unwrap_or_default(),
         tags: serde_json::from_str(&tags_json).unwrap_or_default(),
         related_ids: serde_json::from_str(&rel_json).unwrap_or_default(),
+        garment_measurements: serde_json::from_str(&gm_meas_json).unwrap_or_default(),
+        garment_cut,
+        garment_taper,
         created_at_world_time: row.get(19)?,
         updated_at_world_time: row.get(20)?,
     })
@@ -3600,6 +4279,10 @@ fn row_to_relation(row: &rusqlite::Row<'_>) -> rusqlite::Result<GraphRelation> {
 
 fn row_to_clock(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProgressClock> {
     let rel_json: String = row.get(7)?;
+    let cadence_raw: Option<i64> = row.get(8).unwrap_or(None);
+    let last_tick: Option<i64> = row.get(9).unwrap_or(None);
+    let consequence: String = row.get(10).unwrap_or_default();
+    let auto_reset_int: i64 = row.get(11).unwrap_or(0);
     Ok(ProgressClock {
         id: row.get(0)?,
         name: row.get(1)?,
@@ -3609,6 +4292,10 @@ fn row_to_clock(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProgressClock> {
         status: row.get(5)?,
         description: row.get(6)?,
         related_ids: serde_json::from_str(&rel_json).unwrap_or_default(),
+        cadence_hours: cadence_raw.filter(|&h| h > 0).map(|h| h as u64),
+        last_tick_total_hours: last_tick,
+        consequence_on_fill: consequence,
+        auto_reset: auto_reset_int != 0,
     })
 }
 

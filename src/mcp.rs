@@ -13,8 +13,9 @@ use crate::maintenance::{
     UpdateClockRequest, UpdateEntityHistoryRequest, UpdatePlaceBaselineRequest,
 };
 use crate::mechanics::{
-    parse_modifier_sources, CheckRequest, ContestParticipantInput, ContestRequest, DrawContext,
-    DrawTableRequest, EncounterParticipant, EventCausalMeta, RandomTable, RulesetProfile,
+    parse_modifier_sources, CheckRequest, ContestParticipantInput, ContestRequest, DcFactorInput,
+    DrawContext, DrawTableRequest, EncounterParticipant, EventCausalMeta, RandomTable,
+    RulesetProfile,
 };
 use crate::models::{
     slugify, CatalogItem, CharacterBaseline, EntityHistoryEntry, EventPayload, GraphRelation, Item,
@@ -27,8 +28,9 @@ use crate::search::{
     RelationSearchFilter, TextSearchFilter,
 };
 use crate::world_sim::{
-    CraftingProject, CrimeRecord, InjuryRecord, ItemEconomics, JurisdictionRecord, PlaceSpatialExt,
-    SettlementMarket, TravelRoute,
+    CharacterProgressionTrack, CraftingProject, CrimeRecord, InjuryRecord, ItemEconomics,
+    JurisdictionRecord, PlaceSpatialExt, ProgressionLadder, ProgressionStageDef, SettlementMarket,
+    TravelRoute,
 };
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -37,6 +39,51 @@ use std::io::{self, BufRead, Write};
 
 const SERVER_NAME: &str = "chronicle-rpg-gm";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Controls which tool schema surface `tools/list` and `export_tool_schemas` advertise to MCP clients.
+/// Note: `execute_tool` ALWAYS accepts both unified domain tools AND all legacy granular tool names!
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolProfile {
+    /// Sanitized live-play surface: 12 unified domain tools (`scene`, `query`, `resolve`, `commit_turn`,
+    /// `character`, `progression`, `world`, `society`, `codex`, `economy`, `search`, `fetch`) — ~80% fewer schema tokens.
+    Play,
+    /// Sanitized surface + `admin` maintenance/hygiene facade (13 tools).
+    CompactFull,
+    /// Full backward-compatible catalog (all legacy granular tools + unified domain facades).
+    Legacy,
+}
+
+impl ToolProfile {
+    pub fn parse_opt(raw: Option<&str>) -> Self {
+        match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            Some("play") | Some("compact") | Some("sanitized") => Self::Play,
+            Some("compact-full") | Some("compact_full") | Some("full-compact") => Self::CompactFull,
+            _ => Self::Legacy,
+        }
+    }
+}
+
+static TOOL_PROFILE_OVERRIDE: std::sync::OnceLock<std::sync::RwLock<Option<ToolProfile>>> =
+    std::sync::OnceLock::new();
+
+pub fn set_active_tool_profile(profile: Option<ToolProfile>) {
+    let lock = TOOL_PROFILE_OVERRIDE.get_or_init(|| std::sync::RwLock::new(None));
+    if let Ok(mut guard) = lock.write() {
+        *guard = profile;
+    }
+}
+
+pub fn active_tool_profile() -> ToolProfile {
+    if let Some(lock) = TOOL_PROFILE_OVERRIDE.get() {
+        if let Ok(guard) = lock.read() {
+            if let Some(p) = *guard {
+                return p;
+            }
+        }
+    }
+    let env_val = std::env::var("CHRONICLE_TOOL_PROFILE").ok();
+    ToolProfile::parse_opt(env_val.as_deref())
+}
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
@@ -192,7 +239,7 @@ fn handle_request(
                     "name": SERVER_NAME,
                     "version": SERVER_VERSION
                 },
-                "instructions": "Chronicle RPG GM Engine. Follow strict read order: campaign_status -> get_scene_context(format: 'markdown') -> targeted search_*/get_*. Use roll_dice before adjudicating uncertain outcomes, batch mutations in commit_turn (advance_time -> move_character -> character deltas -> update_place -> texts/lore -> relations/clocks -> log_event), and never reveal unread Books/Scrolls content until record_text_reading is logged."
+                "instructions": "Chronicle active RPG simulation & rules engine. Read order: `scene(action='status')` / `campaign_status` -> `scene(action='context', format='markdown')` / `get_scene_context(format='markdown')` (inspect `## Engine Alarms & Active Directives` at the very top!) -> targeted `query(...)` / `read_campaign_file`. Always resolve uncertain actions via `resolve(op='check', dc_tier=..., dc_factors=...)` / `resolve_check` (auto-hydrates stats, skills, gear, apparel fit, titles, traits, proficiencies, injuries, encumbrance, weather, and trickles Skill -> Stat Training + Job XP). Use declarative `stage_rules` on progression tracks/ladders and standing `character(op='routine')` habits to automate recurring transformations, wages, upkeep, and practice. Commit turns atomically in ONE `commit_turn` call (`advance_minutes`, `actions`, `log`)."
             }))
         }
         "ping" => Ok(json!({})),
@@ -256,15 +303,25 @@ fn handle_tool_call(
     };
 
     match exec_result {
-        Ok(data) => {
+        Ok(mut data) => {
+            // Over remote HTTP MCP (e.g. ChatGPT Connectors), strip local host filesystem prefixes
+            // (like `D:\...\my-campaign\`) down to clean campaign-relative paths so host internals
+            // never leak or trigger upstream DLP / redaction filters.
+            let is_remote_http = base_url.is_some();
+            if is_remote_http {
+                sanitize_http_response_value(&mut data, engine.root_dir());
+            }
             let text = if let Some(s) = data.as_str() {
                 s.to_string()
             } else {
                 serde_json::to_string(&data)?
             };
-            // Return both `content` (JSON/text) and `structuredContent` (when object)
-            // for full MCP 2025-06-18 & ChatGPT Connectors/Apps compatibility.
-            if data.is_object() {
+            // Always include `structuredContent` for ChatGPT Connector `search`/`fetch` and small
+            // object responses (<= 8 KB). Omit redundant `structuredContent` on larger objects so
+            // payloads do not double on the wire and trip client size/redaction limits.
+            let include_structured =
+                data.is_object() && (name == "search" || name == "fetch" || text.len() <= 8192);
+            if include_structured {
                 Ok(json!({
                     "content": [{ "type": "text", "text": text }],
                     "structuredContent": data,
@@ -282,6 +339,77 @@ fn handle_tool_call(
             "isError": true
         })),
     }
+}
+
+/// Recursively converts local host campaign directory prefixes (both Windows `\` and POSIX `/`)
+/// into clean campaign-relative paths for remote HTTP MCP responses.
+fn sanitize_http_response_value(val: &mut Value, campaign_root: &std::path::Path) {
+    let raw_root = campaign_root.display().to_string();
+    let norm_root = raw_root.replace('\\', "/");
+    let root_no_slash = norm_root.trim_end_matches('/');
+    if root_no_slash.is_empty() {
+        return;
+    }
+    fn walk(v: &mut Value, root_fwd: &str, root_back: &str) {
+        match v {
+            Value::String(s) => {
+                let mut replaced = false;
+                if s.contains(root_back) {
+                    *s = s.replace(root_back, "").replace('\\', "/");
+                    replaced = true;
+                } else if s.contains(root_fwd) {
+                    *s = s.replace(root_fwd, "");
+                    replaced = true;
+                }
+                if replaced {
+                    let trimmed = s.trim_start_matches('/');
+                    if trimmed.is_empty() {
+                        *s = ".".to_string();
+                    } else {
+                        *s = trimmed.to_string();
+                    }
+                }
+            }
+            Value::Array(arr) => {
+                for item in arr {
+                    walk(item, root_fwd, root_back);
+                }
+            }
+            Value::Object(map) => {
+                for (_, item) in map.iter_mut() {
+                    walk(item, root_fwd, root_back);
+                }
+            }
+            _ => {}
+        }
+    }
+    let root_back = root_no_slash.replace('/', "\\");
+    walk(val, root_no_slash, &root_back);
+}
+
+fn summarize_turn_action_result(tool: &str, res: &Value, seq_opt: Option<i64>) -> String {
+    let prefix = seq_opt.map(|s| format!("#{s} ")).unwrap_or_default();
+    if let Some(outcome) = res.get("outcome").and_then(|v| v.as_str()) {
+        let total = res.get("total").and_then(|v| v.as_i64()).unwrap_or(0);
+        let dc = res.get("difficulty").and_then(|v| v.as_i64()).unwrap_or(0);
+        return format!("{prefix}{tool}: {outcome} (total {total} vs DC {dc})");
+    }
+    if let Some(winner) = res.get("winner_id").and_then(|v| v.as_str()) {
+        let margin = res.get("margin").and_then(|v| v.as_i64()).unwrap_or(0);
+        return format!("{prefix}{tool}: winner={winner} (margin {margin})");
+    }
+    if let Some(summary) = res.get("summary").and_then(|v| v.as_str()) {
+        if !summary.is_empty() {
+            return format!("{prefix}{tool}: {summary}");
+        }
+    }
+    if let Some(wt) = res.get("world_time").and_then(|v| v.as_str()) {
+        return format!("{prefix}{tool}: world_time={wt}");
+    }
+    if let Some(total) = res.get("total").and_then(|v| v.as_i64()) {
+        return format!("{prefix}{tool}: total={total}");
+    }
+    format!("{prefix}{tool}: ok")
 }
 
 /// ChatGPT-standard `search` tool (Connector / Deep Research spec):
@@ -587,6 +715,10 @@ pub fn execute_tool_with_policy(
             let pending_discoveries = engine.db().list_staged_discoveries(Some("pending"))?;
             let factions = engine.db().list_factions()?;
             let claims = engine.db().list_knowledge_claims()?;
+            let routines = engine.db().list_routines(None).unwrap_or_default();
+            let active_signals = engine
+                .list_active_signals(Some("gm"), None, &[], true)
+                .unwrap_or_default();
             let chain_report = engine.db().verify_event_chain_detailed()?;
             let db_identity = engine.db().database_identity()?;
             Ok(json!({
@@ -608,10 +740,13 @@ pub fn execute_tool_with_policy(
                     "pending_discoveries": pending_discoveries.len(),
                     "factions": factions.len(),
                     "knowledge_claims": claims.len(),
+                    "routines": routines.len(),
+                    "active_signals": active_signals.len(),
                     "events": chain_report.total_events
                 },
                 "ledger_hash_chain_valid": chain_report.valid,
                 "ledger_chain_report": chain_report,
+                "active_signals": active_signals,
                 "active_clocks": clocks,
                 "active_encounters": active_encounters.iter().map(|e| json!({
                     "id": e.id,
@@ -664,12 +799,16 @@ pub fn execute_tool_with_policy(
             let reason = opt_str(&args, "reason");
             let (clock, season_changed, ev) =
                 engine.advance_time(minutes, global_weather, reason)?;
+            let signals = engine
+                .list_active_signals(Some("gm"), None, &[], true)
+                .unwrap_or_default();
             Ok(json!({
                 "world_clock": clock,
                 "time_of_day": clock.time_of_day(),
                 "season_changed": season_changed,
                 "event_seq": ev.seq,
-                "summary": ev.summary
+                "summary": ev.summary,
+                "signals": signals
             }))
         }
 
@@ -696,11 +835,31 @@ pub fn execute_tool_with_policy(
         "get_character" => {
             let id = req_str(&args, "character_id")?;
             let as_of = args.get("as_of_seq").and_then(|v| v.as_i64());
-            let proj = engine.get_character(&id, as_of)?;
+            let include_full = args
+                .get("include_full_event_log")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let event_limit = args
+                .get("event_log_limit")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+                .unwrap_or(10);
+            let mut proj = engine.get_character(&id, as_of)?;
+            let total_event_count = proj.event_log.len();
+            if !include_full && event_limit > 0 && proj.event_log.len() > event_limit {
+                let start = proj.event_log.len() - event_limit;
+                proj.event_log = proj.event_log.split_off(start);
+            }
             let rels = engine.db().list_relations_for_entity(&proj.baseline.id)?;
+            let progressions = engine
+                .db()
+                .list_character_progressions(&proj.baseline.id)
+                .unwrap_or_default();
             Ok(json!({
                 "doc_path": engine.docs_dir().join("characters").join(format!("{}.md", proj.baseline.id)).display().to_string(),
+                "total_event_count": total_event_count,
                 "character": proj,
+                "progression_tracks": progressions,
                 "relations": rels
             }))
         }
@@ -716,13 +875,17 @@ pub fn execute_tool_with_policy(
         "modify_character_resource" => {
             let cid = req_str(&args, "character_id")?;
             let resource = req_str(&args, "resource")?;
-            let delta = args.get("delta").and_then(|v| v.as_i64());
-            let set_current = args.get("set_current").and_then(|v| v.as_i64());
-            let set_max = args.get("set_max").and_then(|v| v.as_i64());
-            let unit = opt_str(&args, "unit");
+            let remove = args.get("remove").and_then(|v| v.as_bool()).unwrap_or(false);
             let reason = opt_str(&args, "reason").unwrap_or_default();
-            let (proj, ev) =
-                engine.modify_resource(&cid, &resource, delta, set_current, set_max, unit, &reason)?;
+            let (proj, ev) = if remove {
+                engine.remove_resource(&cid, &resource, &reason)?
+            } else {
+                let delta = args.get("delta").and_then(|v| v.as_i64());
+                let set_current = args.get("set_current").and_then(|v| v.as_i64());
+                let set_max = args.get("set_max").and_then(|v| v.as_i64());
+                let unit = opt_str(&args, "unit");
+                engine.modify_resource(&cid, &resource, delta, set_current, set_max, unit, &reason)?
+            };
             Ok(json!({
                 "event_seq": ev.seq,
                 "summary": ev.summary,
@@ -782,10 +945,23 @@ pub fn execute_tool_with_policy(
             let cid = req_str(&args, "character_id")?;
             let action = req_str(&args, "action")?;
             let reason = opt_str(&args, "reason").unwrap_or_default();
+            let parse_garment_meas = || -> std::collections::BTreeMap<String, String> {
+                let mut m = std::collections::BTreeMap::new();
+                if let Some(obj) = args.get("garment_measurements").and_then(|v| v.as_object()) {
+                    for (k, v) in obj {
+                        let s = v
+                            .as_str()
+                            .map(|x| x.trim().to_string())
+                            .unwrap_or_else(|| v.to_string());
+                        m.insert(k.trim().to_string(), s);
+                    }
+                }
+                m
+            };
             match action.to_lowercase().as_str() {
                 "acquire" | "add" => {
                     let item = Item {
-                        name: req_str(&args, "name")?,
+                        name: req_str(&args, "name").or_else(|_| req_str(&args, "item_name"))?,
                         slot: opt_str(&args, "slot"),
                         quantity: args.get("quantity").and_then(|v| v.as_i64()).unwrap_or(1),
                         equipped: args
@@ -795,38 +971,264 @@ pub fn execute_tool_with_policy(
                         durability: opt_str(&args, "durability"),
                         tags: opt_str_vec(&args, "tags"),
                         description: opt_str(&args, "description").unwrap_or_default(),
+                        garment_measurements: parse_garment_meas(),
+                        garment_cut: opt_str(&args, "garment_cut").unwrap_or_default(),
+                        garment_taper: opt_str(&args, "garment_taper").unwrap_or_default(),
                     };
+                    let iname = item.name.clone();
                     let (proj, ev) = engine.add_item(&cid, item, &reason)?;
-                    Ok(json!({ "event_seq": ev.seq, "summary": ev.summary, "equipment": proj.current.equipment }))
+                    let fit_report = engine
+                        .get_character_profile(&cid)
+                        .ok()
+                        .and_then(|prof| {
+                            proj.current
+                                .equipment
+                                .iter()
+                                .find(|i| i.name.eq_ignore_ascii_case(&iname))
+                                .and_then(|it| crate::autonomy::evaluate_garment_fit(it, &prof.avatar))
+                        });
+                    Ok(json!({ "event_seq": ev.seq, "summary": ev.summary, "fit_report": fit_report, "equipment": proj.current.equipment }))
+                }
+                "tailor" | "resize" | "update" => {
+                    let item = Item {
+                        name: req_str(&args, "name").or_else(|_| req_str(&args, "item_name"))?,
+                        slot: opt_str(&args, "slot"),
+                        quantity: 0,
+                        equipped: args
+                            .get("equipped")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
+                        durability: opt_str(&args, "durability"),
+                        tags: opt_str_vec(&args, "tags"),
+                        description: opt_str(&args, "description").unwrap_or_default(),
+                        garment_measurements: parse_garment_meas(),
+                        garment_cut: opt_str(&args, "garment_cut").unwrap_or_default(),
+                        garment_taper: opt_str(&args, "garment_taper").unwrap_or_default(),
+                    };
+                    let iname = item.name.clone();
+                    let (proj, ev) = engine.add_item(&cid, item, &reason)?;
+                    let fit_report = engine
+                        .get_character_profile(&cid)
+                        .ok()
+                        .and_then(|prof| {
+                            proj.current
+                                .equipment
+                                .iter()
+                                .find(|i| i.name.eq_ignore_ascii_case(&iname))
+                                .and_then(|it| crate::autonomy::evaluate_garment_fit(it, &prof.avatar))
+                        });
+                    Ok(json!({ "event_seq": ev.seq, "summary": ev.summary, "fit_report": fit_report, "equipment": proj.current.equipment }))
                 }
                 "remove" | "consume" => {
-                    let name = req_str(&args, "name")?;
+                    let name = req_str(&args, "name").or_else(|_| req_str(&args, "item_name"))?;
                     let qty = args.get("quantity").and_then(|v| v.as_i64()).unwrap_or(1);
                     let (proj, ev) = engine.remove_item(&cid, &name, qty, &reason)?;
                     Ok(json!({ "event_seq": ev.seq, "summary": ev.summary, "equipment": proj.current.equipment }))
                 }
                 "equip" | "unequip" => {
-                    let name = req_str(&args, "name")?;
+                    let name = req_str(&args, "name").or_else(|_| req_str(&args, "item_name"))?;
                     let slot = opt_str(&args, "slot");
                     let equipped = action.eq_ignore_ascii_case("equip");
                     let (proj, ev) = engine.equip_item(&cid, &name, slot, equipped)?;
-                    Ok(json!({ "event_seq": ev.seq, "summary": ev.summary, "equipment": proj.current.equipment }))
+                    let fit_report = if equipped {
+                        engine.get_character_profile(&cid).ok().and_then(|prof| {
+                            proj.current
+                                .equipment
+                                .iter()
+                                .find(|i| i.name.eq_ignore_ascii_case(&name))
+                                .and_then(|it| crate::autonomy::evaluate_garment_fit(it, &prof.avatar))
+                        })
+                    } else {
+                        None
+                    };
+                    Ok(json!({ "event_seq": ev.seq, "summary": ev.summary, "fit_report": fit_report, "equipment": proj.current.equipment }))
+                }
+                "tag" | "set_tags" | "add_tags" | "remove_tags" => {
+                    if let Some(batch) = args.get("items").and_then(|v| v.as_array()) {
+                        let results = engine.with_deferred_compile(|eng| -> Result<Vec<Value>> {
+                            let mut out = Vec::new();
+                            for entry in batch {
+                                let iname = req_str(entry, "name")
+                                    .or_else(|_| req_str(entry, "item_name"))?;
+                                let add_t = opt_str_vec(entry, "add_tags");
+                                let rem_t = opt_str_vec(entry, "remove_tags");
+                                let rep_t = entry
+                                    .get("set_tags")
+                                    .or_else(|| entry.get("replace_tags"))
+                                    .or_else(|| entry.get("tags"))
+                                    .and_then(|v| v.as_array())
+                                    .map(|arr| {
+                                        arr.iter()
+                                            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                            .collect::<Vec<_>>()
+                                    });
+                                let item_reason = opt_str(entry, "reason").unwrap_or_else(|| reason.clone());
+                                let (_, ev) = eng.update_item_tags(
+                                    &cid,
+                                    &iname,
+                                    add_t,
+                                    rem_t,
+                                    rep_t,
+                                    &item_reason,
+                                )?;
+                                out.push(json!({ "name": iname, "event_seq": ev.seq, "summary": ev.summary }));
+                            }
+                            Ok(out)
+                        })?;
+                        let inv = engine.search_inventory(&crate::search::InventorySearchFilter {
+                            character_id: Some(cid.clone()),
+                            ..Default::default()
+                        })?;
+                        return Ok(json!({
+                            "updated_count": results.len(),
+                            "results": results,
+                            "tag_facets": inv.tag_facets
+                        }));
+                    }
+                    let name = req_str(&args, "name").or_else(|_| req_str(&args, "item_name"))?;
+                    let mut add_t = opt_str_vec(&args, "add_tags");
+                    let mut rem_t = opt_str_vec(&args, "remove_tags");
+                    let mut rep_t = args
+                        .get("set_tags")
+                        .or_else(|| args.get("replace_tags"))
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                .collect::<Vec<_>>()
+                        });
+                    if rep_t.is_none() && add_t.is_empty() && rem_t.is_empty() {
+                        let plain_tags = opt_str_vec(&args, "tags");
+                        match action.to_lowercase().as_str() {
+                            "add_tags" => add_t = plain_tags,
+                            "remove_tags" => rem_t = plain_tags,
+                            _ => rep_t = Some(plain_tags),
+                        }
+                    }
+                    let (proj, ev) = engine.update_item_tags(&cid, &name, add_t, rem_t, rep_t, &reason)?;
+                    let inv = engine.search_inventory(&crate::search::InventorySearchFilter {
+                        character_id: Some(cid.clone()),
+                        ..Default::default()
+                    })?;
+                    Ok(json!({
+                        "event_seq": ev.seq,
+                        "summary": ev.summary,
+                        "tag_facets": inv.tag_facets,
+                        "equipment": proj.current.equipment
+                    }))
+                }
+                "auto_tag" => engine.auto_tag_character_inventory(&cid, &reason),
+                "search" | "list" | "filter" => {
+                    let mut filter: crate::search::InventorySearchFilter =
+                        serde_json::from_value(args.clone()).unwrap_or_default();
+                    filter.character_id = Some(cid);
+                    let res = engine.search_inventory(&filter)?;
+                    Ok(serde_json::to_value(res)?)
                 }
                 other => Err(anyhow!(
-                    "Unknown equipment action '{other}'; expected 'acquire', 'remove', 'equip', or 'unequip'"
+                    "Unknown equipment action '{other}'; expected 'acquire', 'tailor', 'update', 'remove', 'equip', 'unequip', 'tag', 'auto_tag', or 'search'"
                 )),
             }
         }
 
         "upsert_character_skill" => {
             let cid = req_str(&args, "character_id")?;
+            let name = req_str(&args, "name")?;
             let reason = opt_str(&args, "reason").unwrap_or_default();
+            let profile_opt = opt_str(&args, "profile");
+            let recalc_rank = args
+                .get("recalc_rank")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+
+            if args.get("reset_xp").and_then(|v| v.as_bool()).unwrap_or(false) {
+                let (res, _) = engine.adjust_skill_xp(
+                    &cid,
+                    &name,
+                    None,
+                    Some(0),
+                    recalc_rank,
+                    profile_opt.as_deref(),
+                    if reason.is_empty() { "Skill XP reset to 0" } else { &reason },
+                )?;
+                return Ok(res);
+            }
+            if let Some(set_xp) = args.get("set_xp").and_then(|v| v.as_u64()) {
+                let (res, _) = engine.adjust_skill_xp(
+                    &cid,
+                    &name,
+                    None,
+                    Some(set_xp),
+                    recalc_rank,
+                    profile_opt.as_deref(),
+                    &reason,
+                )?;
+                return Ok(res);
+            }
+            if let Some(delta_xp) = args
+                .get("add_xp")
+                .or_else(|| args.get("delta_xp"))
+                .and_then(|v| v.as_i64())
+            {
+                if delta_xp > 0 {
+                    let (prog, ev) = engine.grant_skill_xp(
+                        &cid,
+                        &name,
+                        delta_xp as u64,
+                        profile_opt.as_deref(),
+                        &reason,
+                    )?;
+                    let proj = engine.get_character(&cid, None)?;
+                    return Ok(json!({
+                        "event_seq": ev.seq,
+                        "summary": ev.summary,
+                        "progression": prog,
+                        "skills": proj.current.skills
+                    }));
+                } else if delta_xp < 0 {
+                    let (res, _) = engine.adjust_skill_xp(
+                        &cid,
+                        &name,
+                        Some(delta_xp),
+                        None,
+                        recalc_rank,
+                        profile_opt.as_deref(),
+                        &reason,
+                    )?;
+                    return Ok(res);
+                }
+            }
+            let existing_skill = engine
+                .get_character(&cid, None)
+                .ok()
+                .and_then(|p| {
+                    p.current
+                        .skills
+                        .into_iter()
+                        .find(|s| s.name.eq_ignore_ascii_case(&name))
+                });
             let skill = Skill {
-                name: req_str(&args, "name")?,
-                rank: opt_str(&args, "rank").unwrap_or_else(|| "Novice".to_string()),
-                category: opt_str(&args, "category").unwrap_or_default(),
-                modifier: opt_str(&args, "modifier"),
-                description: opt_str(&args, "description").unwrap_or_default(),
+                name,
+                rank: opt_str(&args, "rank")
+                    .or_else(|| existing_skill.as_ref().map(|s| s.rank.clone()))
+                    .unwrap_or_else(|| "Novice".to_string()),
+                category: opt_str(&args, "category")
+                    .or_else(|| existing_skill.as_ref().map(|s| s.category.clone()))
+                    .unwrap_or_default(),
+                modifier: opt_str(&args, "modifier")
+                    .or_else(|| existing_skill.as_ref().and_then(|s| s.modifier.clone())),
+                description: opt_str(&args, "description")
+                    .or_else(|| existing_skill.as_ref().map(|s| s.description.clone()))
+                    .unwrap_or_default(),
+                governing_stat: opt_str(&args, "governing_stat")
+                    .or_else(|| existing_skill.as_ref().and_then(|s| s.governing_stat.clone())),
+                xp: args
+                    .get("xp")
+                    .and_then(|v| v.as_u64())
+                    .or_else(|| existing_skill.as_ref().map(|s| s.xp))
+                    .unwrap_or(0),
+                proficiency_tier: opt_str(&args, "proficiency_tier")
+                    .or_else(|| existing_skill.as_ref().and_then(|s| s.proficiency_tier.clone())),
             };
             let (proj, ev) = engine.upsert_skill(&cid, skill, &reason)?;
             Ok(json!({ "event_seq": ev.seq, "summary": ev.summary, "skills": proj.current.skills }))
@@ -834,15 +1236,84 @@ pub fn execute_tool_with_policy(
 
         "upsert_character_technique" => {
             let cid = req_str(&args, "character_id")?;
+            let name = req_str(&args, "name")?;
             let reason = opt_str(&args, "reason").unwrap_or_default();
+            let existing_tech = engine
+                .get_character(&cid, None)
+                .ok()
+                .and_then(|p| {
+                    p.current
+                        .techniques
+                        .into_iter()
+                        .find(|t| t.name.eq_ignore_ascii_case(&name))
+                });
+            let source_text_id = match args.get("source_text_id") {
+                Some(v) if v.is_null() => None,
+                Some(v) => v
+                    .as_str()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+                None => existing_tech
+                    .as_ref()
+                    .and_then(|t| t.source_text_id.clone()),
+            };
+            let source_item_id = match args.get("source_item_id") {
+                Some(v) if v.is_null() => None,
+                Some(v) => v
+                    .as_str()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+                None => existing_tech
+                    .as_ref()
+                    .and_then(|t| t.source_item_id.clone()),
+            };
+            let progression_track_id = match args.get("progression_track_id") {
+                Some(v) if v.is_null() => None,
+                Some(v) => v
+                    .as_str()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+                None => existing_tech
+                    .as_ref()
+                    .and_then(|t| t.progression_track_id.clone()),
+            };
+            let manual_title = if args.get("manual_title").is_some() {
+                opt_str(&args, "manual_title").unwrap_or_default()
+            } else if args.get("source_text_id").is_some() || args.get("source_item_id").is_some() {
+                String::new()
+            } else {
+                existing_tech
+                    .as_ref()
+                    .map(|t| t.manual_title.clone())
+                    .unwrap_or_default()
+            };
             let tech = Technique {
-                name: req_str(&args, "name")?,
-                tier: opt_str(&args, "tier").unwrap_or_default(),
-                cost: opt_str(&args, "cost").unwrap_or_default(),
-                cooldown: opt_str(&args, "cooldown").unwrap_or_default(),
-                mastery: opt_str(&args, "mastery").unwrap_or_default(),
-                effect: opt_str(&args, "effect").unwrap_or_default(),
-                description: opt_str(&args, "description").unwrap_or_default(),
+                name,
+                tier: opt_str(&args, "tier")
+                    .or_else(|| existing_tech.as_ref().map(|t| t.tier.clone()))
+                    .unwrap_or_default(),
+                cost: opt_str(&args, "cost")
+                    .or_else(|| existing_tech.as_ref().map(|t| t.cost.clone()))
+                    .unwrap_or_default(),
+                cooldown: opt_str(&args, "cooldown")
+                    .or_else(|| existing_tech.as_ref().map(|t| t.cooldown.clone()))
+                    .unwrap_or_default(),
+                mastery: opt_str(&args, "mastery")
+                    .or_else(|| existing_tech.as_ref().map(|t| t.mastery.clone()))
+                    .unwrap_or_default(),
+                effect: opt_str(&args, "effect")
+                    .or_else(|| existing_tech.as_ref().map(|t| t.effect.clone()))
+                    .unwrap_or_default(),
+                description: opt_str(&args, "description")
+                    .or_else(|| existing_tech.as_ref().map(|t| t.description.clone()))
+                    .unwrap_or_default(),
+                source_text_id,
+                source_item_id,
+                progression_track_id,
+                manual_title,
+                manual_notes: opt_str(&args, "manual_notes")
+                    .or_else(|| existing_tech.as_ref().map(|t| t.manual_notes.clone()))
+                    .unwrap_or_default(),
             };
             let (proj, ev) = engine.upsert_technique(&cid, tech, &reason)?;
             Ok(json!({ "event_seq": ev.seq, "summary": ev.summary, "techniques": proj.current.techniques }))
@@ -876,10 +1347,25 @@ pub fn execute_tool_with_policy(
         "get_place" => {
             let id = req_str(&args, "place_id")?;
             let as_of = args.get("as_of_seq").and_then(|v| v.as_i64());
-            let proj = engine.get_place(&id, as_of)?;
+            let include_full = args
+                .get("include_full_event_log")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let event_limit = args
+                .get("event_log_limit")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+                .unwrap_or(10);
+            let mut proj = engine.get_place(&id, as_of)?;
+            let total_event_count = proj.event_log.len();
+            if !include_full && event_limit > 0 && proj.event_log.len() > event_limit {
+                let start = proj.event_log.len() - event_limit;
+                proj.event_log = proj.event_log.split_off(start);
+            }
             let rels = engine.db().list_relations_for_entity(&proj.baseline.id)?;
             Ok(json!({
                 "doc_path": engine.docs_dir().join("places").join(format!("{}.md", proj.baseline.id)).display().to_string(),
+                "total_event_count": total_event_count,
                 "place": proj,
                 "relations": rels
             }))
@@ -1017,11 +1503,21 @@ pub fn execute_tool_with_policy(
 
         "get_text" => {
             let id = req_str(&args, "text_id")?;
+            let event_limit = args
+                .get("event_log_limit")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+                .unwrap_or(10);
             let text = engine.get_text(&id)?;
-            let events = engine.db().list_events_for_entity(&text.id)?;
+            let mut events = engine.db().list_events_for_entity(&text.id)?;
+            let total_event_count = events.len();
+            if event_limit > 0 && events.len() > event_limit {
+                events = events.split_off(events.len() - event_limit);
+            }
             let rels = engine.db().list_relations_for_entity(&text.id)?;
             Ok(json!({
                 "doc_path": engine.docs_dir().join("texts").join(format!("{}.md", text.id)).display().to_string(),
+                "total_event_count": total_event_count,
                 "text": text,
                 "relations": rels,
                 "event_log": events
@@ -1103,14 +1599,78 @@ pub fn execute_tool_with_policy(
                 .get("include_text_content")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
+            let offset_chars = args
+                .get("offset_chars")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            let max_chars = args
+                .get("max_chars")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+                .unwrap_or(6000);
+            let event_limit = args
+                .get("event_log_limit")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+                .unwrap_or(10);
             let att = engine.get_attachment(&id)?;
             let abs_path = engine.attachment_file_path(&att);
-            let events = engine.db().list_events_for_entity(&att.id)?;
+            let mut events = engine.db().list_events_for_entity(&att.id)?;
+            let total_event_count = events.len();
+            if event_limit > 0 && events.len() > event_limit {
+                events = events.split_off(events.len() - event_limit);
+            }
             let rels = engine.db().list_relations_for_entity(&att.id)?;
-            let text_content = if include_text
-                && (att.mime_type.starts_with("text/") || att.mime_type == "application/json")
-            {
-                std::fs::read_to_string(&abs_path).ok()
+            let ext_is_text = abs_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| {
+                    matches!(
+                        e.to_lowercase().as_str(),
+                        "md" | "markdown"
+                            | "txt"
+                            | "json"
+                            | "yaml"
+                            | "yml"
+                            | "toml"
+                            | "csv"
+                            | "tsv"
+                            | "xml"
+                            | "html"
+                            | "htm"
+                            | "rst"
+                            | "log"
+                            | "ini"
+                            | "cfg"
+                    )
+                })
+                .unwrap_or(false);
+            let is_text_mime = att.mime_type.starts_with("text/")
+                || att.mime_type == "application/json"
+                || att.mime_type == "application/xml"
+                || att.mime_type == "application/x-yaml"
+                || ext_is_text;
+            let mut text_total_chars: Option<usize> = None;
+            let mut text_has_more = false;
+            let mut text_next_offset: Option<usize> = None;
+            let text_content = if include_text && is_text_mime {
+                std::fs::read_to_string(&abs_path).ok().map(|full| {
+                    let total = full.chars().count();
+                    text_total_chars = Some(total);
+                    if max_chars == 0 && offset_chars == 0 {
+                        full
+                    } else {
+                        let safe_off = offset_chars.min(total);
+                        let take_n = if max_chars == 0 { total } else { max_chars };
+                        let slice: String = full.chars().skip(safe_off).take(take_n).collect();
+                        let next = safe_off + slice.chars().count();
+                        if next < total {
+                            text_has_more = true;
+                            text_next_offset = Some(next);
+                        }
+                        slice
+                    }
+                })
             } else {
                 None
             };
@@ -1120,11 +1680,48 @@ pub fn execute_tool_with_policy(
                 "mcp_uri": format!("chronicle://attachments/{}", att.id),
                 "relative_path": att.relative_path,
                 "absolute_path": abs_path.display().to_string(),
+                "total_event_count": total_event_count,
                 "attachment": att,
+                "verbatim": true,
                 "text_content": text_content,
+                "text_offset_chars": offset_chars,
+                "text_total_chars": text_total_chars,
+                "text_has_more": text_has_more,
+                "text_next_offset_chars": text_next_offset,
                 "relations": rels,
                 "event_log": events
             }))
+        }
+
+        "read_campaign_file" => {
+            let target = if args.get("list").and_then(|v| v.as_bool()).unwrap_or(false) {
+                "list".to_string()
+            } else if let Some(t) = opt_str(&args, "target") {
+                t
+            } else if let Some(aid) = opt_str(&args, "attachment_id") {
+                format!("attachment:{aid}")
+            } else if let Some(tid) = opt_str(&args, "text_id") {
+                format!("text:{tid}")
+            } else if let Some(lid) = opt_str(&args, "lore_id") {
+                format!("lore:{lid}")
+            } else if let Some(dp) = opt_str(&args, "doc_path") {
+                format!("doc:{dp}")
+            } else {
+                "list".to_string()
+            };
+            let offset_chars = args
+                .get("offset_chars")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            let chunk_chars = args
+                .get("chunk_chars")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(6000) as usize;
+            let gm_override = args
+                .get("gm_override")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            engine.read_campaign_file_chunk(&target, offset_chars, chunk_chars, gm_override)
         }
 
         "search_attachments" => {
@@ -1169,6 +1766,19 @@ pub fn execute_tool_with_policy(
 
         "upsert_item" => {
             let notes = opt_str(&args, "notes").unwrap_or_default();
+            let mut garment_measurements = std::collections::BTreeMap::new();
+            if let Some(obj) = args.get("garment_measurements").and_then(|v| v.as_object()) {
+                for (k, v) in obj {
+                    let nk = crate::autonomy::normalize_measurement_key(k);
+                    let vs = v
+                        .as_str()
+                        .map(|s| s.trim().to_string())
+                        .unwrap_or_else(|| v.to_string());
+                    if !nk.is_empty() && !vs.is_empty() {
+                        garment_measurements.insert(nk, vs);
+                    }
+                }
+            }
             let item = CatalogItem {
                 id: opt_str(&args, "id").unwrap_or_default(),
                 name: req_str(&args, "name")?,
@@ -1194,6 +1804,9 @@ pub fn execute_tool_with_policy(
                 keywords: opt_str_vec(&args, "keywords"),
                 tags: opt_str_vec(&args, "tags"),
                 related_ids: opt_str_vec(&args, "related_ids"),
+                garment_measurements,
+                garment_cut: opt_str(&args, "garment_cut").unwrap_or_default(),
+                garment_taper: opt_str(&args, "garment_taper").unwrap_or_default(),
                 created_at_world_time: String::new(),
                 updated_at_world_time: String::new(),
             };
@@ -1207,12 +1820,22 @@ pub fn execute_tool_with_policy(
 
         "get_item" => {
             let id = req_str(&args, "item_id")?;
+            let event_limit = args
+                .get("event_log_limit")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+                .unwrap_or(10);
             let item = engine.get_catalog_item(&id)?;
             let histories = engine.db().list_histories_for_entity(&item.id)?;
-            let events = engine.db().list_events_for_entity(&item.id)?;
+            let mut events = engine.db().list_events_for_entity(&item.id)?;
+            let total_event_count = events.len();
+            if event_limit > 0 && events.len() > event_limit {
+                events = events.split_off(events.len() - event_limit);
+            }
             let rels = engine.db().list_relations_for_entity(&item.id)?;
             Ok(json!({
                 "doc_path": engine.docs_dir().join("items").join(format!("{}.md", item.id)).display().to_string(),
+                "total_event_count": total_event_count,
                 "item": item,
                 "histories": histories,
                 "relations": rels,
@@ -1242,7 +1865,52 @@ pub fn execute_tool_with_policy(
             }
             let filter: ItemSearchFilter = serde_json::from_value(args)?;
             let items = engine.search_items_by(&filter)?;
-            Ok(json!({ "count": items.len(), "items": items }))
+            let all_items = engine.db().list_catalog_items()?;
+            let tag_facets = crate::search::compute_catalog_tag_facets(&all_items);
+            Ok(json!({
+                "count": items.len(),
+                "total_catalog_count": all_items.len(),
+                "tag_facets": tag_facets,
+                "items": items
+            }))
+        }
+
+        "search_inventory" => {
+            let filter: crate::search::InventorySearchFilter = serde_json::from_value(args)?;
+            let res = engine.search_inventory(&filter)?;
+            Ok(serde_json::to_value(res)?)
+        }
+
+        "tag_catalog_item" => {
+            let item_id = req_str(&args, "item_id").or_else(|_| req_str(&args, "id"))?;
+            let add_t = opt_str_vec(&args, "add_tags");
+            let rem_t = opt_str_vec(&args, "remove_tags");
+            let rep_t = args
+                .get("set_tags")
+                .or_else(|| args.get("replace_tags"))
+                .or_else(|| {
+                    if add_t.is_empty() && rem_t.is_empty() {
+                        args.get("tags")
+                    } else {
+                        None
+                    }
+                })
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .collect::<Vec<_>>()
+                });
+            let reason = opt_str(&args, "reason")
+                .or_else(|| opt_str(&args, "notes"))
+                .unwrap_or_default();
+            let (saved, ev) =
+                engine.update_catalog_item_tags(&item_id, add_t, rem_t, rep_t, &reason)?;
+            Ok(json!({
+                "event_seq": ev.seq,
+                "summary": ev.summary,
+                "item": saved
+            }))
         }
 
         "add_entity_history" => {
@@ -1495,29 +2163,146 @@ pub fn execute_tool_with_policy(
         }
 
         "commit_turn" => {
-            let actions = args
-                .get("actions")
-                .and_then(|v| v.as_array())
-                .ok_or_else(|| anyhow!("Missing 'actions' array for commit_turn"))?;
-            let mut results = Vec::new();
-            for (idx, act) in actions.iter().enumerate() {
-                let tool_name = act
-                    .get("tool")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow!("Action #{idx} missing 'tool' string"))?;
-                if tool_name == "commit_turn" {
-                    return Err(anyhow!("Nested commit_turn is not allowed"));
+            let mut planned: Vec<(String, Value)> = Vec::new();
+            if let Some(mins) = args.get("advance_minutes").and_then(|v| v.as_u64()) {
+                if mins > 0 {
+                    let mut ta = json!({ "minutes": mins });
+                    if let Some(r) = opt_str(&args, "time_reason") {
+                        ta["reason"] = Value::String(r);
+                    }
+                    planned.push(("advance_time".to_string(), ta));
                 }
-                let tool_args = act.get("arguments").cloned().unwrap_or_else(|| json!({}));
-                let res =
-                    execute_tool_with_policy(engine, tool_name, tool_args, allow_local_file_import)
-                        .map_err(|e| anyhow!("Action #{idx} ('{tool_name}') failed: {e}"))?;
-                results.push(json!({ "index": idx, "tool": tool_name, "result": res }));
             }
-            Ok(json!({
-                "committed_actions": results.len(),
-                "results": results
-            }))
+            if let Some(actions) = args.get("actions").and_then(|v| v.as_array()) {
+                for (idx, act) in actions.iter().enumerate() {
+                    let tool_name = act
+                        .get("tool")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| anyhow!("Action #{idx} missing 'tool' string"))?;
+                    if tool_name == "commit_turn" {
+                        return Err(anyhow!("Nested commit_turn is not allowed"));
+                    }
+                    let tool_args = act.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                    planned.push((tool_name.to_string(), tool_args));
+                }
+            }
+            let trailing_log: Option<Value> = if let Some(log_obj) = args.get("log").filter(|v| v.is_object()) {
+                Some(log_obj.clone())
+            } else if let Some(title) = opt_str(&args, "narrative_title") {
+                Some(json!({
+                    "title": title,
+                    "details": opt_str(&args, "narrative_details").unwrap_or_default(),
+                    "location_id": opt_str(&args, "location_id"),
+                    "affected_entities": opt_str_vec(&args, "affected_entities"),
+                    "tags": opt_str_vec(&args, "tags"),
+                    "visibility": opt_str(&args, "visibility").unwrap_or_else(|| "public".to_string())
+                }))
+            } else {
+                None
+            };
+            if planned.is_empty() && trailing_log.is_none() {
+                return Err(anyhow!(
+                    "commit_turn requires at least one of: 'actions', 'advance_minutes', 'log', or 'narrative_title'"
+                ));
+            }
+            let compact = args
+                .get("compact")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            engine.with_deferred_compile(|engine| {
+                let mut results = Vec::new();
+                let mut event_seqs: Vec<i64> = Vec::new();
+                let mut receipt_parts: Vec<String> = Vec::new();
+                for (idx, (tool_name, tool_args)) in planned.into_iter().enumerate() {
+                    let res = execute_tool_with_policy(
+                        engine,
+                        &tool_name,
+                        tool_args,
+                        allow_local_file_import,
+                    )
+                    .map_err(|e| anyhow!("Action #{idx} ('{tool_name}') failed: {e}"))?;
+                    let seq_opt = res
+                        .get("event_seq")
+                        .or_else(|| res.get("event_id"))
+                        .and_then(|v| v.as_i64());
+                    if let Some(s) = seq_opt {
+                        event_seqs.push(s);
+                    }
+                    let step_summary = summarize_turn_action_result(&tool_name, &res, seq_opt);
+                    receipt_parts.push(step_summary.clone());
+                    if compact {
+                        let mut slim = json!({
+                            "index": idx,
+                            "tool": tool_name,
+                            "summary": step_summary
+                        });
+                        if let Some(s) = seq_opt {
+                            slim["event_seq"] = json!(s);
+                        }
+                        // Preserve key mechanical results (rolls/checks/contests/draws/warnings/stage_rules) in compact mode
+                        for k in [
+                            "outcome", "degree", "roll", "modifier", "total", "difficulty", "margin",
+                            "winner_id", "warnings", "world_time", "rolls", "kept", "stage_rules_applied",
+                            "stat_xp_gained", "job_xp_gained", "currency_conversion",
+                        ] {
+                            if let Some(v) = res.get(k) {
+                                slim[k] = v.clone();
+                            }
+                        }
+                        results.push(slim);
+                    } else {
+                        results.push(json!({ "index": idx, "tool": tool_name, "result": res }));
+                    }
+                }
+                if let Some(mut log_args) = trailing_log {
+                    if log_args.get("causal_event_ids").is_none() && !event_seqs.is_empty() {
+                        log_args["causal_event_ids"] = json!(event_seqs);
+                    }
+                    let idx = results.len();
+                    let res = execute_tool_with_policy(
+                        engine,
+                        "log_event",
+                        log_args,
+                        allow_local_file_import,
+                    )
+                    .map_err(|e| anyhow!("Trailing 'log_event' failed: {e}"))?;
+                    let seq_opt = res.get("event_seq").and_then(|v| v.as_i64());
+                    if let Some(s) = seq_opt {
+                        event_seqs.push(s);
+                    }
+                    let step_summary = summarize_turn_action_result("log_event", &res, seq_opt);
+                    receipt_parts.push(step_summary.clone());
+                    if compact {
+                        let mut slim = json!({
+                            "index": idx,
+                            "tool": "log_event",
+                            "summary": step_summary
+                        });
+                        if let Some(s) = seq_opt {
+                            slim["event_seq"] = json!(s);
+                        }
+                        results.push(slim);
+                    } else {
+                        results.push(json!({ "index": idx, "tool": "log_event", "result": res }));
+                    }
+                }
+                let world_time = engine
+                    .db()
+                    .get_campaign_meta()
+                    .map(|m| m.clock.format_short())
+                    .unwrap_or_default();
+                let signals = engine
+                    .list_active_signals(Some("gm"), None, &[], true)
+                    .unwrap_or_default();
+                Ok(json!({
+                    "committed_actions": results.len(),
+                    "world_time": world_time,
+                    "event_seqs": event_seqs,
+                    "receipt": receipt_parts.join(" | "),
+                    "results": results,
+                    "signals": signals
+                }))
+            })
         }
 
         "upsert_relation" => {
@@ -1572,6 +2357,19 @@ pub fn execute_tool_with_policy(
                         status: opt_str(&args, "status").unwrap_or_else(|| "active".to_string()),
                         description: opt_str(&args, "description").unwrap_or_default(),
                         related_ids: opt_str_vec(&args, "related_ids"),
+                        cadence_hours: args
+                            .get("cadence_hours")
+                            .and_then(|v| v.as_u64())
+                            .filter(|&h| h > 0),
+                        last_tick_total_hours: args
+                            .get("last_tick_total_hours")
+                            .and_then(|v| v.as_i64()),
+                        consequence_on_fill: opt_str(&args, "consequence_on_fill")
+                            .unwrap_or_default(),
+                        auto_reset: args
+                            .get("auto_reset")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
                     };
                     let (c, ev) = engine.create_clock(clock)?;
                     Ok(json!({ "event_seq": ev.seq, "summary": ev.summary, "clock": c }))
@@ -1641,7 +2439,49 @@ pub fn execute_tool_with_policy(
                     "profiles": profiles
                 }));
             }
-            let mut profile: RulesetProfile = serde_json::from_value(args)?;
+            let mut profile: RulesetProfile = if let Some(preset) = opt_str(&args, "preset") {
+                let custom_id = opt_str(&args, "id");
+                let mut p = RulesetProfile::from_preset(&preset, custom_id.as_deref())?;
+                if let Some(n) = opt_str(&args, "name") {
+                    p.name = n;
+                }
+                if let Some(d) = opt_str(&args, "description") {
+                    p.description = d;
+                }
+                if let Some(m) = opt_str(&args, "stat_modifier_mode") {
+                    p.stat_modifier_mode = m;
+                }
+                if let Some(axp) = args.get("auto_skill_xp").and_then(|v| v.as_bool()) {
+                    p.auto_skill_xp = axp;
+                }
+                if let Some(extra_skills) = args
+                    .get("skill_table")
+                    .and_then(|v| serde_json::from_value::<std::collections::BTreeMap<String, crate::mechanics::SkillDefinition>>(v.clone()).ok())
+                {
+                    for (k, v) in extra_skills {
+                        p.skill_table.insert(slugify(&k), v);
+                    }
+                }
+                if let Some(extra_dc) = args
+                    .get("dc_rubric")
+                    .and_then(|v| serde_json::from_value::<std::collections::BTreeMap<String, i64>>(v.clone()).ok())
+                {
+                    for (k, v) in extra_dc {
+                        p.dc_rubric.insert(k.to_lowercase(), v);
+                    }
+                }
+                if let Some(extra_ranks) = args
+                    .get("rank_bonuses")
+                    .and_then(|v| serde_json::from_value::<std::collections::BTreeMap<String, i64>>(v.clone()).ok())
+                {
+                    for (k, v) in extra_ranks {
+                        p.rank_bonuses.insert(k.to_lowercase(), v);
+                    }
+                }
+                p
+            } else {
+                serde_json::from_value(args)?
+            };
             if profile.id.trim().is_empty() {
                 profile.id = slugify(&profile.name);
             }
@@ -1654,6 +2494,19 @@ pub fn execute_tool_with_policy(
         }
 
         "resolve_check" => {
+            let dc_tier = opt_str(&args, "dc_tier");
+            let explicit_dc = args.get("difficulty").and_then(|v| v.as_i64());
+            if explicit_dc.is_none() && dc_tier.is_none() {
+                return Err(anyhow!(
+                    "Provide either integer 'difficulty' OR grounded 'dc_tier' (trivial, easy, moderate, hard, very_hard, nearly_impossible)."
+                ));
+            }
+            let dc_factors: Vec<DcFactorInput> = args
+                .get("dc_factors")
+                .map(|v| serde_json::from_value(v.clone()))
+                .transpose()
+                .map_err(|e| anyhow!("Invalid 'dc_factors' array: {e}"))?
+                .unwrap_or_default();
             let req = CheckRequest {
                 actor_id: opt_str(&args, "actor_id"),
                 action: req_str(&args, "action")?,
@@ -1661,16 +2514,17 @@ pub fn execute_tool_with_policy(
                 stat: opt_str(&args, "stat"),
                 skill: opt_str(&args, "skill"),
                 technique: opt_str(&args, "technique"),
+                progression_track: opt_str(&args, "progression_track"),
                 equipment: opt_str_vec(&args, "equipment"),
-                difficulty: args
-                    .get("difficulty")
-                    .and_then(|v| v.as_i64())
-                    .ok_or_else(|| anyhow!("Missing required integer parameter 'difficulty'"))?,
+                difficulty: explicit_dc.unwrap_or(0),
+                dc_tier,
+                dc_factors,
                 modifier: args.get("modifier").and_then(|v| v.as_i64()).unwrap_or(0),
                 situational_modifiers: parse_modifier_sources(args.get("situational_modifiers")),
                 advantage: opt_str(&args, "advantage").unwrap_or_else(|| "none".to_string()),
                 dice_override: opt_str(&args, "dice_override"),
                 auto_hydrate: args.get("auto_hydrate").and_then(|v| v.as_bool()),
+                award_skill_xp: args.get("award_skill_xp").and_then(|v| v.as_bool()),
                 stakes: opt_str(&args, "stakes").unwrap_or_default(),
                 seed: args.get("seed").and_then(|v| v.as_u64()),
                 dry_run: args
@@ -2256,8 +3110,55 @@ pub fn execute_tool_with_policy(
                     let (res, _) = engine.commit_autonomy_turn(req)?;
                     Ok(res)
                 }
+                "configure_mobility" => {
+                    let cid = req_str(&args, "character_id")?;
+                    engine.configure_npc_mobility(&cid, &args)
+                }
+                "dispatch_trip" => {
+                    let cid = req_str(&args, "character_id")?;
+                    let dest = req_str(&args, "destination_place_id")?;
+                    let purpose = opt_str(&args, "purpose").unwrap_or_else(|| "business".to_string());
+                    let details = opt_str(&args, "details").unwrap_or_default();
+                    let stay_days = args
+                        .get("stay_duration_days")
+                        .and_then(|v| v.as_u64())
+                        .map(|d| d as u32);
+                    let speed = opt_str(&args, "travel_speed_mode");
+                    engine.dispatch_npc_trip(
+                        &cid,
+                        &dest,
+                        &purpose,
+                        &details,
+                        stay_days,
+                        speed.as_deref(),
+                    )
+                }
+                "tick_movements" => {
+                    let aids = opt_str_vec(&args, "actor_ids");
+                    let auto_prom = args
+                        .get("auto_include_prominent")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    let advance_clock = args
+                        .get("advance_world_clock")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if advance_clock {
+                        let _ = engine.advance_time_no_npc_tick(
+                            duration_hours * 60,
+                            None,
+                            Some(format!("Living world NPC movement tick ({duration_hours}h)")),
+                        )?;
+                    }
+                    let seed = args
+                        .get("seed")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(duration_hours.wrapping_mul(0x9E37_79B9));
+                    engine.tick_npc_movements(duration_hours, &aids, auto_prom, seed)
+                }
+                "list_movements" => engine.list_npc_movements(),
                 other => Err(anyhow!(
-                    "Unknown simulate_autonomy mode '{other}'. Expected 'prepare', 'commit', or 'auto_mechanical'."
+                    "Unknown simulate_autonomy mode '{other}'. Expected 'prepare', 'commit', 'auto_mechanical', 'configure_mobility', 'dispatch_trip', 'tick_movements', or 'list_movements'."
                 )),
             }
         }
@@ -2282,7 +3183,7 @@ pub fn execute_tool_with_policy(
                     let saved = engine.update_place_spatial(sp)?;
                     Ok(json!({ "spatial": saved }))
                 }
-                "calculate" => {
+                "calculate" | "calculate_route" => {
                     let from = req_str(&args, "from_place_id")?;
                     let to = req_str(&args, "to_place_id")?;
                     let chars = opt_str_vec(&args, "character_ids");
@@ -2291,7 +3192,7 @@ pub fn execute_tool_with_policy(
                     let plan = engine.calculate_travel(&from, &to, &chars, &mode, forced)?;
                     Ok(serde_json::to_value(plan)?)
                 }
-                "advance" => {
+                "advance" | "advance_travel" => {
                     let from = req_str(&args, "from_place_id")?;
                     let to = req_str(&args, "to_place_id")?;
                     let chars = opt_str_vec(&args, "character_ids");
@@ -2317,7 +3218,7 @@ pub fn execute_tool_with_policy(
                         "hazard_draw": haz
                     }))
                 }
-                "explore" => {
+                "explore" | "explore_area" => {
                     let pid = req_str(&args, "place_id")?;
                     let actor = opt_str(&args, "actor_id");
                     let mode = opt_str(&args, "mode").unwrap_or_else(|| "scout".to_string());
@@ -2335,8 +3236,94 @@ pub fn execute_tool_with_policy(
                         seed,
                     )
                 }
+                "upsert_grid" => {
+                    let grid = crate::world_sim::MapGrid {
+                        id: opt_str(&args, "grid_id")
+                            .or_else(|| opt_str(&args, "id"))
+                            .unwrap_or_default(),
+                        name: req_str(&args, "name")?,
+                        scale_kind: opt_str(&args, "scale_kind")
+                            .unwrap_or_else(|| "region".to_string()),
+                        parent_place_id: opt_str(&args, "parent_place_id"),
+                        width: args.get("width").and_then(|v| v.as_u64()).unwrap_or(16) as u32,
+                        height: args.get("height").and_then(|v| v.as_u64()).unwrap_or(12) as u32,
+                        cell_scale_label: opt_str(&args, "cell_scale_label")
+                            .unwrap_or_else(|| "5 km".to_string()),
+                        default_terrain: opt_str(&args, "default_terrain")
+                            .unwrap_or_else(|| "wilderness".to_string()),
+                        description: opt_str(&args, "description").unwrap_or_default(),
+                        updated_at_world_time: String::new(),
+                    };
+                    let (saved, ev) = engine.upsert_map_grid(grid)?;
+                    Ok(json!({ "event_seq": ev.seq, "summary": ev.summary, "grid": saved }))
+                }
+                "list_grids" => engine.list_map_grids_overview(),
+                "get_grid" => {
+                    let gid = req_str(&args, "grid_id").or_else(|_| req_str(&args, "id"))?;
+                    let cx = args.get("center_x").and_then(|v| v.as_i64()).map(|n| n as i32);
+                    let cy = args.get("center_y").and_then(|v| v.as_i64()).map(|n| n as i32);
+                    let center = match (cx, cy) {
+                        (Some(x), Some(y)) => Some((x, y)),
+                        _ => None,
+                    };
+                    let radius = args.get("radius").and_then(|v| v.as_i64()).map(|n| n as i32);
+                    let include_gm = args
+                        .get("include_gm_secrets")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    engine.get_map_grid_snapshot(&gid, center, radius, include_gm)
+                }
+                "set_cell" => {
+                    let gid = req_str(&args, "grid_id").or_else(|_| req_str(&args, "id"))?;
+                    let reason = opt_str(&args, "reason").unwrap_or_default();
+                    let cells_vec: Vec<crate::world_sim::MapGridCell> =
+                        if let Some(arr) = args.get("cells").and_then(|v| v.as_array()) {
+                            let mut out = Vec::new();
+                            for item in arr {
+                                let x = item.get("x").and_then(|v| v.as_i64()).ok_or_else(|| {
+                                    anyhow!("Each cell in 'cells' requires integer 'x'")
+                                })? as i32;
+                                let y = item.get("y").and_then(|v| v.as_i64()).ok_or_else(|| {
+                                    anyhow!("Each cell in 'cells' requires integer 'y'")
+                                })? as i32;
+                                out.push(parse_map_cell(&gid, x, y, item));
+                            }
+                            out
+                        } else {
+                            let x = args
+                                .get("x")
+                                .and_then(|v| v.as_i64())
+                                .ok_or_else(|| anyhow!("set_cell requires integer 'x' (or 'cells' array)"))?
+                                as i32;
+                            let y = args
+                                .get("y")
+                                .and_then(|v| v.as_i64())
+                                .ok_or_else(|| anyhow!("set_cell requires integer 'y' (or 'cells' array)"))?
+                                as i32;
+                            vec![parse_map_cell(&gid, x, y, &args)]
+                        };
+                    engine.upsert_map_cells(&gid, cells_vec, &reason)
+                }
+                "clear_cell" => {
+                    let gid = req_str(&args, "grid_id").or_else(|_| req_str(&args, "id"))?;
+                    let x = args
+                        .get("x")
+                        .and_then(|v| v.as_i64())
+                        .ok_or_else(|| anyhow!("clear_cell requires integer 'x'"))?
+                        as i32;
+                    let y = args
+                        .get("y")
+                        .and_then(|v| v.as_i64())
+                        .ok_or_else(|| anyhow!("clear_cell requires integer 'y'"))?
+                        as i32;
+                    engine.clear_map_cell(&gid, x, y)
+                }
+                "auto_layout_grid" => {
+                    let gid = req_str(&args, "grid_id").or_else(|_| req_str(&args, "id"))?;
+                    engine.auto_layout_places_on_grid(&gid)
+                }
                 other => Err(anyhow!(
-                    "Unknown manage_travel_and_exploration action '{other}'. Expected: upsert_route, list_routes, update_spatial, calculate, advance, explore."
+                    "Unknown manage_travel_and_exploration action '{other}'. Expected: upsert_route, list_routes, update_spatial, calculate, advance, explore, upsert_grid, list_grids, get_grid, set_cell, clear_cell, auto_layout_grid."
                 )),
             }
         }
@@ -2344,7 +3331,7 @@ pub fn execute_tool_with_policy(
         "manage_economy" => {
             let action = req_str(&args, "action")?.to_lowercase();
             match action.as_str() {
-                "set_item_weight" => {
+                "set_item_weight" | "set_item_economics" => {
                     let econ: ItemEconomics = serde_json::from_value(args)?;
                     let saved = engine.set_item_economics(econ)?;
                     Ok(json!({ "item_economics": saved }))
@@ -2366,7 +3353,9 @@ pub fn execute_tool_with_policy(
                         .get("amount")
                         .and_then(|v| v.as_i64())
                         .ok_or_else(|| anyhow!("Missing integer 'amount'"))?;
-                    let reason = opt_str(&args, "reason").unwrap_or_default();
+                    let reason = opt_str(&args, "reason")
+                        .or_else(|| opt_str(&args, "notes"))
+                        .unwrap_or_default();
                     let (bal, ev) = engine.set_currency_balance(&oid, &curr, amt, &reason)?;
                     Ok(json!({ "event_seq": ev.seq, "balance": bal, "currency": curr }))
                 }
@@ -2576,13 +3565,17 @@ pub fn execute_tool_with_policy(
                             stat: opt_str(&args, "stat"),
                             skill: opt_str(&args, "skill"),
                             technique: opt_str(&args, "technique"),
+                            progression_track: opt_str(&args, "progression_track"),
                             equipment: vec![],
                             difficulty: dc,
+                            dc_tier: opt_str(&args, "dc_tier"),
+                            dc_factors: vec![],
                             modifier: args.get("modifier").and_then(|v| v.as_i64()).unwrap_or(0),
                             situational_modifiers: vec![],
                             advantage: "none".to_string(),
                             dice_override: None,
                             auto_hydrate: Some(true),
+                            award_skill_xp: None,
                             stakes: opt_str(&args, "stakes").unwrap_or_default(),
                             seed: args.get("seed").and_then(|v| v.as_u64()),
                             dry_run: false,
@@ -2628,13 +3621,17 @@ pub fn execute_tool_with_policy(
                         stat: opt_str(&args, "stat"),
                         skill: opt_str(&args, "skill"),
                         technique: opt_str(&args, "technique"),
+                        progression_track: opt_str(&args, "progression_track"),
                         equipment: opt_str_vec(&args, "equipment"),
                         difficulty: dc,
+                        dc_tier: opt_str(&args, "dc_tier"),
+                        dc_factors: vec![],
                         modifier: args.get("modifier").and_then(|v| v.as_i64()).unwrap_or(0),
                         situational_modifiers: parse_modifier_sources(args.get("situational_modifiers")),
                         advantage: opt_str(&args, "advantage").unwrap_or_else(|| "none".to_string()),
                         dice_override: opt_str(&args, "dice_override"),
                         auto_hydrate: Some(true),
+                        award_skill_xp: None,
                         stakes: opt_str(&args, "stakes")
                             .unwrap_or_else(|| "Advancement vs bottleneck / backlash".to_string()),
                         seed: args.get("seed").and_then(|v| v.as_u64()),
@@ -2697,6 +3694,300 @@ pub fn execute_tool_with_policy(
             }
         }
 
+        "manage_progression" => {
+            let action = req_str(&args, "action")?.to_lowercase();
+            match action.as_str() {
+                "define_ladder" => {
+                    let mut ladder = if let Some(preset) = opt_str(&args, "preset") {
+                        let mut p = ProgressionLadder::from_preset(
+                            &preset,
+                            opt_str(&args, "ladder_id").or_else(|| opt_str(&args, "id")).as_deref(),
+                        )?;
+                        if let Some(n) = opt_str(&args, "name") {
+                            p.name = n;
+                        }
+                        if let Some(d) = opt_str(&args, "description") {
+                            p.description = d;
+                        }
+                        if let Some(k) = opt_str(&args, "kind") {
+                            p.kind = k;
+                        }
+                        if let Some(st) = opt_str(&args, "source_text_id") {
+                            p.source_text_id = Some(st);
+                        }
+                        if let Some(si) = opt_str(&args, "source_item_id") {
+                            p.source_item_id = Some(si);
+                        }
+                        if let Some(mt) = opt_str(&args, "manual_title") {
+                            p.manual_title = mt;
+                        }
+                        if let Some(mn) = opt_str(&args, "manual_notes") {
+                            p.manual_notes = mn;
+                        }
+                        let extra_tags = opt_str_vec(&args, "default_check_tags");
+                        if !extra_tags.is_empty() {
+                            p.default_check_tags = extra_tags;
+                        }
+                        p
+                    } else {
+                        let stages: Vec<ProgressionStageDef> = args
+                            .get("stages")
+                            .map(|v| serde_json::from_value(v.clone()))
+                            .transpose()
+                            .map_err(|e| anyhow!("Invalid 'stages' array: {e}"))?
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "define_ladder requires either 'preset' (xianxia_standard, body_tempering, dnd_level_20, scifi_tier) or a 'stages' array"
+                                )
+                            })?;
+                        ProgressionLadder {
+                            id: opt_str(&args, "ladder_id")
+                                .or_else(|| opt_str(&args, "id"))
+                                .unwrap_or_default(),
+                            name: req_str(&args, "name")?,
+                            kind: opt_str(&args, "kind")
+                                .unwrap_or_else(|| "realm_ladder".to_string()),
+                            description: opt_str(&args, "description").unwrap_or_default(),
+                            source_text_id: opt_str(&args, "source_text_id"),
+                            source_item_id: opt_str(&args, "source_item_id"),
+                            manual_title: opt_str(&args, "manual_title").unwrap_or_default(),
+                            manual_notes: opt_str(&args, "manual_notes").unwrap_or_default(),
+                            default_check_tags: opt_str_vec(&args, "default_check_tags"),
+                            stages,
+                            updated_at_world_time: String::new(),
+                        }
+                    };
+                    if ladder.id.trim().is_empty() {
+                        ladder.id = slugify(&ladder.name);
+                    }
+                    let (saved, ev) = engine.define_progression_ladder(ladder)?;
+                    Ok(json!({ "event_seq": ev.seq, "summary": ev.summary, "ladder": saved }))
+                }
+                "list_ladders" => {
+                    let ladders = engine.list_progression_ladders()?;
+                    Ok(json!({ "count": ladders.len(), "ladders": ladders }))
+                }
+                "enroll_track" => {
+                    let cid = req_str(&args, "character_id")?;
+                    let reason = opt_str(&args, "reason").unwrap_or_default();
+                    let ladder_id = opt_str(&args, "ladder_id");
+                    let name = opt_str(&args, "name")
+                        .or_else(|| opt_str(&args, "track_id"))
+                        .or_else(|| ladder_id.clone())
+                        .ok_or_else(|| anyhow!("Missing 'name', 'track_id', or 'ladder_id'"))?;
+                    let sub_max = args
+                        .get("sub_stage_max")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(9) as u32;
+                    let sub = args
+                        .get("sub_stage")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(1) as u32;
+                    let track = CharacterProgressionTrack {
+                        character_id: cid,
+                        track_id: opt_str(&args, "track_id").unwrap_or_else(|| slugify(&name)),
+                        name,
+                        track_kind: opt_str(&args, "track_kind")
+                            .unwrap_or_else(|| "primary_realm".to_string()),
+                        ladder_id,
+                        source_text_id: opt_str(&args, "source_text_id"),
+                        source_item_id: opt_str(&args, "source_item_id"),
+                        manual_title: opt_str(&args, "manual_title").unwrap_or_default(),
+                        manual_notes: opt_str(&args, "manual_notes").unwrap_or_default(),
+                        major_stage_index: args
+                            .get("major_stage_index")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as u32,
+                        major_stage_name: opt_str(&args, "major_stage_name").unwrap_or_default(),
+                        sub_stage: sub,
+                        sub_stage_max: sub_max,
+                        sub_stage_label: opt_str(&args, "sub_stage_label").unwrap_or_default(),
+                        current_xp: args
+                            .get("current_xp")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0),
+                        xp_to_next: args
+                            .get("xp_to_next")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(100),
+                        cumulative_xp: args
+                            .get("cumulative_xp")
+                            .or_else(|| args.get("current_xp"))
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0),
+                        at_bottleneck: args
+                            .get("at_bottleneck")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
+                        bottleneck_reason: opt_str(&args, "bottleneck_reason").unwrap_or_default(),
+                        halt_conditions: opt_str_vec(&args, "halt_conditions"),
+                        active_properties: opt_str_vec(&args, "active_properties"),
+                        check_modifier: args
+                            .get("check_modifier")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0),
+                        check_tags: opt_str_vec(&args, "check_tags"),
+                        status: opt_str(&args, "status").unwrap_or_else(|| "active".to_string()),
+                        notes: opt_str(&args, "notes").unwrap_or_default(),
+                        gm_notes: opt_str(&args, "gm_notes").unwrap_or_default(),
+                        stage_rules: args
+                            .get("stage_rules")
+                            .and_then(|v| serde_json::from_value(v.clone()).ok())
+                            .unwrap_or_default(),
+                        updated_at_world_time: String::new(),
+                    };
+                    let (saved, ev) = engine.enroll_progression_track(track, &reason)?;
+                    Ok(json!({ "event_seq": ev.seq, "summary": ev.summary, "track": saved }))
+                }
+                "advance_xp" => {
+                    let cid = req_str(&args, "character_id")?;
+                    let tid = req_str(&args, "track_id")?;
+                    let xp = args
+                        .get("xp")
+                        .or_else(|| args.get("add_xp"))
+                        .or_else(|| args.get("delta_xp"))
+                        .and_then(|v| v.as_i64())
+                        .ok_or_else(|| anyhow!("Missing integer 'xp' (or 'add_xp' / 'delta_xp')"))?;
+                    let reason = opt_str(&args, "reason").unwrap_or_default();
+                    let allow_demote = args
+                        .get("allow_demote")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    if xp >= 0 {
+                        let (res, _) =
+                            engine.advance_progression_xp(&cid, &tid, xp as u64, &reason)?;
+                        Ok(res)
+                    } else {
+                        let (res, _) = engine.adjust_progression_xp(
+                            &cid,
+                            &tid,
+                            Some(xp),
+                            None,
+                            None,
+                            false,
+                            false,
+                            allow_demote,
+                            &reason,
+                        )?;
+                        Ok(res)
+                    }
+                }
+                "adjust_xp" | "revert_xp" | "reset_xp" => {
+                    let cid = req_str(&args, "character_id")?;
+                    let tid = req_str(&args, "track_id")?;
+                    let reason = opt_str(&args, "reason").unwrap_or_default();
+                    let delta_xp = args
+                        .get("delta_xp")
+                        .or_else(|| args.get("xp"))
+                        .or_else(|| args.get("add_xp"))
+                        .and_then(|v| v.as_i64())
+                        .map(|d| {
+                            if action.eq_ignore_ascii_case("revert_xp") && d > 0 {
+                                -d
+                            } else {
+                                d
+                            }
+                        });
+                    let set_current_xp = args
+                        .get("set_current_xp")
+                        .or_else(|| args.get("current_xp"))
+                        .and_then(|v| v.as_u64());
+                    let set_cumulative_xp = args
+                        .get("set_cumulative_xp")
+                        .or_else(|| args.get("cumulative_xp"))
+                        .and_then(|v| v.as_u64());
+                    let reset_track = args
+                        .get("reset_track")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let mut reset_stage_xp = args
+                        .get("reset_stage_xp")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if action.eq_ignore_ascii_case("reset_xp")
+                        && !reset_track
+                        && !reset_stage_xp
+                        && set_current_xp.is_none()
+                        && set_cumulative_xp.is_none()
+                        && delta_xp.is_none()
+                    {
+                        reset_stage_xp = true;
+                    }
+                    let allow_demote = args
+                        .get("allow_demote")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    let (res, _) = engine.adjust_progression_xp(
+                        &cid,
+                        &tid,
+                        delta_xp,
+                        set_current_xp,
+                        set_cumulative_xp,
+                        reset_stage_xp,
+                        reset_track,
+                        allow_demote,
+                        &reason,
+                    )?;
+                    Ok(res)
+                }
+                "remove_track" => {
+                    let cid = req_str(&args, "character_id")?;
+                    let tid = req_str(&args, "track_id")?;
+                    let reason = opt_str(&args, "reason").unwrap_or_default();
+                    let ev = engine.remove_progression_track(&cid, &tid, &reason)?;
+                    Ok(json!({ "event_seq": ev.seq, "summary": ev.summary, "removed": true }))
+                }
+                "attempt_breakthrough" => {
+                    let cid = req_str(&args, "character_id")?;
+                    let tid = req_str(&args, "track_id")?;
+                    let dc_factors: Vec<DcFactorInput> = args
+                        .get("dc_factors")
+                        .map(|v| serde_json::from_value(v.clone()))
+                        .transpose()
+                        .map_err(|e| anyhow!("Invalid 'dc_factors': {e}"))?
+                        .unwrap_or_default();
+                    let (res, _) = engine.attempt_progression_breakthrough(
+                        &cid,
+                        &tid,
+                        opt_str(&args, "profile").as_deref(),
+                        opt_str(&args, "stat"),
+                        opt_str(&args, "skill"),
+                        args.get("difficulty").and_then(|v| v.as_i64()),
+                        opt_str(&args, "dc_tier"),
+                        dc_factors,
+                        args.get("modifier").and_then(|v| v.as_i64()).unwrap_or(0),
+                        opt_str(&args, "advantage").unwrap_or_else(|| "none".to_string()),
+                        opt_str(&args, "stakes").unwrap_or_default(),
+                        args.get("seed").and_then(|v| v.as_u64()),
+                        opt_str(&args, "next_stage_name"),
+                    )?;
+                    Ok(res)
+                }
+                "update_track" => {
+                    let cid = req_str(&args, "character_id")?;
+                    let tid = req_str(&args, "track_id")?;
+                    let reason = opt_str(&args, "reason").unwrap_or_default();
+                    let (saved, ev) =
+                        engine.update_progression_track(&cid, &tid, &args, &reason)?;
+                    Ok(json!({ "event_seq": ev.seq, "summary": ev.summary, "track": saved }))
+                }
+                "get_character_progression" => {
+                    let cid = req_str(&args, "character_id")?;
+                    let tracks = engine.list_character_progressions(&cid)?;
+                    Ok(json!({ "character_id": cid, "count": tracks.len(), "tracks": tracks }))
+                }
+                other => Err(anyhow!(
+                    "Unknown manage_progression action '{other}'. Expected: define_ladder, list_ladders, enroll_track, advance_xp, adjust_xp, revert_xp, reset_xp, attempt_breakthrough, update_track, remove_track, get_character_progression."
+                )),
+            }
+        }
+
+        "manage_player_character" => {
+            let action = req_str(&args, "action")?;
+            let cid = opt_str(&args, "character_id");
+            engine.manage_player_character_action(cid.as_deref(), &action, &args)
+        }
+
         "advance_world" => {
             let hours = args
                 .get("duration_hours")
@@ -2714,6 +4005,10 @@ pub fn execute_tool_with_policy(
                 .get("prepare_autonomy_dossiers")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            let tick_npc_movements = args
+                .get("tick_npc_movements")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
             let seed = args.get("seed").and_then(|v| v.as_u64());
             engine.advance_world(
                 hours,
@@ -2725,6 +4020,7 @@ pub fn execute_tool_with_policy(
                 tick_markets,
                 tick_upkeep,
                 prep_dossiers,
+                tick_npc_movements,
                 seed,
             )
         }
@@ -2790,6 +4086,22 @@ pub fn execute_tool_with_policy(
                 "total_events": report.total_events
             }))
         }
+
+        // =====================================================================
+        // Signal Bus, Standing Routines & Sanitized Unified Domain Facades
+        // =====================================================================
+        "manage_signals" => execute_manage_signals(engine, args),
+        "manage_routines" => execute_manage_routines(engine, args),
+        "scene" => execute_domain_scene(engine, args, allow_local_file_import),
+        "query" => execute_domain_query(engine, args, allow_local_file_import),
+        "resolve" => execute_domain_resolve(engine, args, allow_local_file_import),
+        "character" => execute_domain_character(engine, args, allow_local_file_import),
+        "progression" => execute_domain_progression(engine, args, allow_local_file_import),
+        "world" => execute_domain_world(engine, args, allow_local_file_import),
+        "society" => execute_domain_society(engine, args, allow_local_file_import),
+        "codex" => execute_domain_codex(engine, args, allow_local_file_import),
+        "economy" => execute_domain_economy(engine, args, allow_local_file_import),
+        "admin" => execute_domain_admin(engine, args, allow_local_file_import),
 
         _ => Err(anyhow!("Unknown tool: {name}")),
     }
@@ -2968,6 +4280,35 @@ fn handle_prompt_get(params: Value) -> Result<Value> {
 }
 
 fn tool_definitions() -> Value {
+    tool_definitions_for_profile(active_tool_profile())
+}
+
+pub fn tool_definitions_for_profile(profile: ToolProfile) -> Value {
+    let mut list = match profile {
+        ToolProfile::Play => unified_domain_tool_definitions(false),
+        ToolProfile::CompactFull => unified_domain_tool_definitions(true),
+        ToolProfile::Legacy => {
+            let mut full = legacy_base_tool_definitions();
+            full.extend(extra_rpg_ai_tools());
+            full.extend(unified_domain_only_definitions());
+            full
+        }
+    };
+    // Attach ChatGPT / MCP standard behavioral annotations to every tool
+    for tool in &mut list {
+        if let Some(obj) = tool.as_object_mut() {
+            let name = obj
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            obj.insert("annotations".to_string(), tool_annotations(&name));
+        }
+    }
+    Value::Array(list)
+}
+
+fn legacy_base_tool_definitions() -> Vec<Value> {
     let base: Value = serde_json::from_str(
         r#"[
         {
@@ -3083,6 +4424,7 @@ fn tool_definitions() -> Value {
                     "set_current": { "type": "integer" },
                     "set_max": { "type": "integer" },
                     "unit": { "type": "string" },
+                    "remove": { "type": "boolean", "default": false, "description": "If true, removes an obsolete resource pool from the character sheet." },
                     "reason": { "type": "string" }
                 },
                 "required": ["character_id", "resource"]
@@ -3118,7 +4460,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "update_character_condition",
-            "description": "Add or remove an active status effect, buff, debuff, injury, or curse on a character.",
+            "description": "Add or remove an active status effect, buff, debuff, injury, or curse on a character. Put a signed modifier (e.g. `-2`) and optional `[scope: strength, brawling, sprint, initiative]` in `notes` to make `resolve_check` auto-apply the modifier ONLY to matching checks!",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -3137,12 +4479,12 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "update_character_equipment",
-            "description": "Acquire, remove/consume, equip, or unequip an item in a character's gear & inventory.",
+            "description": "Acquire, tailor/update, remove/consume, equip, or unequip an item in a character's gear & inventory. WEARABLE SIZING & TAPER RULE: Whenever creating or acquiring clothes/armor, specify `garment_cut`, `garment_taper`, and dimensional `garment_measurements` (`Shoulders`, `Chest`, `Underbust`, `Waist`, `Hips`, `Thigh`, `Inseam`) based on the garment's intended wearer/cut (e.g. boxy workwear: Shoulders +2 cm, Chest +5 cm, Waist +7 cm, Hips +2 cm; tailored waist/hourglass: Shoulders +1 cm, Chest +4 cm, Waist +3 cm, Hips +3 cm; relaxed robe: +8–12 cm). Equipping a garment smaller than the character's current body beyond tolerance is blocked; baggy, tight, or odd-tapered equipped garments auto-apply DEX/STR/CHA penalties and persistent Apparel Discomfort.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "character_id": { "type": "string" },
-                    "action": { "type": "string", "enum": ["acquire", "remove", "equip", "unequip"] },
+                    "action": { "type": "string", "enum": ["acquire", "tailor", "update", "remove", "equip", "unequip"] },
                     "name": { "type": "string" },
                     "quantity": { "type": "integer", "default": 1 },
                     "slot": { "type": "string" },
@@ -3150,6 +4492,9 @@ fn tool_definitions() -> Value {
                     "durability": { "type": "string" },
                     "tags": { "type": "array", "items": { "type": "string" } },
                     "description": { "type": "string" },
+                    "garment_measurements": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Optional garment dimensions (e.g. {'Shoulders':'50 cm','Chest':'114 cm','Waist':'96 cm','Hips':'106 cm'}). Keys auto-canonicalize; compared live against character measurements." },
+                    "garment_cut": { "type": "string", "description": "Optional cut/stretch profile: 'fitted', 'tailored', 'standard', 'relaxed', 'loose', 'stretch', or 'rigid_armor'." },
+                    "garment_taper": { "type": "string", "description": "Optional silhouette/taper cut: 'straight', 'boxy', 'athletic_v', 'tailored_waist', 'hourglass', 'a_line', or 'relaxed_drape'." },
                     "reason": { "type": "string" }
                 },
                 "required": ["character_id", "action", "name"]
@@ -3157,13 +4502,21 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "upsert_character_skill",
-            "description": "Learn a new skill or upgrade an existing skill's rank/modifier.",
+            "description": "Learn a new skill, update its rank/governing_stat/modifier/xp, award or revert activity XP via signed `add_xp` (negative reverts XP & demotes rank cleanly), set exact XP via `set_xp`, or reset skill XP to 0 via `reset_xp: true`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "character_id": { "type": "string" },
                     "name": { "type": "string" },
                     "rank": { "type": "string" },
+                    "governing_stat": { "type": "string", "description": "Optional governing ability/stat (e.g. 'Dexterity', 'Wisdom')." },
+                    "proficiency_tier": { "type": "string", "description": "Optional proficiency tier (e.g. 'untrained', 'proficient', 'expertise')." },
+                    "xp": { "type": "integer", "description": "Set raw skill XP without auto-recalculating rank." },
+                    "set_xp": { "type": "integer", "description": "Set exact skill XP and automatically recalculate rank & modifier from the active XP curve (unless recalc_rank=false)." },
+                    "add_xp": { "type": "integer", "description": "Signed activity XP delta: positive awards XP and promotes; negative reverts/deducts XP and recalculates rank downwards." },
+                    "reset_xp": { "type": "boolean", "description": "Reset skill XP to 0 and restore baseline rank/modifier from the active XP curve." },
+                    "recalc_rank": { "type": "boolean", "default": true, "description": "When reverting/setting/resetting XP, auto-recalculate rank & modifier from the active XP curve." },
+                    "profile": { "type": "string", "description": "Optional ruleset profile ID for XP curve lookup." },
                     "category": { "type": "string" },
                     "modifier": { "type": "string" },
                     "description": { "type": "string" },
@@ -3174,7 +4527,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "upsert_character_technique",
-            "description": "Learn a new technique/ability/spell or update its mastery, tier, cost, cooldown, or effect.",
+            "description": "Learn a new technique/ability/spell/cultivation art or update its mastery, tier, cost, cooldown, effect, linked cultivation manual (source_text_id / source_item_id), linked progression track, or manual cultivation notes.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -3186,6 +4539,11 @@ fn tool_definitions() -> Value {
                     "mastery": { "type": "string" },
                     "effect": { "type": "string" },
                     "description": { "type": "string" },
+                    "source_text_id": { "type": "string", "description": "Linked StoryText ID or title of the cultivation manual/scroll teaching this technique." },
+                    "source_item_id": { "type": "string", "description": "Optional linked CatalogItem ID of the physical manual/relic." },
+                    "progression_track_id": { "type": "string", "description": "Optional linked CharacterProgressionTrack ID (e.g. parallel cultivation manual track)." },
+                    "manual_title": { "type": "string", "description": "Optional manual display title (auto-resolved from source_text_id if omitted)." },
+                    "manual_notes": { "type": "string", "description": "Specific notes on cultivating or practicing this manual technique (breathing rhythm, meridian quirks, incompatibilities, margin notes)." },
                     "reason": { "type": "string" }
                 },
                 "required": ["character_id", "name"]
@@ -3444,29 +4802,17 @@ fn tool_definitions() -> Value {
     ]"#,
     )
     .expect("valid base MCP tool definitions JSON");
-    let mut list = match base {
+    match base {
         Value::Array(v) => v,
         _ => Vec::new(),
-    };
-    list.extend(extra_rpg_ai_tools());
-    // Attach ChatGPT / MCP standard behavioral annotations to every tool
-    for tool in &mut list {
-        if let Some(obj) = tool.as_object_mut() {
-            let name = obj
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            obj.insert("annotations".to_string(), tool_annotations(&name));
-        }
     }
-    Value::Array(list)
 }
 
 fn tool_annotations(name: &str) -> Value {
     let read_only = matches!(
         name,
-        "campaign_status"
+        "query"
+            | "campaign_status"
             | "get_scene_context"
             | "get_character"
             | "get_place"
@@ -3474,6 +4820,7 @@ fn tool_annotations(name: &str) -> Value {
             | "get_item"
             | "get_lore"
             | "get_attachment"
+            | "read_campaign_file"
             | "search"
             | "fetch"
             | "search_characters"
@@ -3486,12 +4833,13 @@ fn tool_annotations(name: &str) -> Value {
             | "search_history"
             | "search_events"
             | "search_relations"
+            | "search_knowledge"
             | "search_all"
             | "diagnose_campaign"
     );
     let destructive = matches!(
         name,
-        "rollback_to_event" | "remove_relation" | "delete_entity" | "restore_backup"
+        "admin" | "rollback_to_event" | "remove_relation" | "delete_entity" | "restore_backup"
     );
     let idempotent = read_only || matches!(name, "compile_docs" | "cleanup_campaign");
     json!({
@@ -3618,12 +4966,15 @@ fn extra_rpg_ai_tools() -> Vec<Value> {
         }"#));
     v.push(parse(r#"{
             "name": "commit_turn",
-            "description": "AI-optimized batch turn commit: execute multiple Chronicle tool operations in order within a single tool call (e.g., roll_dice + modify_character_resource + update_character_condition + manage_clock + log_event).",
+            "description": "Primary one-call turn/beat checkpointer: combine optional elapsed time (`advance_minutes`), state/roll `actions`, and a trailing narrative `log` (`{ title, details, location_id, affected_entities, tags }`) into a single call with auto-linked causality and a concise verified receipt (`world_time`, `event_seqs`, `receipt`). Use after any meaningful decision, deal, discovery, travel, or roll consequence.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "advance_minutes": { "type": "integer", "description": "Optional shorthand to advance world time before running actions/log." },
+                    "time_reason": { "type": "string", "description": "Optional reason for `advance_minutes`." },
                     "actions": {
                         "type": "array",
+                        "description": "Optional ordered Chronicle tool operations (e.g. resolve_check, move_character, modify_character_resource, update_character_equipment, manage_economy, upsert_relation).",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -3632,9 +4983,28 @@ fn extra_rpg_ai_tools() -> Vec<Value> {
                             },
                             "required": ["tool", "arguments"]
                         }
+                    },
+                    "log": {
+                        "type": "object",
+                        "description": "Optional shorthand for a trailing `log_event` summarizing this beat's narrative outcome (auto-links causal_event_ids from earlier steps in this commit).",
+                        "properties": {
+                            "title": { "type": "string" },
+                            "details": { "type": "string" },
+                            "location_id": { "type": "string" },
+                            "affected_entities": { "type": "array", "items": { "type": "string" } },
+                            "tags": { "type": "array", "items": { "type": "string" } },
+                            "visibility": { "type": "string", "enum": ["public", "witnessed_only", "gm_secret"], "default": "public" }
+                        },
+                        "required": ["title"]
+                    },
+                    "narrative_title": { "type": "string", "description": "Flat shorthand alternative to `log.title`." },
+                    "narrative_details": { "type": "string", "description": "Flat shorthand alternative to `log.details`." },
+                    "compact": {
+                        "type": "boolean",
+                        "default": true,
+                        "description": "Defaults to true: returns concise per-step summaries and key roll/check results instead of bulky nested projections."
                     }
-                },
-                "required": ["actions"]
+                }
             }
         }"#));
     v.push(parse(r#"{
@@ -3817,24 +5187,27 @@ fn extra_rpg_ai_tools() -> Vec<Value> {
         }"#));
     v.push(parse(r#"{
             "name": "upsert_item",
-            "description": "Catalog or update a carryable RPG item (weapon, armor, tool, artifact, keepsake, book, manual, scroll, record, key, relic) with origin/maker, previous owners, current holder (character or place), significance, mechanics, and optional linked_text_id. Automatically syncs into the holder character's inventory and compiles docs/items/<id>.md.",
+            "description": "Catalog or update a carryable RPG item (clothing, apparel, armor, weapon, tool, artifact, keepsake, book, manual, scroll, record, key, relic) with origin/maker, previous owners, current holder (character or place), significance, mechanics, optional wearable sizing/taper (`garment_measurements`, `garment_cut`, `garment_taper`), and optional linked_text_id. Automatically syncs into the holder character's inventory (preserving garment sizing/taper) and compiles docs/items/<id>.md.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "id": { "type": "string" },
                     "name": { "type": "string" },
-                    "item_type": { "type": "string", "description": "weapon, armor, tool, artifact, keepsake, book, manual, scroll, record, relic, key, consumable, gear" },
+                    "item_type": { "type": "string", "description": "clothing, apparel, armor, weapon, tool, artifact, keepsake, book, manual, scroll, record, relic, key, consumable, gear" },
                     "rarity_or_tier": { "type": "string" },
                     "slot": { "type": "string" },
                     "quantity": { "type": "integer", "default": 1 },
                     "equipped": { "type": "boolean", "default": false },
                     "condition_or_durability": { "type": "string", "default": "Intact" },
-                    "origin_and_maker": { "type": "string", "description": "Who forged, crafted, or authored this item and where." },
+                    "origin_and_maker": { "type": "string", "description": "Who forged, tailored, crafted, or authored this item and where." },
                     "previous_owners": { "type": "array", "items": { "type": "string" }, "description": "Chronological list of previous owners." },
                     "current_holder_id": { "type": "string", "description": "Character slug carrying it OR place slug where it rests." },
                     "significance": { "type": "string", "description": "Why this item matters to the story, bloodlines, or sects." },
                     "properties_and_effects": { "type": "string" },
                     "description": { "type": "string" },
+                    "garment_measurements": { "type": "object", "additionalProperties": { "type": "string" }, "description": "For clothing/armor: dimensional garment size map ({Shoulders, Chest, Underbust, Waist, Hips, Thigh, Inseam} -> e.g. '49 cm', '108 cm')." },
+                    "garment_cut": { "type": "string", "description": "For clothing/armor: 'fitted', 'tailored', 'standard', 'relaxed', 'loose', 'stretch', or 'rigid_armor'." },
+                    "garment_taper": { "type": "string", "description": "For clothing/armor: 'straight', 'boxy', 'athletic_v', 'tailored_waist', 'hourglass', 'a_line', or 'relaxed_drape'." },
                     "linked_text_id": { "type": "string", "description": "Optional StoryText slug when this carryable item is a readable book, manual, scroll, or record." },
                     "gm_notes": { "type": "string" },
                     "keywords": { "type": "array", "items": { "type": "string" } },
@@ -4016,11 +5389,11 @@ fn extra_rpg_ai_tools() -> Vec<Value> {
         }"#));
     v.push(parse(r#"{
             "name": "rename_or_merge_entity",
-            "description": "Rename an entity's slug OR merge a duplicate entity (old_id) into a canonical target (new_id, with allow_merge: true) within the same register. Automatically rewrites all cross-references across relations, histories, lore, texts, items, attachments, clocks, routes, and character locations, and prunes stale .md docs.",
+            "description": "Rename an entity's slug OR merge a duplicate entity (old_id) into a canonical target (new_id, with allow_merge: true) within the same register. Automatically rewrites all cross-references across relations, histories, lore, texts, items, attachments, clocks, routes, factions, and character locations, and prunes stale .md docs.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "register": { "type": "string", "enum": ["character", "place", "lore", "text", "item", "attachment"] },
+                    "register": { "type": "string", "enum": ["character", "place", "lore", "text", "item", "attachment", "faction"] },
                     "old_id": { "type": "string" },
                     "new_id": { "type": "string" },
                     "allow_merge": { "type": "boolean", "default": false },
@@ -4031,11 +5404,11 @@ fn extra_rpg_ai_tools() -> Vec<Value> {
         }"#));
     v.push(parse(r#"{
             "name": "delete_entity",
-            "description": "Cleanly delete a miscreated, duplicate, or obsolete record from any register (character, place, lore, text, item, history, attachment, clock), optionally removing dangling Knowledge Graph relations and stale compiled .md docs.",
+            "description": "Cleanly delete a miscreated, duplicate, or obsolete record from any register (character, place, lore, text, item, history, attachment, clock, faction), optionally removing dangling Knowledge Graph relations and stale compiled .md docs.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "register": { "type": "string", "enum": ["character", "place", "lore", "text", "item", "history", "attachment", "clock"] },
+                    "register": { "type": "string", "enum": ["character", "place", "lore", "text", "item", "history", "attachment", "clock", "faction"] },
                     "entity_id": { "type": "string" },
                     "remove_backing_file": { "type": "boolean", "default": false, "description": "For attachments: also delete the copied file under docs/attachments/files/." },
                     "cleanup_relations": { "type": "boolean", "default": true },
@@ -4128,17 +5501,37 @@ fn extra_rpg_ai_tools() -> Vec<Value> {
             }
         }"#));
     v.push(parse(r#"{
-            "name": "upsert_ruleset_profile",
-            "description": "Define or update a campaign-specific, system-agnostic check resolution profile ('roll_over', 'roll_under', 'dice_pool', or 'step_dice') with custom base dice, advantage/disadvantage dice, critical thresholds, PbtA partial bands, and rank/condition modifier tables. Pass list=true to view all profiles.",
+            "name": "read_campaign_file",
+            "description": "Read any campaign attachment (`attachment:<id>`), readable story text (`text:<id>`), lore entry (`lore:<id>`), or compiled Markdown doc (`doc:INDEX.md`, `doc:characters/aria.md`, `doc:attachments/files/...`) VERBATIM in exact UTF-8 character chunks (default 6000 chars/chunk, zero compression or summarization). When `has_more` is true, call again with the returned `next_call` arguments to retrieve the complete file verbatim. Pass `list: true` to list all readable campaign files.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "list": { "type": "boolean", "description": "Set true to list all saved ruleset profiles plus the built-in default." },
-                    "id": { "type": "string", "description": "Profile slug (e.g. 'default', 'mortal-2d6', 'brp-d100', 'cultivation-tribulation')." },
+                    "target": { "type": "string", "description": "Target specifier: 'attachment:<id>', 'text:<id>', 'lore:<id>', 'doc:<relative_path>', or 'list'." },
+                    "attachment_id": { "type": "string", "description": "Shorthand for target='attachment:<id>'." },
+                    "text_id": { "type": "string", "description": "Shorthand for target='text:<id>'." },
+                    "lore_id": { "type": "string", "description": "Shorthand for target='lore:<id>'." },
+                    "doc_path": { "type": "string", "description": "Shorthand for target='doc:<relative_path>' inside campaign docs/." },
+                    "list": { "type": "boolean", "description": "Set true to list all readable attachments, texts, and docs/ files." },
+                    "offset_chars": { "type": "integer", "default": 0, "description": "Zero-based UTF-8 character offset for verbatim pagination." },
+                    "chunk_chars": { "type": "integer", "default": 6000, "description": "Exact characters per chunk (500..=16000; default 6000 avoids client redaction/compression)." },
+                    "gm_override": { "type": "boolean", "default": false, "description": "For GM-only inspection of unread StoryTexts." }
+                }
+            }
+        }"#));
+    v.push(parse(r#"{
+            "name": "upsert_ruleset_profile",
+            "description": "Define or update a campaign check resolution profile ('roll_over', 'roll_under', 'dice_pool', 'step_dice') with built-in D20/D&D 5e ability-score modifier conversion (`stat_modifier_mode`), standard 18-skill table (`skill_table`), progressive Skill XP curve (`xp_curve`), grounded DC rubric (`dc_rubric`: 5/10/15/20/25/30) + situational DC factors (`dc_factors`), and automatic Skill XP awards (`auto_skill_xp`). Pass `preset: 'dnd5e' | 'cultivation_d20' | 'pbta_2d6' | 'brp_d100'` for one-call setup, or `list: true` to inspect profiles.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "list": { "type": "boolean", "description": "Set true to list all saved ruleset profiles plus the built-in default (including full skill_table, xp_curve, and dc_rubric)." },
+                    "preset": { "type": "string", "enum": ["dnd5e", "cultivation_d20", "pbta_2d6", "brp_d100"], "description": "Optional one-call ruleset preset." },
+                    "id": { "type": "string", "description": "Profile slug (e.g. 'default', 'mortal-2d6', 'brp-d100')." },
                     "name": { "type": "string" },
                     "description": { "type": "string" },
                     "resolution_mode": { "type": "string", "enum": ["roll_over", "roll_under", "dice_pool", "step_dice"], "default": "roll_over" },
-                    "base_dice": { "type": "string", "default": "1d20", "description": "Base dice expression (e.g. '1d20', '2d6', '1d100', '1d6' for dice_pool)." },
+                    "base_dice": { "type": "string", "default": "1d20" },
+                    "stat_modifier_mode": { "type": "string", "enum": ["auto_dnd5e", "dnd5e", "direct"], "default": "auto_dnd5e", "description": "How character stat scores convert to modifiers: 'dnd5e' applies floor((score-10)/2); 'auto_dnd5e' converts scores >= 6 via floor((score-10)/2) and uses small modifiers directly; 'direct' uses raw value." },
                     "advantage_dice": { "type": "string" },
                     "disadvantage_dice": { "type": "string" },
                     "crit_success_natural": { "type": "integer" },
@@ -4150,38 +5543,47 @@ fn extra_rpg_ai_tools() -> Vec<Value> {
                     "pool_success_threshold": { "type": "integer" },
                     "rank_bonuses": { "type": "object", "additionalProperties": { "type": "integer" } },
                     "condition_penalties": { "type": "object", "additionalProperties": { "type": "integer" } },
+                    "skill_table": { "type": "object", "description": "Map of skill slug -> { name, governing_stat, category, description } (defaults to standard 18 D&D skills; add custom campaign skills here)." },
+                    "xp_curve": { "type": "array", "description": "Ordered Skill XP thresholds [{ rank, min_xp, bonus }]." },
+                    "dc_rubric": { "type": "object", "additionalProperties": { "type": "integer" }, "description": "Grounded difficulty ladder (trivial=5, easy=10, moderate=15, hard=20, very_hard=25, nearly_impossible=30)." },
+                    "dc_factors": { "type": "object", "additionalProperties": { "type": "integer" }, "description": "Named situational DC adjustments (rushed=+2, proper_tools=-2, darkness=+3, etc.)." },
+                    "auto_skill_xp": { "type": "boolean", "default": true },
                     "auto_hydrate": { "type": "boolean", "default": true }
                 }
             }
         }"#));
     v.push(parse(r#"{
             "name": "resolve_check",
-            "description": "Resolve a structured, system-agnostic action check. Automatically hydrates the actor's live stat, skill, technique, relevant equipment, active injuries/conditions, AND their current place's live weather/conditions into an itemized modifier breakdown. Supports advantage/disadvantage, dry_run odds preview, deterministic seeds, and causal ledger recording.",
+            "description": "Resolve a structured action check (e.g. 1d20 + ability modifier + growing skill proficiency + gear/injuries/weather; totals naturally exceed 20). Supply either explicit `difficulty` OR grounded `dc_tier` (trivial/easy/moderate/hard/very_hard/nearly_impossible) + `dc_factors` for an auditable `dc_breakdown`. When `skill` is provided without `stat`, automatically hydrates the skill's governing ability modifier from the ruleset's skill_table and awards difficulty-scaled Skill XP on live checks.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "actor_id": { "type": "string", "description": "Character slug or name performing the action." },
-                    "action": { "type": "string", "description": "Concrete action attempted (e.g. 'Climb the loose wet ridge path')." },
-                    "difficulty": { "type": "integer", "description": "Target DC, roll-under target, or required hits." },
+                    "action": { "type": "string", "description": "Concrete action attempted (e.g. 'Pick the magistrate archive lock')." },
+                    "difficulty": { "type": "integer", "description": "Explicit target DC (optional if `dc_tier` is provided)." },
+                    "dc_tier": { "type": "string", "enum": ["trivial", "easy", "moderate", "hard", "very_hard", "nearly_impossible"], "description": "Grounded difficulty tier from RulesetProfile.dc_rubric (5/10/15/20/25/30) instead of picking an arbitrary DC." },
+                    "dc_factors": { "type": "array", "description": "Optional situational DC adjustments: named strings ('rushed', 'improvised_tools', 'darkness', 'proper_tools', 'assisted', 'prepared') or custom { label, delta, reason } objects." },
                     "profile": { "type": "string", "default": "default", "description": "Ruleset profile ID (defaults to campaign 'default')." },
-                    "stat": { "type": "string", "description": "Optional character stat name to auto-hydrate." },
-                    "skill": { "type": "string", "description": "Optional character skill name to auto-hydrate." },
+                    "stat": { "type": "string", "description": "Optional stat name (auto-hydrated from skill's governing_stat when omitted; scores convert via floor((score-10)/2))." },
+                    "skill": { "type": "string", "description": "Optional skill name (character sheet OR standard ruleset skill_table; untrained skills use governing stat + 0 and still earn practice XP)." },
                     "technique": { "type": "string", "description": "Optional character technique name to auto-hydrate." },
+                    "progression_track": { "type": "string", "description": "Optional progression track ID/name (e.g. 'qi-cultivation', 'body-tempering', 'character-level') whose modifier applies to this check." },
                     "equipment": { "type": "array", "items": { "type": "string" }, "description": "Optional specific carried items to factor in (including durability penalties)." },
                     "modifier": { "type": "integer", "default": 0, "description": "Additional manual modifier." },
                     "situational_modifiers": { "type": "array", "items": { "type": "object", "properties": { "source": { "type": "string" }, "value": { "type": "integer" }, "category": { "type": "string" }, "notes": { "type": "string" } }, "required": ["source", "value"] } },
                     "advantage": { "type": "string", "enum": ["none", "advantage", "disadvantage"], "default": "none" },
-                    "dice_override": { "type": "string", "description": "Optional override dice expression (e.g. '1d10' for step-dice)." },
-                    "auto_hydrate": { "type": "boolean", "description": "Override whether live character/weather modifiers are auto-applied." },
+                    "dice_override": { "type": "string", "description": "Optional override dice expression." },
+                    "auto_hydrate": { "type": "boolean" },
+                    "award_skill_xp": { "type": "boolean", "description": "Override whether this live skill check awards difficulty-scaled Skill XP (defaults to profile.auto_skill_xp)." },
                     "stakes": { "type": "string", "description": "Explicit stakes at risk on failure/success." },
-                    "seed": { "type": "integer", "description": "Optional deterministic RNG seed (auto-generated and returned if omitted)." },
-                    "dry_run": { "type": "boolean", "default": false, "description": "Preview itemized modifiers and success odds WITHOUT rolling or logging." },
-                    "strict_validation": { "type": "boolean", "default": false, "description": "When true, return an error if any requested stat, skill, technique, or equipment item does not exist on the actor (otherwise returns explicit warnings and treats missing references as +0)." },
+                    "seed": { "type": "integer", "description": "Optional deterministic RNG seed." },
+                    "dry_run": { "type": "boolean", "default": false, "description": "Preview DC breakdown, itemized modifiers, and success odds WITHOUT rolling or logging." },
+                    "strict_validation": { "type": "boolean", "default": false },
                     "log_to_ledger": { "type": "boolean", "default": true },
                     "causal_event_ids": { "type": "array", "items": { "type": "integer" } },
                     "visibility": { "type": "string", "enum": ["public", "witnessed_only", "gm_secret"], "default": "public" }
                 },
-                "required": ["action", "difficulty"]
+                "required": ["action"]
             }
         }"#));
     v.push(parse(r#"{
@@ -4346,7 +5748,7 @@ fn extra_rpg_ai_tools() -> Vec<Value> {
         }"#));
     v.push(parse(r#"{
             "name": "update_character_profile",
-            "description": "Set or merge structured Identity, Physical (constitution, body_tempering, disabilities), Psychological/Autonomy drivers (long_term_motivations, values_and_principles, fears, loyalties, ambitions, commitments, secrets, risk_tolerance, stress, morale, current_plans), and prioritized structured_goals (or upsert_goal) for a character without mutating their immutable baseline. Pass get_only=true to read.",
+            "description": "Set or merge structured Identity, Physical (constitution, body_tempering, disabilities, AND nested avatar fields: avatar_summary, appearance_stage, height, weight, baseline_height, baseline_weight, body_type_or_build, silhouette, posture_and_gait, proportions_summary, clothing_fit, measurements, baseline_measurements, face_shape_and_features, eyes, skin_tone_and_texture, hair, facial_hair, voice_and_speech, scent_or_aura, visual_prompt_anchor, record_checkpoint), Psychological/Autonomy drivers, and prioritized structured_goals. STYLE RULE: Write live observable avatar fields in concise, concrete, absolute present-tense (stranger's-eye view, ZERO comparative phrases like 'formerly' or 'relative to Day-1'); store starting numbers in `baseline_measurements` and current numbers in `measurements` so Chronicle auto-computes deltas in GM POV. Pass get_only=true to read.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -4358,6 +5760,33 @@ fn extra_rpg_ai_tools() -> Vec<Value> {
                     "social_class": { "type": "string" },
                     "body_constitution": { "type": "string" },
                     "body_tempering": { "type": "string" },
+                    "avatar": { "type": "object", "description": "Optional partial nested AvatarProfile object (deep-merged without wiping unpassed fields)." },
+                    "avatar_summary": { "type": "string", "description": "Concise, concrete, absolute present-tense stranger's-eye appearance (no comparative history)." },
+                    "appearance_stage": { "type": "string", "description": "Optional progression stage tag for transforming bodies (e.g. 'Layer 5/9 — Low-Gradient Flow')." },
+                    "height": { "type": "string" },
+                    "weight": { "type": "string" },
+                    "baseline_height": { "type": "string" },
+                    "baseline_weight": { "type": "string" },
+                    "body_type_or_build": { "type": "string" },
+                    "silhouette": { "type": "string" },
+                    "posture_and_gait": { "type": "string" },
+                    "proportions_summary": { "type": "string" },
+                    "clothing_fit": { "type": "string", "description": "Concise present-tense observation of how current clothing sits and drapes." },
+                    "perceived_change_note": { "type": "string", "description": "Optional 1-sentence player-safe subjective note of ongoing physical drift (shown in Player/PC & GM POVs, hidden from strangers/NPCs; zero GM spoilers)." },
+                    "transformation_trajectory": { "type": "string", "description": "Optional GM-only active transformation vector & next-stage trigger/recipe (shown ONLY in GM POV and echoed automatically when manage_progression advances a stage)." },
+                    "measurements": { "type": "object", "additionalProperties": { "type": "string" }, "description": "CURRENT measurements map (canonical keys -> clean scalar values like '88 cm'; set '' to delete or pass replace_measurements=true)." },
+                    "replace_measurements": { "type": "boolean" },
+                    "baseline_measurements": { "type": "object", "additionalProperties": { "type": "string" }, "description": "BASELINE (Day-1 / pre-transformation) measurements map for auto-computed deltas." },
+                    "replace_baseline_measurements": { "type": "boolean" },
+                    "record_checkpoint": { "type": "object", "description": "Optional transformation checkpoint snapshot ({stage, world_time?, summary, height?, weight?, measurements?})." },
+                    "face_shape_and_features": { "type": "string" },
+                    "eyes": { "type": "string" },
+                    "skin_tone_and_texture": { "type": "string" },
+                    "hair": { "type": "string" },
+                    "facial_hair": { "type": "string" },
+                    "voice_and_speech": { "type": "string" },
+                    "scent_or_aura": { "type": "string" },
+                    "visual_prompt_anchor": { "type": "string" },
                     "temperament": { "type": "string" },
                     "long_term_motivations": { "type": "array", "items": { "type": "string" } },
                     "values_and_principles": { "type": "array", "items": { "type": "string" } },
@@ -4480,12 +5909,27 @@ fn extra_rpg_ai_tools() -> Vec<Value> {
         }"#));
     v.push(parse(r#"{
             "name": "simulate_autonomy",
-            "description": "Two-Phase Constrained Agency Sandbox for off-screen NPC, Group (e.g. bandit band), and Faction autonomy. Phase 1 (mode='prepare'): returns a strictly leak-proof POV dossier containing ONLY what those actors know, exact resources/capacity/injuries, tensions, and projected upkeep. Phase 2 (mode='commit'): enforces hard resource & epistemic guards (blocks acting on unknown claims or spending non-existent resources!) and commits deltas atomically. mode='auto_mechanical' applies routine upkeep ticks.",
+            "description": "Two-Phase Constrained Agency Sandbox + Living World Prominent Figure Mobility & Networking. Modes: 'prepare' (leak-proof POV dossier), 'commit' (guarded resource/epistemic commit), 'auto_mechanical' (routine upkeep), 'configure_mobility' (mark prominent NPCs, set home_place_id, mobility_mode: business_circuit|networking_envoy|inspector|wanderer|local_commuter|stationary, preferred_destinations, cadence/stay days, entourage), 'dispatch_trip' (immediately send an NPC on a real Dijkstra-routed business/networking trip with ETA), 'tick_movements' (simulate prominent figure departures, arrivals, networking engagements & organic rumor spread), and 'list_movements' (see who is in transit, visiting, or stranded).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "mode": { "type": "string", "enum": ["prepare", "commit", "auto_mechanical"], "default": "prepare" },
+                    "mode": { "type": "string", "enum": ["prepare", "commit", "auto_mechanical", "configure_mobility", "dispatch_trip", "tick_movements", "list_movements"], "default": "prepare" },
                     "scope_type": { "type": "string", "enum": ["npc", "group", "faction"], "default": "npc" },
+                    "character_id": { "type": "string", "description": "For configure_mobility / dispatch_trip." },
+                    "prominent": { "type": "boolean" },
+                    "mobility_mode": { "type": "string", "enum": ["auto", "stationary", "local_commuter", "business_circuit", "networking_envoy", "inspector", "wanderer"] },
+                    "home_place_id": { "type": "string" },
+                    "destination_place_id": { "type": "string", "description": "Target place for dispatch_trip." },
+                    "preferred_destinations": { "type": "array", "items": { "type": "string" } },
+                    "purposes": { "type": "array", "items": { "type": "string" } },
+                    "purpose": { "type": "string", "description": "Trip purpose for dispatch_trip (business, networking, diplomacy, inspection, procurement)." },
+                    "details": { "type": "string" },
+                    "trip_cadence_days": { "type": "integer", "default": 7 },
+                    "stay_duration_days": { "type": "integer", "default": 3 },
+                    "travel_speed_mode": { "type": "string", "enum": ["foot", "mount", "cart", "carriage", "boat"], "default": "mount" },
+                    "entourage_ids": { "type": "array", "items": { "type": "string" } },
+                    "auto_include_prominent": { "type": "boolean", "default": true },
+                    "seed": { "type": "integer" },
                     "faction_id": { "type": "string" },
                     "actor_ids": { "type": "array", "items": { "type": "string" } },
                     "location_id": { "type": "string" },
@@ -4507,12 +5951,36 @@ fn extra_rpg_ai_tools() -> Vec<Value> {
         }"#));
     v.push(parse(r#"{
             "name": "manage_travel_and_exploration",
-            "description": "Connected geography, graph pathfinding (Dijkstra), travel execution, and grounded exploration. Actions: upsert_route (distance_km, terrain, elevation, weather_exposure, tolls, status: open|hazardous|blocked|destroyed) | list_routes | update_spatial (coordinates, jurisdiction, population, services, resource_deposits) | calculate (auto-detours around destroyed bridges, factors weather, encumbrance, injuries, forced march) | advance (moves party, advances clock, deducts tolls, rolls hazards) | explore (scout/search/track/forage grounded in place lore & tables).",
+            "description": "Connected geography, graph pathfinding (Dijkstra), travel execution, grounded exploration, AND Sparse Multi-Scale 2D (x,y) Map Grids (genre-universal: world/region/settlement/dungeon/space_sector/tactical). Actions: upsert_route | list_routes | update_spatial | calculate | advance | explore | upsert_grid | list_grids | get_grid (supports windowed center_x/center_y/radius & compass neighborhood) | set_cell (single x,y or batch cells[]) | clear_cell | auto_layout_grid.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["upsert_route", "list_routes", "update_spatial", "calculate", "advance", "explore"] },
+                    "action": { "type": "string", "enum": ["upsert_route", "list_routes", "update_spatial", "calculate", "advance", "explore", "upsert_grid", "list_grids", "get_grid", "set_cell", "clear_cell", "auto_layout_grid"] },
                     "id": { "type": "string" },
+                    "grid_id": { "type": "string", "description": "Map grid ID/slug for 2D grid actions." },
+                    "name": { "type": "string" },
+                    "scale_kind": { "type": "string", "enum": ["world", "region", "settlement", "dungeon", "space_sector", "tactical"] },
+                    "parent_place_id": { "type": "string" },
+                    "width": { "type": "integer", "default": 16 },
+                    "height": { "type": "integer", "default": 12 },
+                    "cell_scale_label": { "type": "string", "description": "Scale per cell (e.g. '5 km', '100 m', '1 AU', '10 ft')." },
+                    "default_terrain": { "type": "string", "default": "wilderness" },
+                    "description": { "type": "string" },
+                    "x": { "type": "integer" },
+                    "y": { "type": "integer" },
+                    "center_x": { "type": "integer" },
+                    "center_y": { "type": "integer" },
+                    "radius": { "type": "integer" },
+                    "elevation": { "type": "integer" },
+                    "label": { "type": "string" },
+                    "landmark_name": { "type": "string" },
+                    "faction_control": { "type": "string" },
+                    "fog_status": { "type": "string", "enum": ["charted", "surveyed", "glimpsed", "unexplored"] },
+                    "passable": { "type": "boolean", "default": true },
+                    "gm_notes": { "type": "string" },
+                    "include_gm_secrets": { "type": "boolean", "default": true },
+                    "cells": { "type": "array", "description": "Optional batch array of {x, y, terrain, label, place_id, landmark_name, faction_control, fog_status, passable, hazards, notes, gm_notes} for set_cell." },
+                    "reason": { "type": "string" },
                     "from_place_id": { "type": "string" },
                     "to_place_id": { "type": "string" },
                     "place_id": { "type": "string" },
@@ -4668,7 +6136,7 @@ fn extra_rpg_ai_tools() -> Vec<Value> {
         }"#));
     v.push(parse(r#"{
             "name": "advance_world",
-            "description": "Bounded-scope world simulation tick: advances world clock by duration_hours/duration_days and orchestrates regional weather, injury recovery, market production/consumption drift, routine faction ration upkeep, and optional leak-proof autonomy dossiers strictly within the specified places, factions, and characters (never unbounded).",
+            "description": "Bounded-scope world simulation tick: advances world clock by duration_hours/duration_days and orchestrates regional weather, injury recovery, market production/consumption drift, routine faction ration upkeep, prominent figure business/networking travel & engagements (route-aware via Dijkstra), and optional leak-proof autonomy dossiers.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -4681,17 +6149,223 @@ fn extra_rpg_ai_tools() -> Vec<Value> {
                     "tick_recovery": { "type": "boolean", "default": true },
                     "tick_markets": { "type": "boolean", "default": true },
                     "tick_upkeep": { "type": "boolean", "default": true },
+                    "tick_npc_movements": { "type": "boolean", "default": true, "description": "Simulate prominent figure business circuits, networking travel, arrivals, and organic rumor exchange along open routes." },
                     "prepare_autonomy_dossiers": { "type": "boolean", "default": false },
                     "seed": { "type": "integer" }
                 }
             }
         }"#));
+    v.push(parse(r#"{
+            "name": "manage_progression",
+            "description": "Stateful, genre-agnostic progression engine for Xianxia cultivation realms (1-9 sub-stages per major realm + parallel manual/body-tempering tracks with unique properties, halt-conditions, and bottlenecks), D&D levels (1-20), or Sci-Fi/Cyberpunk operational/psionic tiers. Tracks auto-compile onto character sheets, surface in get_scene_context (with POV-safe gm_notes), and auto-hydrate modifiers into resolve_check.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "define_ladder",
+                            "list_ladders",
+                            "enroll_track",
+                            "advance_xp",
+                            "adjust_xp",
+                            "revert_xp",
+                            "reset_xp",
+                            "attempt_breakthrough",
+                            "update_track",
+                            "remove_track",
+                            "get_character_progression"
+                        ]
+                    },
+                    "preset": { "type": "string", "enum": ["xianxia_standard", "body_tempering", "dnd_level_20", "scifi_tier"], "description": "For define_ladder: one-call genre ladder preset." },
+                    "ladder_id": { "type": "string" },
+                    "name": { "type": "string" },
+                    "kind": { "type": "string", "description": "e.g. realm_ladder, parallel_manual, body_refinement, character_level, scifi_tier." },
+                    "description": { "type": "string" },
+                    "source_text_id": { "type": "string", "description": "Linked StoryText ID or title (e.g. a cultivation manual/scroll in Books & Scrolls)." },
+                    "source_item_id": { "type": "string", "description": "Optional linked CatalogItem ID for a physical manual/relic." },
+                    "manual_title": { "type": "string", "description": "Optional manual title override (auto-resolved from source_text_id/source_item_id if omitted)." },
+                    "manual_notes": { "type": "string", "description": "Notes specific to the cultivation manual being practiced (breathing cadence, meridian pathway, affinities, incompatibilities, personal annotations)." },
+                    "default_check_tags": { "type": "array", "items": { "type": "string" } },
+                    "stages": { "type": "array", "description": "For custom define_ladder: [{ name, sub_stages (e.g. 9), sub_stage_prefix, xp_per_sub_stage, xp_thresholds, breakthrough_required_at_peak, breakthrough_dc_tier, passive_modifier, lifespan_years, properties, halt_conditions }]." },
+                    "character_id": { "type": "string" },
+                    "track_id": { "type": "string" },
+                    "track_kind": { "type": "string", "enum": ["primary_realm", "parallel_manual", "body_refinement", "level", "discipline"], "default": "primary_realm" },
+                    "major_stage_index": { "type": "integer", "default": 0 },
+                    "major_stage_name": { "type": "string" },
+                    "sub_stage": { "type": "integer", "default": 1 },
+                    "sub_stage_max": { "type": "integer", "default": 9 },
+                    "sub_stage_label": { "type": "string" },
+                    "xp": { "type": "integer", "description": "Signed XP delta for advance_xp/adjust_xp/revert_xp (negative reverts awarded XP, stepping back sub-stages if allow_demote=true)." },
+                    "delta_xp": { "type": "integer", "description": "Alias for signed XP delta on adjust_xp/revert_xp." },
+                    "set_current_xp": { "type": "integer", "description": "Set exact current stage XP directly (for adjust_xp)." },
+                    "set_cumulative_xp": { "type": "integer", "description": "Set exact cumulative XP directly (for adjust_xp)." },
+                    "reset_stage_xp": { "type": "boolean", "description": "Reset current stage XP to 0 and clear peak bottleneck (for adjust_xp/reset_xp)." },
+                    "reset_track": { "type": "boolean", "description": "Full track reset back to Stage 0, Sub-stage 1, 0 XP (for adjust_xp/reset_xp)." },
+                    "allow_demote": { "type": "boolean", "default": true, "description": "When reverting XP past 0 on the current sub-stage, step back sub-stages/major stages cleanly." },
+                    "current_xp": { "type": "integer" },
+                    "xp_to_next": { "type": "integer" },
+                    "cumulative_xp": { "type": "integer" },
+                    "at_bottleneck": { "type": "boolean" },
+                    "bottleneck_reason": { "type": "string" },
+                    "halt_conditions": { "type": "array", "items": { "type": "string" } },
+                    "active_properties": { "type": "array", "items": { "type": "string" } },
+                    "add_properties": { "type": "array", "items": { "type": "string" } },
+                    "check_modifier": { "type": "integer" },
+                    "check_tags": { "type": "array", "items": { "type": "string" } },
+                    "status": { "type": "string", "enum": ["active", "stalled", "halted", "completed", "crippled"] },
+                    "notes": { "type": "string" },
+                    "gm_notes": { "type": "string", "description": "GM-only progression notes (stripped from player POV)." },
+                    "profile": { "type": "string" },
+                    "stat": { "type": "string" },
+                    "skill": { "type": "string" },
+                    "difficulty": { "type": "integer" },
+                    "dc_tier": { "type": "string" },
+                    "dc_factors": { "type": "array" },
+                    "modifier": { "type": "integer" },
+                    "advantage": { "type": "string", "enum": ["none", "advantage", "disadvantage"] },
+                    "stakes": { "type": "string" },
+                    "seed": { "type": "integer" },
+                    "next_stage_name": { "type": "string" },
+                    "reason": { "type": "string" }
+                },
+                "required": ["action"]
+            }
+        }"#));
+    v.push(parse(r#"{
+            "name": "manage_player_character",
+            "description": "Dedicated Player Character (PC) sheet manager (defaults to primary PC when character_id is omitted). Manages: Avatar & Body description with dedicated BASELINE vs. CURRENT measurements (auto-computing numeric deltas), Appearance Stage, Clothing Fit, Transformation Checkpoints, height/weight/lifespan, build/silhouette/proportions, face/eyes/skin/hair/voice/aura, permanent scars/tattoos/marks, modular wardrobe & active outfit, portrait attachment, AI visual prompt anchor, Titles & Epithets, Innate Traits/Physique/Spirit Roots, and PROPERLY SEGREGATED XP pools (Stat Training XP, Job/Class XP, Formal Proficiencies). STYLE RULE: Keep live avatar prose fields concise, concrete, and strictly present-tense (stranger's-eye view — ZERO comparative phrasing like 'formerly' or 'relative to Day-1'); put starting numbers in `baseline_measurements` and current numbers in `measurements` so Chronicle auto-computes deltas for GM / returning-NPC reference.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "get_sheet",
+                            "update_avatar",
+                            "upsert_marker",
+                            "remove_marker",
+                            "upsert_outfit",
+                            "set_active_outfit",
+                            "remove_outfit",
+                            "upsert_title",
+                            "toggle_title",
+                            "remove_title",
+                            "adjust_stat_xp",
+                            "upsert_job",
+                            "adjust_job_xp",
+                            "remove_job",
+                            "upsert_proficiency",
+                            "adjust_proficiency_xp",
+                            "remove_proficiency",
+                            "upsert_trait",
+                            "remove_trait"
+                        ]
+                    },
+                    "character_id": { "type": "string", "description": "Optional character ID/slug (defaults to primary PC when omitted)." },
+                    "id": { "type": "string" },
+                    "job_id": { "type": "string" },
+                    "name": { "type": "string" },
+                    "kind": { "type": "string" },
+                    "category": { "type": "string" },
+                    "role": { "type": "string", "enum": ["primary", "secondary", "occupation", "trade", "sect_role"] },
+                    "avatar_summary": { "type": "string", "description": "Concise, concrete, absolute present-tense stranger's-eye description of the PC's current physical presence (no comparative history)." },
+                    "appearance_stage": { "type": "string", "description": "Optional stage tag for a transforming body (e.g. 'Still Water Layer 5/9 — Low-Gradient Flow')." },
+                    "height": { "type": "string" },
+                    "weight": { "type": "string" },
+                    "baseline_height": { "type": "string", "description": "Original Day-1 / pre-transformation height for auto-delta tracking." },
+                    "baseline_weight": { "type": "string", "description": "Original Day-1 / pre-transformation weight for auto-delta tracking." },
+                    "chronological_age": { "type": "string" },
+                    "apparent_age": { "type": "string" },
+                    "lifespan_years": { "type": "integer" },
+                    "body_type_or_build": { "type": "string" },
+                    "silhouette": { "type": "string" },
+                    "posture_and_gait": { "type": "string" },
+                    "proportions_summary": { "type": "string" },
+                    "clothing_fit": { "type": "string", "description": "Concise present-tense description of how current clothing sits and drapes." },
+                    "perceived_change_note": { "type": "string", "description": "Optional 1-sentence player-safe subjective cue of ongoing change (shown in Player/PC & GM POVs, hidden from other NPCs; zero hidden spoilers)." },
+                    "transformation_trajectory": { "type": "string", "description": "Optional GM-only active transformation vector & next-stage update recipe (shown ONLY in GM POV and auto-surfaced when manage_progression advances a stage)." },
+                    "measurements": { "type": "object", "additionalProperties": { "type": "string" }, "description": "CURRENT body measurements (canonical keys -> clean scalar values like '88 cm'; keys auto-canonicalized)." },
+                    "replace_measurements": { "type": "boolean" },
+                    "set_measurement": { "type": "object", "properties": { "key": { "type": "string" }, "value": { "type": "string" } } },
+                    "remove_measurement": { "type": "string" },
+                    "baseline_measurements": { "type": "object", "additionalProperties": { "type": "string" }, "description": "BASELINE (Day-1 / pre-transformation) measurements map for auto-computed deltas." },
+                    "replace_baseline_measurements": { "type": "boolean" },
+                    "set_baseline_measurement": { "type": "object", "properties": { "key": { "type": "string" }, "value": { "type": "string" } } },
+                    "remove_baseline_measurement": { "type": "string" },
+                    "record_checkpoint": { "type": "object", "description": "Snapshot a transformation checkpoint ({stage, world_time?, summary, height?, weight?, measurements?})." },
+                    "transformation_log": { "type": "array", "items": { "type": "object" }, "description": "Replace full transformation_log checkpoint array." },
+                    "clear_checkpoints": { "type": "boolean" },
+                    "face_shape_and_features": { "type": "string" },
+                    "eyes": { "type": "string" },
+                    "skin_tone_and_texture": { "type": "string" },
+                    "hair": { "type": "string" },
+                    "facial_hair": { "type": "string" },
+                    "voice_and_speech": { "type": "string" },
+                    "scent_or_aura": { "type": "string" },
+                    "gender": { "type": "string" },
+                    "species": { "type": "string" },
+                    "body_constitution": { "type": "string" },
+                    "body_tempering": { "type": "string" },
+                    "portrait_attachment_id": { "type": "string" },
+                    "visual_prompt_anchor": { "type": "string" },
+                    "active_outfit": { "type": "string" },
+                    "location": { "type": "string" },
+                    "description": { "type": "string" },
+                    "origin_or_story": { "type": "string" },
+                    "visible_when_clothed": { "type": "boolean" },
+                    "occasion": { "type": "string" },
+                    "headwear": { "type": "string" },
+                    "outer_layer": { "type": "string" },
+                    "top_layer": { "type": "string" },
+                    "bottoms": { "type": "string" },
+                    "footwear": { "type": "string" },
+                    "accessories": { "type": "string" },
+                    "color_palette": { "type": "string" },
+                    "set_active": { "type": "boolean" },
+                    "equipped": { "type": "boolean" },
+                    "source": { "type": "string" },
+                    "mechanical_effect": { "type": "string" },
+                    "stat_modifiers": { "type": "object", "additionalProperties": { "type": "integer" } },
+                    "visibility": { "type": "string", "enum": ["public", "faction", "hidden", "gm_secret"] },
+                    "stat": { "type": "string" },
+                    "delta_xp": { "type": "integer", "description": "Signed XP delta (positive awards, negative reverts/demotes)." },
+                    "xp": { "type": "integer" },
+                    "set_xp": { "type": "integer" },
+                    "set_cumulative_xp": { "type": "integer" },
+                    "xp_to_next": { "type": "integer" },
+                    "reset_xp": { "type": "boolean" },
+                    "reset_stage_xp": { "type": "boolean" },
+                    "reset_job": { "type": "boolean" },
+                    "allow_demote": { "type": "boolean", "default": true },
+                    "auto_promote": { "type": "boolean", "default": true },
+                    "recalc_rank": { "type": "boolean", "default": true },
+                    "unspent_stat_points_delta": { "type": "integer" },
+                    "set_unspent_stat_points": { "type": "integer" },
+                    "spend_stat_point": { "type": "boolean" },
+                    "training_notes": { "type": "string" },
+                    "tier_or_rank": { "type": "string" },
+                    "level": { "type": "integer" },
+                    "set_level": { "type": "integer" },
+                    "active": { "type": "boolean" },
+                    "governing_stats": { "type": "array", "items": { "type": "string" } },
+                    "perks_and_features": { "type": "array", "items": { "type": "string" } },
+                    "rank": { "type": "string" },
+                    "rank_or_grade": { "type": "string" },
+                    "bonus": { "type": "string" },
+                    "effect": { "type": "string" },
+                    "notes": { "type": "string" },
+                    "reason": { "type": "string" }
+                },
+                "required": ["action"]
+            }
+        }"#));
     v
 }
 
-/// Returns the canonical list of all Chronicle tools.
+/// Returns the canonical list of all Chronicle tools (Legacy + Unified Domain Facades).
 pub fn all_tool_definitions() -> Value {
-    tool_definitions()
+    tool_definitions_for_profile(ToolProfile::Legacy)
 }
 
 /// Exports Chronicle's full toolset in universal AI schemas:
@@ -4768,4 +6442,1122 @@ fn opt_i64_vec(args: &Value, key: &str) -> Vec<i64> {
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|item| item.as_i64()).collect())
         .unwrap_or_default()
+}
+
+fn parse_map_cell(grid_id: &str, x: i32, y: i32, obj: &Value) -> crate::world_sim::MapGridCell {
+    crate::world_sim::MapGridCell {
+        grid_id: grid_id.to_string(),
+        x,
+        y,
+        terrain: opt_str(obj, "terrain").unwrap_or_default(),
+        elevation: obj.get("elevation").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+        label: opt_str(obj, "label").unwrap_or_default(),
+        place_id: opt_str(obj, "place_id"),
+        landmark_name: opt_str(obj, "landmark_name").unwrap_or_default(),
+        faction_control: opt_str(obj, "faction_control"),
+        fog_status: opt_str(obj, "fog_status").unwrap_or_else(|| "charted".to_string()),
+        passable: obj.get("passable").and_then(|v| v.as_bool()).unwrap_or(true),
+        hazards: opt_str_vec(obj, "hazards"),
+        notes: opt_str(obj, "notes").unwrap_or_default(),
+        gm_notes: opt_str(obj, "gm_notes").unwrap_or_default(),
+        updated_at_world_time: String::new(),
+    }
+}
+
+// =============================================================================
+// Active Signal Bus, Standing Routines & Unified Domain Facade Dispatchers
+// =============================================================================
+
+fn with_sub_action_as_action(mut args: Value, fallback_action: Option<&str>) -> Value {
+    if let Some(obj) = args.as_object_mut() {
+        obj.remove("op");
+        obj.remove("operation");
+        if let Some(sa) = obj.remove("sub_action") {
+            obj.insert("action".to_string(), sa);
+        } else if let Some(fb) = fallback_action {
+            obj.insert("action".to_string(), Value::String(fb.to_string()));
+        }
+    }
+    args
+}
+
+fn extract_op(args: &Value, default_op: &str) -> String {
+    opt_str(args, "op")
+        .or_else(|| opt_str(args, "operation"))
+        .or_else(|| opt_str(args, "action"))
+        .unwrap_or_else(|| default_op.to_string())
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn execute_manage_signals(engine: &CampaignEngine, args: Value) -> Result<Value> {
+    let op = extract_op(&args, "list");
+    match op.as_str() {
+        "list" | "list_signals" | "get" => {
+            let perspective = opt_str(&args, "perspective");
+            let place_id = opt_str(&args, "place_id");
+            let character_ids = opt_str_vec(&args, "character_ids");
+            let include_secrets = args
+                .get("include_gm_secrets")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let signals = engine.list_active_signals(
+                perspective.as_deref(),
+                place_id.as_deref(),
+                &character_ids,
+                include_secrets,
+            )?;
+            Ok(json!({ "count": signals.len(), "signals": signals }))
+        }
+        "ack" | "acknowledge" | "ack_signal" | "acknowledge_signal" => {
+            let sid = opt_str(&args, "signal_id")
+                .or_else(|| opt_str(&args, "id"))
+                .or_else(|| opt_str(&args, "dedup_key"))
+                .ok_or_else(|| anyhow!("Missing 'signal_id' (or 'id' / 'dedup_key')"))?;
+            let updated = engine.update_signal(&sid, "acknowledged")?;
+            Ok(json!({ "acknowledged": updated.is_some(), "signal": updated }))
+        }
+        "resolve" | "dismiss" | "resolve_signal" | "dismiss_signal" => {
+            let sid = opt_str(&args, "signal_id")
+                .or_else(|| opt_str(&args, "id"))
+                .or_else(|| opt_str(&args, "dedup_key"))
+                .ok_or_else(|| anyhow!("Missing 'signal_id' (or 'id' / 'dedup_key')"))?;
+            let updated = engine.update_signal(&sid, "resolved")?;
+            Ok(json!({ "resolved": updated.is_some(), "signal": updated }))
+        }
+        "delete" | "clear" => {
+            let sid = opt_str(&args, "signal_id")
+                .or_else(|| opt_str(&args, "id"))
+                .ok_or_else(|| anyhow!("Missing 'signal_id'"))?;
+            let _ = engine.update_signal(&sid, "delete")?;
+            Ok(json!({ "deleted": true, "signal_id": sid }))
+        }
+        "emit" | "emit_signal" | "create" => {
+            let sig: crate::signals::EngineSignal = serde_json::from_value(args)?;
+            let saved = engine.emit_signal(sig)?;
+            Ok(json!({ "signal": saved }))
+        }
+        other => Err(anyhow!(
+            "Unknown signal action '{other}'. Expected list, acknowledge, resolve, emit, or delete."
+        )),
+    }
+}
+
+fn execute_manage_routines(engine: &CampaignEngine, args: Value) -> Result<Value> {
+    let op = extract_op(&args, "list");
+    match op.as_str() {
+        "list" | "list_routines" | "get" => {
+            let cid = opt_str(&args, "character_id");
+            let routines = engine.list_routines(cid.as_deref())?;
+            Ok(json!({ "count": routines.len(), "routines": routines }))
+        }
+        "upsert" | "upsert_routine" | "save" | "create" => {
+            let mut routine_val = args
+                .get("routine")
+                .filter(|v| v.is_object())
+                .cloned()
+                .unwrap_or_else(|| args.clone());
+            if let Some(obj) = routine_val.as_object_mut() {
+                if !obj.contains_key("enabled") && !obj.contains_key("active") {
+                    if let Some(st) = obj.get("status").and_then(|v| v.as_str()) {
+                        let sl = st.trim().to_ascii_lowercase();
+                        if matches!(sl.as_str(), "paused" | "disabled" | "halted" | "inactive") {
+                            obj.insert("enabled".to_string(), Value::Bool(false));
+                        } else if matches!(sl.as_str(), "active" | "enabled") {
+                            obj.insert("enabled".to_string(), Value::Bool(true));
+                        }
+                    }
+                }
+            }
+            let routine: crate::routines::CharacterRoutine = serde_json::from_value(routine_val)?;
+            let (saved, ev) = engine.upsert_routine(routine)?;
+            Ok(json!({ "event_seq": ev.seq, "summary": ev.summary, "routine": saved }))
+        }
+        "delete" | "remove" | "delete_routine" => {
+            let rid = opt_str(&args, "routine_id")
+                .or_else(|| opt_str(&args, "id"))
+                .ok_or_else(|| anyhow!("Missing 'routine_id' (or 'id')"))?;
+            let deleted = engine.delete_routine(&rid)?;
+            Ok(json!({ "deleted": deleted, "routine_id": rid }))
+        }
+        other => Err(anyhow!(
+            "Unknown routine action '{other}'. Expected list, upsert, or delete."
+        )),
+    }
+}
+
+fn execute_domain_scene(
+    engine: &CampaignEngine,
+    mut args: Value,
+    allow_local_file_import: bool,
+) -> Result<Value> {
+    let op = extract_op(&args, "context");
+    match op.as_str() {
+        "status" | "campaign_status" => {
+            execute_tool_with_policy(engine, "campaign_status", args, allow_local_file_import)
+        }
+        "context" | "get_scene_context" => {
+            if let Some(obj) = args.as_object_mut() {
+                if !obj.contains_key("format") {
+                    obj.insert("format".to_string(), Value::String("markdown".to_string()));
+                }
+            }
+            execute_tool_with_policy(engine, "get_scene_context", args, allow_local_file_import)
+        }
+        "signals" | "list_signals" => execute_manage_signals(engine, json!({
+            "op": "list",
+            "perspective": args.get("perspective").cloned().unwrap_or(Value::Null),
+            "place_id": args.get("place_id").cloned().unwrap_or(Value::Null),
+            "character_ids": args.get("character_ids").cloned().unwrap_or_else(|| json!([])),
+            "include_gm_secrets": args.get("include_gm_secrets").cloned().unwrap_or(json!(true))
+        })),
+        "ack_signal" | "acknowledge_signal" => {
+            let mut a = args;
+            if let Some(o) = a.as_object_mut() {
+                o.insert("op".to_string(), json!("acknowledge"));
+            }
+            execute_manage_signals(engine, a)
+        }
+        "resolve_signal" | "dismiss_signal" => {
+            let mut a = args;
+            if let Some(o) = a.as_object_mut() {
+                o.insert("op".to_string(), json!("resolve"));
+            }
+            execute_manage_signals(engine, a)
+        }
+        "emit_signal" => {
+            let mut a = args;
+            if let Some(o) = a.as_object_mut() {
+                o.insert("op".to_string(), json!("emit"));
+            }
+            execute_manage_signals(engine, a)
+        }
+        "start_session" | "start_new_session" => {
+            execute_tool_with_policy(engine, "start_new_session", args, allow_local_file_import)
+        }
+        other => Err(anyhow!(
+            "Unknown scene action '{other}'. Expected context, status, signals, ack_signal, resolve_signal, emit_signal, or start_session."
+        )),
+    }
+}
+
+fn execute_domain_query(
+    engine: &CampaignEngine,
+    args: Value,
+    allow_local_file_import: bool,
+) -> Result<Value> {
+    let op = extract_op(&args, "search_all");
+    let target_tool = match op.as_str() {
+        "character" | "get_character" => "get_character",
+        "place" | "get_place" => "get_place",
+        "text" | "get_text" => "get_text",
+        "item" | "get_item" => "get_item",
+        "lore" | "get_lore" => "get_lore",
+        "attachment" | "get_attachment" => "get_attachment",
+        "read_file" | "read_campaign_file" | "file" => "read_campaign_file",
+        "all" | "omni" | "search_all" => "search_all",
+        "characters" | "search_characters" => "search_characters",
+        "places" | "search_places" => "search_places",
+        "lore_search" | "search_lore" => "search_lore",
+        "texts" | "search_texts" => "search_texts",
+        "items" | "search_items" => "search_items",
+        "inventory" | "search_inventory" => "search_inventory",
+        "histories" | "search_histories" => "search_histories",
+        "attachments" | "search_attachments" => "search_attachments",
+        "events" | "history" | "search_history" | "search_events" => "search_history",
+        "relations" | "search_relations" => "search_relations",
+        "knowledge" | "search_knowledge" => "search_knowledge",
+        other => {
+            return Err(anyhow!(
+                "Unknown query op '{other}'. Expected get_character, get_place, get_text, get_item, get_lore, get_attachment, read_file, search_all, search_characters, search_places, search_lore, search_texts, search_items, search_histories, search_attachments, search_events, search_relations, or search_knowledge."
+            ));
+        }
+    };
+    execute_tool_with_policy(engine, target_tool, args, allow_local_file_import)
+}
+
+fn execute_domain_resolve(
+    engine: &CampaignEngine,
+    args: Value,
+    allow_local_file_import: bool,
+) -> Result<Value> {
+    // Note: `CheckRequest` uses `action` for the check's narrative description, so `resolve` reads `op` (or `mode`),
+    // only falling back to `action` if it matches a known sub-tool keyword!
+    let explicit_op = opt_str(&args, "op").or_else(|| opt_str(&args, "mode"));
+    let op = match explicit_op {
+        Some(s) => s.trim().to_ascii_lowercase(),
+        None => {
+            let act = opt_str(&args, "action")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            if matches!(
+                act.as_str(),
+                "contest"
+                    | "resolve_contest"
+                    | "draw_table"
+                    | "draw_random_table"
+                    | "roll"
+                    | "roll_dice"
+                    | "ruleset"
+                    | "upsert_ruleset_profile"
+                    | "random_table"
+                    | "upsert_random_table"
+                    | "encounter"
+                    | "manage_encounter"
+            ) {
+                act
+            } else {
+                "check".to_string()
+            }
+        }
+    };
+
+    match op.as_str() {
+        "check" | "resolve_check" => {
+            execute_tool_with_policy(engine, "resolve_check", args, allow_local_file_import)
+        }
+        "contest" | "resolve_contest" => {
+            execute_tool_with_policy(engine, "resolve_contest", args, allow_local_file_import)
+        }
+        "draw_table" | "table" | "draw_random_table" => {
+            execute_tool_with_policy(engine, "draw_random_table", args, allow_local_file_import)
+        }
+        "roll" | "roll_dice" => {
+            execute_tool_with_policy(engine, "roll_dice", args, allow_local_file_import)
+        }
+        "ruleset" | "upsert_ruleset" | "upsert_ruleset_profile" => {
+            execute_tool_with_policy(engine, "upsert_ruleset_profile", args, allow_local_file_import)
+        }
+        "random_table" | "upsert_table" | "upsert_random_table" => {
+            execute_tool_with_policy(engine, "upsert_random_table", args, allow_local_file_import)
+        }
+        "encounter" | "manage_encounter" => {
+            let mapped = with_sub_action_as_action(args, None);
+            execute_tool_with_policy(engine, "manage_encounter", mapped, allow_local_file_import)
+        }
+        other => Err(anyhow!(
+            "Unknown resolve op '{other}'. Expected check, contest, draw_table, roll_dice, ruleset, random_table, or encounter."
+        )),
+    }
+}
+
+fn execute_domain_character(
+    engine: &CampaignEngine,
+    args: Value,
+    allow_local_file_import: bool,
+) -> Result<Value> {
+    let op = extract_op(&args, "get");
+    match op.as_str() {
+        "create" | "create_character" => {
+            execute_tool_with_policy(engine, "create_character", args, allow_local_file_import)
+        }
+        "get" | "get_character" => {
+            execute_tool_with_policy(engine, "get_character", args, allow_local_file_import)
+        }
+        "move" | "move_character" => {
+            execute_tool_with_policy(engine, "move_character", args, allow_local_file_import)
+        }
+        "resource" | "modify_resource" | "modify_character_resource" => execute_tool_with_policy(
+            engine,
+            "modify_character_resource",
+            args,
+            allow_local_file_import,
+        ),
+        "stat" | "modify_stat" | "modify_character_stat" => execute_tool_with_policy(
+            engine,
+            "modify_character_stat",
+            args,
+            allow_local_file_import,
+        ),
+        "status" | "set_status" | "set_character_status" => execute_tool_with_policy(
+            engine,
+            "set_character_status",
+            args,
+            allow_local_file_import,
+        ),
+        "condition" | "update_condition" | "update_character_condition" => {
+            let mapped = with_sub_action_as_action(args, Some("add"));
+            execute_tool_with_policy(
+                engine,
+                "update_character_condition",
+                mapped,
+                allow_local_file_import,
+            )
+        }
+        "equipment" | "update_equipment" | "update_character_equipment" => {
+            let mapped = with_sub_action_as_action(args, Some("acquire"));
+            execute_tool_with_policy(
+                engine,
+                "update_character_equipment",
+                mapped,
+                allow_local_file_import,
+            )
+        }
+        "transfer_item" => {
+            execute_tool_with_policy(engine, "transfer_item", args, allow_local_file_import)
+        }
+        "skill" | "upsert_skill" | "upsert_character_skill" => execute_tool_with_policy(
+            engine,
+            "upsert_character_skill",
+            args,
+            allow_local_file_import,
+        ),
+        "technique" | "upsert_technique" | "upsert_character_technique" => {
+            execute_tool_with_policy(
+                engine,
+                "upsert_character_technique",
+                args,
+                allow_local_file_import,
+            )
+        }
+        "goal" | "update_goal" | "update_character_goal" => execute_tool_with_policy(
+            engine,
+            "update_character_goal",
+            args,
+            allow_local_file_import,
+        ),
+        "rest" | "rest_characters" => {
+            execute_tool_with_policy(engine, "rest_characters", args, allow_local_file_import)
+        }
+        "profile" | "update_profile" | "update_character_profile" => execute_tool_with_policy(
+            engine,
+            "update_character_profile",
+            args,
+            allow_local_file_import,
+        ),
+        "pc_sheet" | "manage_player_character" => {
+            let mapped = with_sub_action_as_action(args, Some("get_sheet"));
+            execute_tool_with_policy(
+                engine,
+                "manage_player_character",
+                mapped,
+                allow_local_file_import,
+            )
+        }
+        "get_sheet"
+        | "update_avatar"
+        | "upsert_marker"
+        | "remove_marker"
+        | "upsert_outfit"
+        | "set_active_outfit"
+        | "remove_outfit"
+        | "upsert_title"
+        | "toggle_title"
+        | "remove_title"
+        | "adjust_stat_xp"
+        | "upsert_job"
+        | "adjust_job_xp"
+        | "remove_job"
+        | "upsert_proficiency"
+        | "adjust_proficiency_xp"
+        | "remove_proficiency"
+        | "upsert_trait"
+        | "remove_trait" => {
+            let mapped = with_sub_action_as_action(args, Some(&op));
+            execute_tool_with_policy(
+                engine,
+                "manage_player_character",
+                mapped,
+                allow_local_file_import,
+            )
+        }
+        "health" | "manage_health_and_downtime" => {
+            let mapped = with_sub_action_as_action(args, Some("list_injuries"));
+            execute_tool_with_policy(
+                engine,
+                "manage_health_and_downtime",
+                mapped,
+                allow_local_file_import,
+            )
+        }
+        "apply_injury"
+        | "treat_injury"
+        | "advance_recovery"
+        | "list_injuries"
+        | "resolve_downtime"
+        | "begin_crafting"
+        | "resolve_crafting" => {
+            let mapped = with_sub_action_as_action(args, Some(&op));
+            execute_tool_with_policy(
+                engine,
+                "manage_health_and_downtime",
+                mapped,
+                allow_local_file_import,
+            )
+        }
+        "routine" | "routines" => {
+            let mapped = with_sub_action_as_action(args, Some("list"));
+            execute_manage_routines(engine, mapped)
+        }
+        "upsert_routine" | "list_routines" | "delete_routine" => {
+            let mut mapped = args;
+            if let Some(o) = mapped.as_object_mut() {
+                o.insert("op".to_string(), Value::String(op));
+            }
+            execute_manage_routines(engine, mapped)
+        }
+        other => Err(anyhow!(
+            "Unknown character op '{other}'. Expected create, get, move, resource, stat, status, condition, equipment, transfer_item, skill, technique, goal, rest, profile, pc_sheet, health, or routine."
+        )),
+    }
+}
+
+fn execute_domain_progression(
+    engine: &CampaignEngine,
+    mut args: Value,
+    allow_local_file_import: bool,
+) -> Result<Value> {
+    let op = extract_op(&args, "get_character_progression");
+    if op == "apply_stage_rule" {
+        let cid = req_str(&args, "character_id")?;
+        let tid = slugify(&req_str(&args, "track_id")?);
+        let track = engine
+            .db()
+            .get_character_progression(&cid, &tid)?
+            .ok_or_else(|| anyhow!("Track '{tid}' not enrolled on '{cid}'"))?;
+        let ladder = match track.ladder_id.as_deref() {
+            Some(lid) => engine.db().get_progression_ladder(lid)?,
+            None => None,
+        };
+        let m_idx = args
+            .get("major_stage_index")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32)
+            .unwrap_or(track.major_stage_index);
+        let s_stg = args
+            .get("sub_stage")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32)
+            .unwrap_or(track.sub_stage);
+        let rule: crate::routines::StageTransitionRule = if let Some(inline) = args.get("rule") {
+            serde_json::from_value(inline.clone())?
+        } else {
+            CampaignEngine::lookup_stage_rule(&track, ladder.as_ref(), m_idx, s_stg)
+                .ok_or_else(|| anyhow!("No StageTransitionRule configured for stage {m_idx}:{s_stg} on track '{tid}'"))?
+        };
+        return engine.apply_stage_transition_rule(
+            &cid,
+            &track.name,
+            &track.format_stage(),
+            &rule,
+            None,
+        );
+    }
+    let normalized = match op.as_str() {
+        "get_tracks" | "list_tracks" => "get_character_progression",
+        other => other,
+    };
+    if let Some(o) = args.as_object_mut() {
+        o.insert("action".to_string(), Value::String(normalized.to_string()));
+    }
+    execute_tool_with_policy(engine, "manage_progression", args, allow_local_file_import)
+}
+
+fn execute_domain_world(
+    engine: &CampaignEngine,
+    args: Value,
+    allow_local_file_import: bool,
+) -> Result<Value> {
+    let op = extract_op(&args, "advance_time");
+    match op.as_str() {
+        "advance_time" | "time" => {
+            execute_tool_with_policy(engine, "advance_time", args, allow_local_file_import)
+        }
+        "advance_world" | "tick_world" => {
+            execute_tool_with_policy(engine, "advance_world", args, allow_local_file_import)
+        }
+        "create_place" => {
+            execute_tool_with_policy(engine, "create_place", args, allow_local_file_import)
+        }
+        "get_place" => {
+            execute_tool_with_policy(engine, "get_place", args, allow_local_file_import)
+        }
+        "update_place" => {
+            let mapped = with_sub_action_as_action(args, None);
+            execute_tool_with_policy(engine, "update_place", mapped, allow_local_file_import)
+        }
+        "weather" | "manage_weather" => {
+            let mapped = with_sub_action_as_action(args, Some("get"));
+            execute_tool_with_policy(engine, "manage_weather", mapped, allow_local_file_import)
+        }
+        "clock" | "manage_clock" => {
+            let mapped = with_sub_action_as_action(args, Some("list"));
+            execute_tool_with_policy(engine, "manage_clock", mapped, allow_local_file_import)
+        }
+        "travel" | "manage_travel_and_exploration" => {
+            let mapped = with_sub_action_as_action(args, Some("calculate_route"));
+            execute_tool_with_policy(
+                engine,
+                "manage_travel_and_exploration",
+                mapped,
+                allow_local_file_import,
+            )
+        }
+        "upsert_route"
+        | "calculate_route"
+        | "advance_travel"
+        | "explore_area"
+        | "update_spatial"
+        | "upsert_grid"
+        | "list_grids"
+        | "get_grid"
+        | "set_cell"
+        | "clear_cell"
+        | "auto_layout_grid" => {
+            let mapped = with_sub_action_as_action(args, Some(&op));
+            execute_tool_with_policy(
+                engine,
+                "manage_travel_and_exploration",
+                mapped,
+                allow_local_file_import,
+            )
+        }
+        other => Err(anyhow!(
+            "Unknown world op '{other}'. Expected advance_time, advance_world, create_place, get_place, update_place, weather, clock, or travel."
+        )),
+    }
+}
+
+fn execute_domain_society(
+    engine: &CampaignEngine,
+    args: Value,
+    allow_local_file_import: bool,
+) -> Result<Value> {
+    let op = extract_op(&args, "relation");
+    match op.as_str() {
+        "relation" | "upsert_relation" => {
+            execute_tool_with_policy(engine, "upsert_relation", args, allow_local_file_import)
+        }
+        "remove_relation" => {
+            execute_tool_with_policy(engine, "remove_relation", args, allow_local_file_import)
+        }
+        "record_knowledge" => {
+            execute_tool_with_policy(engine, "record_knowledge", args, allow_local_file_import)
+        }
+        "propagate_knowledge" => {
+            execute_tool_with_policy(engine, "propagate_knowledge", args, allow_local_file_import)
+        }
+        "faction" | "manage_faction" => {
+            let mapped = with_sub_action_as_action(args, Some("list"));
+            execute_tool_with_policy(engine, "manage_faction", mapped, allow_local_file_import)
+        }
+        "law" | "manage_law_and_reputation" => {
+            let mapped = with_sub_action_as_action(args, Some("get_reputation"));
+            execute_tool_with_policy(
+                engine,
+                "manage_law_and_reputation",
+                mapped,
+                allow_local_file_import,
+            )
+        }
+        "upsert_jurisdiction"
+        | "check_jurisdiction"
+        | "record_crime"
+        | "update_warrant"
+        | "modify_reputation"
+        | "get_reputation" => {
+            let mapped = with_sub_action_as_action(args, Some(&op));
+            execute_tool_with_policy(
+                engine,
+                "manage_law_and_reputation",
+                mapped,
+                allow_local_file_import,
+            )
+        }
+        "autonomy" | "simulate_autonomy" => {
+            let mapped = with_sub_action_as_action(args, Some("list_movements"));
+            execute_tool_with_policy(engine, "simulate_autonomy", mapped, allow_local_file_import)
+        }
+        "prepare"
+        | "commit"
+        | "auto_mechanical"
+        | "configure_mobility"
+        | "dispatch_trip"
+        | "tick_movements"
+        | "list_movements" => {
+            let mapped = with_sub_action_as_action(args, Some(&op));
+            execute_tool_with_policy(engine, "simulate_autonomy", mapped, allow_local_file_import)
+        }
+        other => Err(anyhow!(
+            "Unknown society op '{other}'. Expected relation, remove_relation, record_knowledge, propagate_knowledge, faction, law, or autonomy."
+        )),
+    }
+}
+
+fn execute_domain_codex(
+    engine: &CampaignEngine,
+    args: Value,
+    allow_local_file_import: bool,
+) -> Result<Value> {
+    let op = extract_op(&args, "upsert_lore");
+    match op.as_str() {
+        "lore" | "upsert_lore" => {
+            execute_tool_with_policy(engine, "upsert_lore", args, allow_local_file_import)
+        }
+        "text" | "upsert_text" => {
+            execute_tool_with_policy(engine, "upsert_text", args, allow_local_file_import)
+        }
+        "record_reading" | "record_text_reading" => {
+            execute_tool_with_policy(engine, "record_text_reading", args, allow_local_file_import)
+        }
+        "history" | "add_history" | "add_entity_history" => {
+            execute_tool_with_policy(engine, "add_entity_history", args, allow_local_file_import)
+        }
+        "import_attachment" | "attach" => {
+            execute_tool_with_policy(engine, "import_attachment", args, allow_local_file_import)
+        }
+        "create_reference_doc" | "reference_doc" => {
+            execute_tool_with_policy(engine, "create_reference_doc", args, allow_local_file_import)
+        }
+        "log_event" | "log" => {
+            execute_tool_with_policy(engine, "log_event", args, allow_local_file_import)
+        }
+        other => Err(anyhow!(
+            "Unknown codex op '{other}'. Expected upsert_lore, upsert_text, record_text_reading, add_history, import_attachment, create_reference_doc, or log_event."
+        )),
+    }
+}
+
+fn execute_domain_economy(
+    engine: &CampaignEngine,
+    args: Value,
+    allow_local_file_import: bool,
+) -> Result<Value> {
+    let op = extract_op(&args, "get_balances");
+    match op.as_str() {
+        "upsert_item" | "catalog_item" => {
+            execute_tool_with_policy(engine, "upsert_item", args, allow_local_file_import)
+        }
+        "tag_item" | "tag_catalog_item" => {
+            execute_tool_with_policy(engine, "tag_catalog_item", args, allow_local_file_import)
+        }
+        "transfer_catalog_item" => {
+            execute_tool_with_policy(engine, "transfer_catalog_item", args, allow_local_file_import)
+        }
+        "claim_discovery" | "claim" => {
+            execute_tool_with_policy(engine, "claim_discovery", args, allow_local_file_import)
+        }
+        "encumbrance" | "check_encumbrance" => {
+            let mapped = with_sub_action_as_action(args, Some("check_encumbrance"));
+            execute_tool_with_policy(engine, "manage_economy", mapped, allow_local_file_import)
+        }
+        "transaction" | "execute_transaction" => {
+            let mapped = with_sub_action_as_action(args, Some("execute_transaction"));
+            execute_tool_with_policy(engine, "manage_economy", mapped, allow_local_file_import)
+        }
+        "set_balance"
+        | "get_balances"
+        | "transfer_currency"
+        | "upsert_market"
+        | "get_market_prices"
+        | "update_market_supply"
+        | "set_item_economics" => {
+            let mapped = with_sub_action_as_action(args, Some(&op));
+            execute_tool_with_policy(engine, "manage_economy", mapped, allow_local_file_import)
+        }
+        other => Err(anyhow!(
+            "Unknown economy op '{other}'. Expected upsert_item, transfer_catalog_item, claim_discovery, check_encumbrance, set_balance, get_balances, transfer_currency, execute_transaction, upsert_market, get_market_prices, update_market_supply, or set_item_economics."
+        )),
+    }
+}
+
+fn execute_domain_admin(
+    engine: &CampaignEngine,
+    args: Value,
+    allow_local_file_import: bool,
+) -> Result<Value> {
+    let op = extract_op(&args, "diagnose");
+    let target = match op.as_str() {
+        "diagnose" | "diagnose_campaign" => "diagnose_campaign",
+        "cleanup" | "cleanup_campaign" => "cleanup_campaign",
+        "backup" | "backup_campaign" => "backup_campaign",
+        "restore" | "restore_backup" => "restore_backup",
+        "rollback" | "rollback_to_event" => "rollback_to_event",
+        "compile" | "compile_docs" => "compile_docs",
+        "update_meta" | "update_campaign_meta" => "update_campaign_meta",
+        "reclassify" | "reclassify_entity" => "reclassify_entity",
+        "rename_or_merge" | "rename_or_merge_entity" => "rename_or_merge_entity",
+        "delete" | "delete_entity" => "delete_entity",
+        "update_character_baseline" => "update_character_baseline",
+        "update_place_baseline" => "update_place_baseline",
+        "update_entity_history" => "update_entity_history",
+        "update_attachment" => "update_attachment",
+        other => {
+            return Err(anyhow!(
+                "Unknown admin op '{other}'. Expected diagnose, cleanup, backup, restore_backup, rollback, compile_docs, update_meta, reclassify, rename_or_merge, delete_entity, update_character_baseline, update_place_baseline, update_entity_history, or update_attachment."
+            ));
+        }
+    };
+    execute_tool_with_policy(engine, target, args, allow_local_file_import)
+}
+
+fn unified_domain_only_definitions() -> Vec<Value> {
+    let arr = json!([
+        {
+            "name": "scene",
+            "description": "Active campaign & scene context hub: read global status, assemble perspective-safe scene context (Markdown with top-banner `## Engine Alarms & Active Directives`), inspect/acknowledge/resolve active Engine Signals, or start a new session.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "op": { "type": "string", "enum": ["context", "status", "signals", "ack_signal", "resolve_signal", "emit_signal", "start_session"], "default": "context" },
+                    "place_id": { "type": "string" },
+                    "character_ids": { "type": "array", "items": { "type": "string" } },
+                    "scene_text": { "type": "string", "description": "Latest player input or scene text to trigger Lorebook, Books/Scrolls, and FTS5 recall." },
+                    "perspective": { "type": "string", "description": "'gm' (default), 'player', or '<character_id>' (strict epistemic wall)." },
+                    "include_gm_secrets": { "type": "boolean", "default": true },
+                    "format": { "type": "string", "enum": ["markdown", "json"], "default": "markdown" },
+                    "max_chars": { "type": "integer" },
+                    "signal_id": { "type": "string", "description": "Signal id or dedup_key for ack_signal / resolve_signal." },
+                    "title": { "type": "string" },
+                    "summary": { "type": "string" }
+                }
+            }
+        },
+        {
+            "name": "query",
+            "description": "Unified read-only retrieval, verbatim file chunk reader, and multi-dimensional 'Search By' engine across Characters, Places, Lore, Books/Scrolls, Carryable Items, Histories, Attachments, Events, Relations, and Epistemic Knowledge.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "op": {
+                        "type": "string",
+                        "enum": [
+                            "search_all", "get_character", "get_place", "get_text", "get_item", "get_lore",
+                            "get_attachment", "read_file", "search_characters", "search_places", "search_lore",
+                            "search_texts", "search_items", "search_inventory", "search_histories", "search_attachments",
+                            "search_events", "search_relations", "search_knowledge"
+                        ],
+                        "default": "search_all"
+                    },
+                    "query": { "type": "string" },
+                    "character_id": { "type": "string" },
+                    "place_id": { "type": "string" },
+                    "text_id": { "type": "string" },
+                    "item_id": { "type": "string" },
+                    "lore_id": { "type": "string" },
+                    "attachment_id": { "type": "string" },
+                    "target": { "type": "string", "description": "For read_file: e.g. 'attachment:<id>', 'text:<id>', 'lore:<id>', 'doc:characters/<id>.md'." },
+                    "offset_chars": { "type": "integer" },
+                    "max_chars": { "type": "integer" },
+                    "actor_id": { "type": "string" },
+                    "not_known_by": { "type": "string", "description": "For search_knowledge: blind-spot finder!" },
+                    "subject": { "type": "string" },
+                    "entity_id": { "type": "string" },
+                    "entity_kind": { "type": "string" },
+                    "location_id": { "type": "string" },
+                    "faction": { "type": "string" },
+                    "tag": { "type": "string" },
+                    "tags": { "type": "array", "items": { "type": "string" }, "description": "Multi-tag filter for search_inventory / search_items (e.g. ['clothing', 'spare'])." },
+                    "tag_match": { "type": "string", "enum": ["all", "any"], "default": "all" },
+                    "exclude_tags": { "type": "array", "items": { "type": "string" } },
+                    "equipped": { "type": "boolean" },
+                    "as_of_seq": { "type": "integer" },
+                    "limit": { "type": "integer" }
+                }
+            }
+        },
+        {
+            "name": "resolve",
+            "description": "Deterministic RPG resolution engine: structured action checks (`op='check'`, auto-hydrating stats, skills, gear, garment fit, titles, traits, proficiencies, injuries, encumbrance & weather, plus automatic Skill -> Stat Training + Job XP trickle), opposed contests (`op='contest'`), weighted/deck random tables (`op='draw_table'`, staging loot receipts), encounters (`op='encounter'`), and ruleset profiles.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "op": { "type": "string", "enum": ["check", "contest", "draw_table", "roll_dice", "ruleset", "random_table", "encounter"], "default": "check" },
+                    "sub_action": { "type": "string", "description": "For op='encounter': start, log_action, next_turn, update_participant, end, get, list." },
+                    "actor_id": { "type": "string" },
+                    "action": { "type": "string", "description": "What is being attempted (e.g. 'Cut mortise joint', 'Slip past watchmen')." },
+                    "stat": { "type": "string" },
+                    "skill": { "type": "string" },
+                    "technique": { "type": "string" },
+                    "progression_track": { "type": "string" },
+                    "equipment": { "type": "array", "items": { "type": "string" } },
+                    "dc_tier": { "type": "string", "enum": ["trivial", "easy", "moderate", "hard", "very_hard", "nearly_impossible"] },
+                    "dc_factors": { "type": "array", "description": "Situational DC modifiers (e.g. 'rushed', 'proper_tools', 'darkness', or {label, delta, reason})." },
+                    "difficulty": { "type": "integer" },
+                    "modifier": { "type": "integer" },
+                    "advantage": { "type": "string", "enum": ["none", "advantage", "disadvantage"] },
+                    "stakes": { "type": "string" },
+                    "dry_run": { "type": "boolean" },
+                    "participants": { "type": "array", "items": { "type": "object" } },
+                    "table_id": { "type": "string" },
+                    "expression": { "type": "string" },
+                    "preset": { "type": "string" },
+                    "seed": { "type": "integer" }
+                }
+            }
+        },
+        {
+            "name": "character",
+            "description": "Unified character lifecycle, vitals/stats/conditions, sized apparel & equipment, persistent injuries/recovery/crafting, standing daily/weekly `routine` habits, and dedicated `pc_sheet` (avatar baseline vs. current measurements, outfits, titles, segregated Stat/Job/Proficiency XP, traits).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "op": {
+                        "type": "string",
+                        "enum": [
+                            "get", "create", "move", "resource", "stat", "status", "condition", "equipment",
+                            "transfer_item", "skill", "technique", "goal", "rest", "profile", "pc_sheet",
+                            "health", "routine"
+                        ]
+                    },
+                    "sub_action": { "type": "string", "description": "Sub-operation for condition (add/remove), equipment (acquire/remove/equip/unequip/tailor/tag/auto_tag/search), pc_sheet (get_sheet/update_avatar/adjust_stat_xp/upsert_job/adjust_job_xp/upsert_proficiency/upsert_title/upsert_trait/upsert_outfit), health (apply_injury/treat_injury/advance_recovery/resolve_downtime/begin_crafting/resolve_crafting), or routine (list/upsert/delete)." },
+                    "character_id": { "type": "string" },
+                    "name": { "type": "string" },
+                    "to_place_id": { "type": "string" },
+                    "resource": { "type": "string" },
+                    "stat": { "type": "string" },
+                    "delta": { "type": "integer" },
+                    "set_value": { "type": "integer" },
+                    "set_current": { "type": "integer" },
+                    "set_max": { "type": "integer" },
+                    "item_name": { "type": "string" },
+                    "tags": { "type": "array", "items": { "type": "string" }, "description": "Item tags (e.g. ['clothing', 'workwear', 'tool', 'cultivation', 'document'])." },
+                    "add_tags": { "type": "array", "items": { "type": "string" } },
+                    "remove_tags": { "type": "array", "items": { "type": "string" } },
+                    "set_tags": { "type": "array", "items": { "type": "string" } },
+                    "garment_measurements": { "type": "object", "additionalProperties": { "type": "string" } },
+                    "garment_cut": { "type": "string" },
+                    "garment_taper": { "type": "string" },
+                    "measurements": { "type": "object", "additionalProperties": { "type": "string" } },
+                    "baseline_measurements": { "type": "object", "additionalProperties": { "type": "string" } },
+                    "routine": { "type": "object", "description": "For op='routine', sub_action='upsert': { name, category, cadence_hours, require_location_id?, halt_on_injury_severity?, progression_xp?, skill_xp?, job_xp?, stat_training_xp?, currency_deltas?, resource_deltas? }." },
+                    "reason": { "type": "string" }
+                },
+                "required": ["op"]
+            }
+        },
+        {
+            "name": "progression",
+            "description": "Genre-agnostic stateful progression & cultivation engine: define ladders (`xianxia_standard`, `body_tempering`, `dnd_level_20`, `scifi_tier`), enroll parallel tracks with declarative `stage_rules` (auto-applying measurements, stats, conditions, traits, checkpoints & emitting CRITICAL signals on layer/stage advance!), award/revert XP, and resolve bottleneck breakthroughs.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "op": {
+                        "type": "string",
+                        "enum": [
+                            "get_tracks", "define_ladder", "list_ladders", "enroll_track", "advance_xp",
+                            "adjust_xp", "revert_xp", "reset_xp", "attempt_breakthrough", "update_track",
+                            "remove_track", "apply_stage_rule"
+                        ]
+                    },
+                    "character_id": { "type": "string" },
+                    "track_id": { "type": "string" },
+                    "ladder_id": { "type": "string" },
+                    "preset": { "type": "string", "enum": ["xianxia_standard", "body_tempering", "dnd_level_20", "scifi_tier"] },
+                    "name": { "type": "string" },
+                    "xp": { "type": "integer" },
+                    "stage_rules": { "type": "object", "description": "Map of '<sub_stage>' or '<major_idx>:<sub_stage>' -> StageTransitionRule ({ appearance_stage?, height?, weight?, measurements?, facial_hair?, stat_set?, stat_deltas?, unspent_stat_points_delta?, upsert_conditions?, remove_conditions?, grant_traits?, checkpoint_summary?, narrative_directive? })." },
+                    "dc_tier": { "type": "string" },
+                    "reason": { "type": "string" }
+                },
+                "required": ["op"]
+            }
+        },
+        {
+            "name": "world",
+            "description": "World calendar, bounded-scope `advance_world` orchestrator, places/landmarks/exits, seasonal Markov weather, auto-ticking `clock` trackers (`cadence_hours`, `consequence_on_fill`, `auto_reset`), Dijkstra overland travel routing, and sparse 2D `(x, y)` map grids.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "op": {
+                        "type": "string",
+                        "enum": [
+                            "advance_time", "advance_world", "create_place", "get_place", "update_place",
+                            "weather", "clock", "travel"
+                        ]
+                    },
+                    "sub_action": { "type": "string", "description": "For update_place (weather/add_condition/remove_condition/landmark/route/control), clock (create/tick/update/list), weather (generate/advance/get), or travel (upsert_route/calculate_route/advance_travel/explore_area/upsert_grid/get_grid/set_cell)." },
+                    "minutes": { "type": "integer" },
+                    "duration_hours": { "type": "integer" },
+                    "place_id": { "type": "string" },
+                    "name": { "type": "string" },
+                    "clock_id": { "type": "string" },
+                    "segments": { "type": "integer" },
+                    "delta": { "type": "integer" },
+                    "cadence_hours": { "type": "integer", "description": "For clock create: auto-ticks +1 segment every `cadence_hours` on advance_time!" },
+                    "consequence_on_fill": { "type": "string" },
+                    "auto_reset": { "type": "boolean" },
+                    "from_place_id": { "type": "string" },
+                    "to_place_id": { "type": "string" },
+                    "grid_id": { "type": "string" },
+                    "reason": { "type": "string" }
+                },
+                "required": ["op"]
+            }
+        },
+        {
+            "name": "society",
+            "description": "Social graph, dedicated Factions, Epistemic Knowledge & witness beliefs (`record_knowledge` / `propagate_knowledge`), Jurisdictions/Crimes/Warrants/Reputation, and off-screen NPC Autonomy & Business-Circuit Mobility.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "op": {
+                        "type": "string",
+                        "enum": [
+                            "relation", "remove_relation", "record_knowledge", "propagate_knowledge",
+                            "faction", "law", "autonomy"
+                        ]
+                    },
+                    "sub_action": { "type": "string", "description": "For faction (upsert/get/list/modify_resource), law (upsert_jurisdiction/record_crime/update_warrant/modify_reputation/get_reputation), or autonomy (prepare/commit/auto_mechanical/configure_mobility/dispatch_trip/tick_movements/list_movements)." },
+                    "source_id": { "type": "string" },
+                    "relation_type": { "type": "string" },
+                    "target_id": { "type": "string" },
+                    "strength": { "type": "integer" },
+                    "dimensions": { "type": "object" },
+                    "subject": { "type": "string" },
+                    "claim": { "type": "string" },
+                    "beliefs": { "type": "array", "items": { "type": "object" } },
+                    "claim_id": { "type": "string" },
+                    "to_actor_ids": { "type": "array", "items": { "type": "string" } },
+                    "notes": { "type": "string" }
+                },
+                "required": ["op"]
+            }
+        },
+        {
+            "name": "codex",
+            "description": "World-building Lorebook (`upsert_lore`), physical readable Books/Scrolls/Manuals (`upsert_text`, `record_text_reading`), Entity Historical Chronicles (`add_history`), Attached/Pasted Reference Docs (`import_attachment`, `create_reference_doc`), and standalone Narrative Events (`log_event`).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "op": {
+                        "type": "string",
+                        "enum": [
+                            "upsert_lore", "upsert_text", "record_text_reading", "add_history",
+                            "import_attachment", "create_reference_doc", "log_event"
+                        ]
+                    },
+                    "id": { "type": "string" },
+                    "title": { "type": "string" },
+                    "category": { "type": "string" },
+                    "summary": { "type": "string" },
+                    "body": { "type": "string" },
+                    "content": { "type": "string" },
+                    "text_id": { "type": "string" },
+                    "reader_id": { "type": "string" },
+                    "read_status": { "type": "string" },
+                    "entity_id": { "type": "string" },
+                    "entity_kind": { "type": "string" },
+                    "details": { "type": "string" },
+                    "visibility": { "type": "string" },
+                    "keywords": { "type": "array", "items": { "type": "string" } },
+                    "related_ids": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": ["op"]
+            }
+        },
+        {
+            "name": "economy",
+            "description": "Carryable catalog items (`upsert_item` with provenance & garment sizing, `transfer_catalog_item`), staged loot claiming (`claim_discovery`), Encumbrance, Atomic Multi-Denomination Currency (auto-making change within the same currency family!), and Dynamic Settlement Markets with broken-route price ripples.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "op": {
+                        "type": "string",
+                        "enum": [
+                            "get_balances", "set_balance", "transfer_currency", "execute_transaction",
+                            "check_encumbrance", "upsert_market", "get_market_prices", "update_market_supply",
+                            "set_item_economics", "upsert_item", "tag_item", "transfer_catalog_item", "claim_discovery"
+                        ]
+                    },
+                    "owner_id": { "type": "string" },
+                    "buyer_id": { "type": "string" },
+                    "seller_id": { "type": "string" },
+                    "from_id": { "type": "string" },
+                    "to_id": { "type": "string" },
+                    "amount": { "type": "integer" },
+                    "currency": { "type": "string" },
+                    "character_id": { "type": "string" },
+                    "place_id": { "type": "string" },
+                    "item_id": { "type": "string" },
+                    "discovery_id": { "type": "string" },
+                    "name": { "type": "string" },
+                    "garment_measurements": { "type": "object", "additionalProperties": { "type": "string" } },
+                    "garment_cut": { "type": "string" },
+                    "garment_taper": { "type": "string" },
+                    "notes": { "type": "string" }
+                },
+                "required": ["op"]
+            }
+        },
+        {
+            "name": "admin",
+            "description": "Campaign diagnostics, backups, hygiene & structural refactoring (`diagnose`, `cleanup`, `backup`, `restore_backup`, `rollback`, `compile_docs`, `update_meta`, `reclassify`, `rename_or_merge`, `delete_entity`, `update_character_baseline`, `update_place_baseline`, `update_entity_history`, `update_attachment`).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "op": {
+                        "type": "string",
+                        "enum": [
+                            "diagnose", "cleanup", "backup", "restore_backup", "rollback", "compile_docs",
+                            "update_meta", "reclassify", "rename_or_merge", "delete_entity",
+                            "update_character_baseline", "update_place_baseline", "update_entity_history",
+                            "update_attachment"
+                        ]
+                    },
+                    "dry_run": { "type": "boolean" },
+                    "to_seq": { "type": "integer" },
+                    "backup_filename": { "type": "string" },
+                    "register": { "type": "string" },
+                    "entity_id": { "type": "string" },
+                    "old_id": { "type": "string" },
+                    "new_id": { "type": "string" },
+                    "reason": { "type": "string" }
+                },
+                "required": ["op"]
+            }
+        },
+        {
+            "name": "manage_signals",
+            "description": "Manage active Chronicle Engine Signals & Alarms (list, acknowledge, resolve, emit, delete).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "op": { "type": "string", "enum": ["list", "acknowledge", "resolve", "emit", "delete"], "default": "list" },
+                    "signal_id": { "type": "string" },
+                    "perspective": { "type": "string" },
+                    "place_id": { "type": "string" },
+                    "character_ids": { "type": "array", "items": { "type": "string" } }
+                }
+            }
+        },
+        {
+            "name": "manage_routines",
+            "description": "Manage standing recurring character habits, work shifts, training regimens, and living upkeep (`list`, `upsert`, `delete`).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "op": { "type": "string", "enum": ["list", "upsert", "delete"], "default": "list" },
+                    "character_id": { "type": "string" },
+                    "routine_id": { "type": "string" },
+                    "routine": { "type": "object" }
+                }
+            }
+        }
+    ]);
+    arr.as_array().cloned().unwrap_or_default()
+}
+
+fn unified_domain_tool_definitions(include_admin: bool) -> Vec<Value> {
+    let mut out = Vec::new();
+    let domain_list = unified_domain_only_definitions();
+    for t in domain_list {
+        let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        if matches!(name, "manage_signals" | "manage_routines") {
+            continue;
+        }
+        if name == "admin" && !include_admin {
+            continue;
+        }
+        out.push(t);
+    }
+    // Include `commit_turn`, `search`, and `fetch` in every sanitized profile!
+    for extra in extra_rpg_ai_tools() {
+        let name = extra.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        if matches!(name, "commit_turn" | "search" | "fetch") {
+            out.push(extra);
+        }
+    }
+    out
 }

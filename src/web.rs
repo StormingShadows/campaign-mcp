@@ -153,20 +153,23 @@ pub fn run_web_server(campaign_dir: &Path, opts: ServerOptions) -> Result<()> {
         let pub_opt = Arc::clone(&explicit_public);
         let fb_base = Arc::clone(&fallback_base);
         let oa = oauth_store.clone();
-        std::thread::spawn(move || {
-            if let Err(e) = handle_connection(
-                stream,
-                eng,
-                &root,
-                tok.as_deref(),
-                pub_opt.as_deref(),
-                fb_base.as_str(),
-                oa,
-                allow_local_file_import,
-            ) {
-                eprintln!("[chronicle-ui] request error: {e}");
-            }
-        });
+        let _ = std::thread::Builder::new()
+            .name("chronicle-http".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                if let Err(e) = handle_connection(
+                    stream,
+                    eng,
+                    &root,
+                    tok.as_deref(),
+                    pub_opt.as_deref(),
+                    fb_base.as_str(),
+                    oa,
+                    allow_local_file_import,
+                ) {
+                    eprintln!("[chronicle-ui] request error: {e}");
+                }
+            });
     }
 
     Ok(())
@@ -222,6 +225,7 @@ fn is_mcp_path(path: &str) -> bool {
 fn handle_oauth_endpoint(
     req: &HttpRequest,
     origin: &str,
+    bearer_token: Option<&str>,
     oauth: Option<&Arc<Mutex<OAuthStore>>>,
 ) -> Option<HttpOutcome> {
     let path = req.path.as_str();
@@ -238,6 +242,64 @@ fn handle_oauth_endpoint(
             status_text: "OK",
             content_type: "application/json; charset=utf-8".to_string(),
             body,
+            extra_headers: vec![],
+        });
+    }
+
+    if req.method == "POST" && path == "/oauth/ui-login" {
+        if let Some(store_arc) = oauth {
+            let mut store = store_arc.lock().ok()?;
+            let r = store.handle_ui_login(&req.body, bearer_token);
+            return Some(HttpOutcome {
+                status: r.status,
+                status_text: r.status_text,
+                content_type: r.content_type,
+                body: r.body,
+                extra_headers: r.extra_headers,
+            });
+        }
+        if let Some(expected) = bearer_token {
+            let provided = serde_json::from_slice::<Value>(&req.body)
+                .ok()
+                .and_then(|v| {
+                    v.get("passphrase")
+                        .or_else(|| v.get("token"))
+                        .and_then(|s| s.as_str())
+                        .map(|s| s.trim().to_string())
+                })
+                .unwrap_or_default();
+            if provided == expected {
+                return Some(HttpOutcome {
+                    status: 200,
+                    status_text: "OK",
+                    content_type: "application/json; charset=utf-8".to_string(),
+                    body: json!({
+                        "access_token": expected,
+                        "token_type": "Bearer",
+                        "expires_in": 86400
+                    })
+                    .to_string()
+                    .into_bytes(),
+                    extra_headers: vec![],
+                });
+            }
+            return Some(HttpOutcome {
+                status: 403,
+                status_text: "Forbidden",
+                content_type: "application/json; charset=utf-8".to_string(),
+                body: json!({ "error": "Invalid Bearer token." })
+                    .to_string()
+                    .into_bytes(),
+                extra_headers: vec![],
+            });
+        }
+        return Some(HttpOutcome {
+            status: 200,
+            status_text: "OK",
+            content_type: "application/json; charset=utf-8".to_string(),
+            body: json!({ "access_token": "", "token_type": "None" })
+                .to_string()
+                .into_bytes(),
             extra_headers: vec![],
         });
     }
@@ -407,8 +469,8 @@ fn handle_connection(
 
     let origin = infer_request_origin(&req, explicit_public_url, fallback_base);
 
-    // OAuth 2.1 discovery, dynamic client registration, consent & token endpoints (+ /health)
-    if let Some(outcome) = handle_oauth_endpoint(&req, &origin, oauth.as_ref()) {
+    // OAuth 2.1 discovery, dynamic client registration, consent & token endpoints (+ /health & /oauth/ui-login)
+    if let Some(outcome) = handle_oauth_endpoint(&req, &origin, bearer_token, oauth.as_ref()) {
         log_http_request(&req.method, &req.path, outcome.status, outcome.body.len());
         return send_response(
             &mut stream,
@@ -440,7 +502,7 @@ fn handle_connection(
         &origin,
         allow_local_file_import,
     );
-    log_http_request(&req.method, &req.path, outcome.status, outcome.body.len());
+    log_http_request_detail(&req, outcome.status, outcome.body.len());
     send_response(
         &mut stream,
         outcome.status,
@@ -454,6 +516,36 @@ fn handle_connection(
 fn log_http_request(method: &str, path: &str, status: u16, bytes: usize) {
     println!("[chronicle-http] {method} {path} -> {status} ({bytes}B)");
     let _ = std::io::stdout().flush();
+}
+
+fn log_http_request_detail(req: &HttpRequest, status: u16, bytes: usize) {
+    if is_mcp_path(&req.path) && req.method == "POST" {
+        if let Ok(v) = serde_json::from_slice::<Value>(&req.body) {
+            let detail = if let Some(m) = v.get("method").and_then(|x| x.as_str()) {
+                if m == "tools/call" {
+                    let tool = v
+                        .get("params")
+                        .and_then(|p| p.get("name"))
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("?");
+                    format!(" [tools/call: {tool}]")
+                } else {
+                    format!(" [{m}]")
+                }
+            } else if v.is_array() {
+                format!(" [batch: {}]", v.as_array().map(|a| a.len()).unwrap_or(0))
+            } else {
+                String::new()
+            };
+            println!(
+                "[chronicle-http] {} {}{} -> {} ({}B)",
+                req.method, req.path, detail, status, bytes
+            );
+            let _ = std::io::stdout().flush();
+            return;
+        }
+    }
+    log_http_request(&req.method, &req.path, status, bytes);
 }
 
 /// Public in-process HTTP router with OAuth 2.1 + headers support for deterministic testing.
@@ -490,7 +582,7 @@ pub fn dispatch_http_with_oauth(
         headers,
         body: body.to_vec(),
     };
-    if let Some(out) = handle_oauth_endpoint(&req, public_origin, Some(oauth)) {
+    if let Some(out) = handle_oauth_endpoint(&req, public_origin, None, Some(oauth)) {
         return (out.status, out.content_type, out.extra_headers, out.body);
     }
     if let Some(unauth) = check_authorization(&req, public_origin, None, Some(oauth)) {
@@ -832,6 +924,25 @@ fn route_request_with_engine(
         return json_bytes(&data);
     }
 
+    if req.method == "GET" && path == "/api/signals" {
+        let persp = opt_q(&req.query, "perspective");
+        let place_id = opt_q(&req.query, "place_id");
+        let include_secrets = parse_opt_bool(&req.query, "include_gm_secrets").unwrap_or(true);
+        let signals = engine.list_active_signals(
+            persp.as_deref(),
+            place_id.as_deref(),
+            &[],
+            include_secrets,
+        )?;
+        return json_bytes(&json!({ "count": signals.len(), "signals": signals }));
+    }
+
+    if req.method == "GET" && path == "/api/routines" {
+        let cid = opt_q(&req.query, "character_id");
+        let routines = engine.list_routines(cid.as_deref())?;
+        return json_bytes(&json!({ "count": routines.len(), "routines": routines }));
+    }
+
     if req.method == "GET" && path == "/api/diagnostics" {
         let report = diagnose_campaign(engine)?;
         return json_bytes(&serde_json::to_value(report)?);
@@ -872,11 +983,108 @@ fn route_request_with_engine(
         let proj = engine.get_character(&id, as_of)?;
         let rels = engine.db().list_relations_for_entity(&proj.baseline.id)?;
         let histories = engine.db().list_histories_for_entity(&proj.baseline.id)?;
+        let progression_tracks = engine.db().list_character_progressions(&proj.baseline.id)?;
+        let progression_ladders = engine.db().list_progression_ladders()?;
+        let profile = engine.get_character_profile(&proj.baseline.id).ok();
+        let mut equipment_fit: std::collections::BTreeMap<String, crate::autonomy::GarmentFitReport> =
+            std::collections::BTreeMap::new();
+        let mut apparel_summary = crate::autonomy::EquippedApparelSummary::default();
+        if let Some(ref prof) = profile {
+            apparel_summary = crate::autonomy::evaluate_equipped_apparel_fit(
+                &proj.current.equipment,
+                &prof.avatar,
+            );
+            for it in &proj.current.equipment {
+                if let Some(rep) = crate::autonomy::evaluate_garment_fit(it, &prof.avatar) {
+                    equipment_fit.insert(it.name.clone(), rep);
+                }
+            }
+        }
+        let manuals: Vec<Value> = engine
+            .db()
+            .list_texts()?
+            .into_iter()
+            .map(|t| {
+                json!({
+                    "id": t.id,
+                    "title": t.title,
+                    "medium": t.medium,
+                    "subject": t.subject,
+                    "read_status": t.read_status
+                })
+            })
+            .collect();
         return json_bytes(&json!({
             "character": proj,
+            "profile": profile,
+            "equipment_fit": equipment_fit,
+            "apparel_summary": apparel_summary,
             "relations": rels,
             "histories": histories,
+            "progression_tracks": progression_tracks,
+            "progression_ladders": progression_ladders,
+            "manuals": manuals,
             "doc_path": format!("docs/characters/{}.md", proj.baseline.id)
+        }));
+    }
+
+    if req.method == "GET" && path == "/api/pc" {
+        let cid = opt_q(&req.query, "character_id");
+        let sheet = engine.get_player_character_sheet(cid.as_deref())?;
+        return json_bytes(&sheet);
+    }
+
+    if req.method == "GET" && path == "/api/world/movements" {
+        let data = engine.list_npc_movements()?;
+        return json_bytes(&data);
+    }
+
+    if req.method == "GET" && path == "/api/maps" {
+        let data = engine.list_map_grids_overview()?;
+        return json_bytes(&data);
+    }
+
+    if req.method == "GET" && path.starts_with("/api/maps/") {
+        let id = url_decode(&path["/api/maps/".len()..]);
+        let cx = parse_opt_i64(&req.query, "center_x").map(|n| n as i32);
+        let cy = parse_opt_i64(&req.query, "center_y").map(|n| n as i32);
+        let center = match (cx, cy) {
+            (Some(x), Some(y)) => Some((x, y)),
+            _ => None,
+        };
+        let radius = parse_opt_i64(&req.query, "radius").map(|n| n as i32);
+        let include_gm = parse_opt_bool(&req.query, "include_gm_secrets").unwrap_or(true);
+        let data = engine.get_map_grid_snapshot(&id, center, radius, include_gm)?;
+        return json_bytes(&data);
+    }
+
+    if req.method == "GET" && path == "/api/progression" {
+        let ladders = engine.db().list_progression_ladders()?;
+        let tracks = if let Some(cid) = opt_q(&req.query, "character_id") {
+            engine.db().list_character_progressions(&cid)?
+        } else {
+            engine.db().list_all_progressions()?
+        };
+        let manuals: Vec<Value> = engine
+            .db()
+            .list_texts()?
+            .into_iter()
+            .map(|t| {
+                json!({
+                    "id": t.id,
+                    "title": t.title,
+                    "medium": t.medium,
+                    "subject": t.subject,
+                    "read_status": t.read_status
+                })
+            })
+            .collect();
+        return json_bytes(&json!({
+            "ladder_count": ladders.len(),
+            "ladders": ladders,
+            "track_count": tracks.len(),
+            "tracks": tracks,
+            "manuals": manuals
         }));
     }
 
@@ -967,6 +1175,16 @@ fn route_request_with_engine(
     }
 
     if req.method == "GET" && path == "/api/items" {
+        let split_csv = |key: &str| -> Vec<String> {
+            opt_q(&req.query, key)
+                .map(|s| {
+                    s.split(',')
+                        .map(|x| x.trim().to_string())
+                        .filter(|x| !x.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
         let filter = ItemSearchFilter {
             query: opt_q(&req.query, "query"),
             item_type: opt_q(&req.query, "item_type"),
@@ -977,11 +1195,49 @@ fn route_request_with_engine(
             has_linked_text: parse_opt_bool(&req.query, "has_linked_text"),
             keyword: opt_q(&req.query, "keyword"),
             tag: opt_q(&req.query, "tag"),
+            tags: split_csv("tags"),
+            tag_match: opt_q(&req.query, "tag_match"),
+            exclude_tags: split_csv("exclude_tags"),
+            equipped: parse_opt_bool(&req.query, "equipped"),
             related_to: opt_q(&req.query, "related_to"),
             limit: parse_opt_usize(&req.query, "limit"),
         };
         let list = engine.search_items_by(&filter)?;
-        return json_bytes(&json!({ "count": list.len(), "items": list }));
+        let all_items = engine.db().list_catalog_items()?;
+        let tag_facets = crate::search::compute_catalog_tag_facets(&all_items);
+        return json_bytes(&json!({
+            "count": list.len(),
+            "total_count": all_items.len(),
+            "tag_facets": tag_facets,
+            "items": list
+        }));
+    }
+
+    if req.method == "GET" && path == "/api/inventory" {
+        let split_csv = |key: &str| -> Vec<String> {
+            opt_q(&req.query, key)
+                .map(|s| {
+                    s.split(',')
+                        .map(|x| x.trim().to_string())
+                        .filter(|x| !x.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let filter = crate::search::InventorySearchFilter {
+            character_id: opt_q(&req.query, "character_id"),
+            query: opt_q(&req.query, "query"),
+            tag: opt_q(&req.query, "tag"),
+            tags: split_csv("tags"),
+            tag_match: opt_q(&req.query, "tag_match"),
+            exclude_tags: split_csv("exclude_tags"),
+            equipped: parse_opt_bool(&req.query, "equipped"),
+            slot: opt_q(&req.query, "slot"),
+            has_sizing: parse_opt_bool(&req.query, "has_sizing"),
+            limit: parse_opt_usize(&req.query, "limit"),
+        };
+        let res = engine.search_inventory(&filter)?;
+        return json_bytes(&serde_json::to_value(res)?);
     }
 
     if req.method == "GET" && path.starts_with("/api/items/") {

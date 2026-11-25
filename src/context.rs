@@ -7,6 +7,9 @@ use crate::models::{
 };
 use crate::projection::{load_all_character_projections, load_all_place_projections};
 use crate::search::{resolve_character_id, resolve_place_id};
+use crate::signals::{
+    evaluate_live_signals, filter_signals_for_perspective, render_signals_markdown, EngineSignal,
+};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -44,6 +47,26 @@ pub struct CharacterBrief {
     pub kind: String,
     pub archetype: String,
     pub current: CharacterCurrent,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub progression_tracks: Vec<crate::world_sim::CharacterProgressionTrack>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_titles: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub avatar_brief: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub apparel_fit_brief: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub perceived_change_note: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub avatar_delta_brief: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub transformation_trajectory: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_jobs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_proficiencies: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_traits: Vec<String>,
     pub recent_events: Vec<String>,
 }
 
@@ -133,6 +156,8 @@ pub struct SceneContextPacket {
     pub time_of_day: String,
     #[serde(default = "default_perspective_label")]
     pub perspective: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_signals: Vec<EngineSignal>,
     pub active_place: Option<PlaceBrief>,
     pub characters: Vec<CharacterBrief>,
     pub knowledge_graph_edges: Vec<GraphRelation>,
@@ -150,6 +175,10 @@ pub struct SceneContextPacket {
     pub character_knowledge: Vec<ActorKnowledgeBrief>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub npc_blind_spots: Vec<BlindSpotNotice>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prominent_figure_movements: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_map_grid_neighborhood: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub present_factions: Vec<FactionRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -375,12 +404,141 @@ pub fn assemble_scene_context(
                 .collect();
             recent.reverse();
 
+            let mut progressions = db.list_character_progressions(cid).unwrap_or_default();
+            if !effective_include_secrets {
+                for tr in &mut progressions {
+                    tr.gm_notes.clear();
+                }
+            }
+
+            let prof_opt = db.get_character_profile(cid).ok().flatten();
+            let show_self_perceived = effective_include_secrets
+                || (raw_persp.eq_ignore_ascii_case("player") && cp.baseline.kind.eq_ignore_ascii_case("pc"))
+                || pov_actor_id.as_deref() == Some(cid.as_str());
+            let (
+                active_titles,
+                avatar_brief,
+                apparel_fit_brief,
+                perceived_change_note,
+                avatar_delta_brief,
+                transformation_trajectory,
+                active_jobs,
+                key_proficiencies,
+                active_traits,
+            ) = if let Some(ref prof) = prof_opt {
+                let titles: Vec<String> = prof
+                    .titles
+                    .iter()
+                    .filter(|t| t.equipped && (effective_include_secrets || t.visibility != "gm_secret"))
+                    .map(|t| {
+                        if t.mechanical_effect.is_empty() {
+                            t.name.clone()
+                        } else {
+                            format!("{} ({})", t.name, t.mechanical_effect)
+                        }
+                    })
+                    .collect();
+                let av_brief = prof.avatar.format_observable_brief();
+                let app_fit = crate::autonomy::evaluate_equipped_apparel_fit(
+                    &cp.current.equipment,
+                    &prof.avatar,
+                )
+                .brief;
+                let self_change = if show_self_perceived {
+                    prof.avatar.perceived_change_note.trim().to_string()
+                } else {
+                    String::new()
+                };
+                let av_delta = if effective_include_secrets {
+                    prof.avatar.format_delta_brief()
+                } else {
+                    String::new()
+                };
+                let av_traj = if effective_include_secrets {
+                    prof.avatar.transformation_trajectory.trim().to_string()
+                } else {
+                    String::new()
+                };
+                let jobs: Vec<String> = prof
+                    .jobs
+                    .iter()
+                    .filter(|j| j.active)
+                    .map(|j| {
+                        format!(
+                            "{} [{} Lv {} ({}/{} XP)]",
+                            j.name, j.role, j.level, j.current_xp, j.xp_to_next
+                        )
+                    })
+                    .collect();
+                let profs: Vec<String> = prof
+                    .proficiencies
+                    .iter()
+                    .map(|p| {
+                        format!(
+                            "{} ({}{})",
+                            p.name,
+                            p.rank,
+                            if p.bonus.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" {}", p.bonus)
+                            }
+                        )
+                    })
+                    .collect();
+                let traits: Vec<String> = prof
+                    .traits_and_perks
+                    .iter()
+                    .filter(|t| t.active)
+                    .map(|t| {
+                        if t.rank_or_grade.is_empty() {
+                            format!("{} [{}]", t.name, t.category)
+                        } else {
+                            format!("{} [{} • {}]", t.name, t.category, t.rank_or_grade)
+                        }
+                    })
+                    .collect();
+                (
+                    titles,
+                    av_brief,
+                    app_fit,
+                    self_change,
+                    av_delta,
+                    av_traj,
+                    jobs,
+                    profs,
+                    traits,
+                )
+            } else {
+                (
+                    vec![],
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    vec![],
+                    vec![],
+                    vec![],
+                )
+            };
+
             characters.push(CharacterBrief {
                 id: cp.baseline.id.clone(),
                 name: cp.baseline.name.clone(),
                 kind: cp.baseline.kind.clone(),
                 archetype: cp.baseline.archetype.clone(),
                 current: cp.current.clone(),
+                progression_tracks: progressions,
+                active_titles,
+                avatar_brief,
+                apparel_fit_brief,
+                perceived_change_note,
+                avatar_delta_brief,
+                transformation_trajectory,
+                active_jobs,
+                key_proficiencies,
+                active_traits,
                 recent_events: recent,
             });
         }
@@ -471,7 +629,7 @@ pub fn assemble_scene_context(
         }
     }
 
-    let triggered_lore: Vec<TriggeredLore> = matched_lore
+    let mut triggered_lore: Vec<TriggeredLore> = matched_lore
         .into_values()
         .map(|(l, reasons)| TriggeredLore {
             id: l.id,
@@ -483,6 +641,21 @@ pub fn assemble_scene_context(
             body: l.body,
         })
         .collect();
+    // High-priority downstream ordering: active GM secrets (always_include or entity-linked) surface FIRST in GM POV!
+    triggered_lore.sort_by(|a, b| {
+        let rank = |l: &TriggeredLore| -> u8 {
+            let is_sec = l.visibility == "gm_secret";
+            let is_always_or_linked = l.trigger_reason.contains("always_include")
+                || l.trigger_reason.contains("linked_to:");
+            match (is_sec, is_always_or_linked) {
+                (true, true) => 0,
+                (true, false) => 1,
+                (false, true) => 2,
+                (false, false) => 3,
+            }
+        };
+        rank(a).cmp(&rank(b)).then_with(|| a.id.cmp(&b.id))
+    });
 
     // Relevant Books, Scrolls & Story Texts:
     // Surface texts located at active place, held by present characters, linked to focus entities,
@@ -802,12 +975,103 @@ pub fn assemble_scene_context(
         .map(format_event_oneliner)
         .collect();
 
+    // Gather prominent figures currently in transit, visiting away from home, or stranded
+    let mut prominent_figure_movements: Vec<String> = Vec::new();
+    for (cid, cp) in &all_chars {
+        if cp.baseline.kind.eq_ignore_ascii_case("pc") {
+            continue;
+        }
+        if let Ok(Some(prof)) = db.get_character_profile(cid) {
+            let m = &prof.mobility;
+            if m.current_status == "in_transit" {
+                if let Some(ref tr) = m.active_trip {
+                    let detour = if tr.detour_note.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" [{}]", tr.detour_note)
+                    };
+                    prominent_figure_movements.push(format!(
+                        "**{}** (`{cid}`) — IN TRANSIT `{}` -> `{}` ({}, ETA {}){detour}",
+                        cp.baseline.name, tr.origin_place_id, tr.destination_place_id, tr.purpose, tr.eta_world_time
+                    ));
+                }
+            } else if m.current_status == "visiting" {
+                if let Some(ref tr) = m.active_trip {
+                    prominent_figure_movements.push(format!(
+                        "**{}** (`{cid}`) — VISITING `{}` for {} (home: `{}`; departing after {})",
+                        cp.baseline.name,
+                        tr.destination_place_id,
+                        tr.purpose,
+                        m.home_place_id.as_deref().unwrap_or("unknown"),
+                        tr.return_after_world_time
+                    ));
+                }
+            } else if m.current_status == "stranded" {
+                let loc = cp.current.current_location.as_deref().unwrap_or("unknown");
+                let note = m
+                    .active_trip
+                    .as_ref()
+                    .map(|t| t.detour_note.as_str())
+                    .unwrap_or("Route severed");
+                prominent_figure_movements.push(format!(
+                    "**{}** (`{cid}`) — STRANDED at `{loc}` ({note})",
+                    cp.baseline.name
+                ));
+            }
+        }
+    }
+
+    // Compact, token-safe 3x3 compass neighborhood if the active place is anchored on a 2D MapGrid
+    let mut local_map_grid_neighborhood: Vec<String> = Vec::new();
+    if let Some(ref ap) = active_place {
+        if let Ok(anchor_cells) = db.find_map_cells_for_place(&ap.id) {
+            for ac in anchor_cells.into_iter().take(2) {
+                if let (Ok(Some(grid)), Ok(all_cells)) =
+                    (db.get_map_grid(&ac.grid_id), db.list_map_cells(&ac.grid_id))
+                {
+                    let lines = crate::world_sim::format_grid_neighborhood_lines(
+                        &grid,
+                        &all_cells,
+                        ac.x,
+                        ac.y,
+                        effective_include_secrets,
+                    );
+                    local_map_grid_neighborhood.extend(lines);
+                }
+            }
+        }
+    }
+
+    // Evaluate & perspective-filter active Engine Signals / Alarms
+    let pc_ids: BTreeSet<String> = all_chars
+        .values()
+        .filter(|c| c.baseline.kind.eq_ignore_ascii_case("pc"))
+        .map(|c| c.baseline.id.clone())
+        .collect();
+    let raw_signals = evaluate_live_signals(
+        db,
+        &all_chars,
+        &all_places,
+        Some(&focus_entities),
+        active_place.as_ref().map(|p| p.id.as_str()),
+        &meta.clock.format_short(),
+    )
+    .unwrap_or_default();
+    let active_signals = filter_signals_for_perspective(
+        raw_signals,
+        raw_persp,
+        pov_actor_id.as_deref(),
+        &pc_ids,
+        effective_include_secrets,
+    );
+
     Ok(SceneContextPacket {
         campaign_name: meta.name,
         session_number: meta.current_session,
         time_of_day: meta.clock.time_of_day().to_string(),
         world_clock: meta.clock,
         perspective: perspective_label,
+        active_signals,
         active_place,
         characters,
         knowledge_graph_edges,
@@ -821,6 +1085,8 @@ pub fn assemble_scene_context(
         pending_discoveries,
         character_knowledge,
         npc_blind_spots,
+        prominent_figure_movements,
+        local_map_grid_neighborhood,
         present_factions,
         gm_only_secrets,
         recent_campaign_events,
@@ -850,12 +1116,20 @@ pub fn render_scene_context_markdown(
     );
     let _ = writeln!(
         out,
-        "**World Clock:** {} ({}) | **Season:** {} | **Global Weather:** {}\n",
+        "**World Clock:** {} ({}) | **Season:** {} | **Global Weather:** {}",
         pkt.world_clock.format_short(),
         pkt.time_of_day,
         pkt.world_clock.season,
         pkt.world_clock.global_weather
     );
+    if let Some(last_ev) = pkt.recent_campaign_events.last() {
+        let _ = writeln!(out, "**Last Committed Ledger Event:** {last_ev}");
+    }
+    let _ = writeln!(out);
+
+    if !pkt.active_signals.is_empty() {
+        out.push_str(&render_signals_markdown(&pkt.active_signals));
+    }
 
     if let Some(ref p) = pkt.active_place {
         let _ = writeln!(out, "## Active Place: {} (`{}`)", p.name, p.id);
@@ -892,6 +1166,11 @@ pub fn render_scene_context_markdown(
                 .map(|l| format!("{} [{}]", l.name, l.status))
                 .collect();
             let _ = writeln!(out, "- **Landmarks:** {}", lms.join("; "));
+        }
+        if !pkt.local_map_grid_neighborhood.is_empty() {
+            for line in &pkt.local_map_grid_neighborhood {
+                let _ = writeln!(out, "{line}");
+            }
         }
         if !p.current.routes.is_empty() {
             let routes: Vec<String> = p
@@ -944,7 +1223,27 @@ pub fn render_scene_context_markdown(
                 .current
                 .techniques
                 .iter()
-                .map(|t| format!("{} ({}, {})", t.name, t.cost, t.mastery))
+                .map(|t| {
+                    let mut extra = Vec::new();
+                    if let Some(ref st) = t.source_text_id {
+                        let lbl = if !t.manual_title.is_empty() {
+                            format!("Manual: {} (text:{st})", t.manual_title)
+                        } else {
+                            format!("Manual: text:{st}")
+                        };
+                        extra.push(lbl);
+                    } else if !t.manual_title.is_empty() {
+                        extra.push(format!("Manual: {}", t.manual_title));
+                    }
+                    if !t.manual_notes.is_empty() {
+                        extra.push(format!("Notes: {}", t.manual_notes));
+                    }
+                    if extra.is_empty() {
+                        format!("{} ({}, {})", t.name, t.cost, t.mastery)
+                    } else {
+                        format!("{} ({}, {}; {})", t.name, t.cost, t.mastery, extra.join(" | "))
+                    }
+                })
                 .collect();
             let skills: Vec<String> = ch
                 .current
@@ -968,8 +1267,84 @@ pub fn render_scene_context_markdown(
                 "### {} (`{}` | {} | {} | {})",
                 ch.name, ch.id, ch.kind, ch.archetype, ch.current.alive_status
             );
+            if !ch.active_titles.is_empty() {
+                let _ = writeln!(out, "- **Active Titles:** {}", ch.active_titles.join(" | "));
+            }
+            if !ch.avatar_brief.is_empty() {
+                let _ = writeln!(out, "- **Observable Appearance (Present-Tense):** {}", ch.avatar_brief);
+            }
+            if !ch.apparel_fit_brief.is_empty() {
+                let _ = writeln!(out, "- **Equipped Apparel Fit:** {}", ch.apparel_fit_brief);
+            }
+            if !ch.perceived_change_note.is_empty() {
+                let _ = writeln!(out, "- **Self-Perceived Ongoing Change:** {}", ch.perceived_change_note);
+            }
+            if !ch.avatar_delta_brief.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "- **Physical Delta vs. Baseline (GM / Returning-NPC Ref):** {}",
+                    ch.avatar_delta_brief
+                );
+            }
+            if !ch.transformation_trajectory.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "- **Active Transformation Trajectory (GM Only — Ongoing Drift & Next Trigger):** {}",
+                    ch.transformation_trajectory
+                );
+            }
+            if !ch.active_traits.is_empty() {
+                let _ = writeln!(out, "- **Traits & Physique:** {}", ch.active_traits.join("; "));
+            }
             if !res.is_empty() {
                 let _ = writeln!(out, "- **Vitals:** {}", res.join(" | "));
+            }
+            if !ch.active_jobs.is_empty() {
+                let _ = writeln!(out, "- **Jobs / Classes:** {}", ch.active_jobs.join(" | "));
+            }
+            if !ch.progression_tracks.is_empty() {
+                let tracks: Vec<String> = ch
+                    .progression_tracks
+                    .iter()
+                    .map(|tr| {
+                        let bn = if tr.at_bottleneck { " [BOTTLENECK]" } else { "" };
+                        let manual = if let Some(ref st) = tr.source_text_id {
+                            if !tr.manual_title.is_empty() {
+                                format!(" [Manual: {} (text:{st})]", tr.manual_title)
+                            } else {
+                                format!(" [Manual: text:{st}]")
+                            }
+                        } else if !tr.manual_title.is_empty() {
+                            format!(" [Manual: {}]", tr.manual_title)
+                        } else {
+                            String::new()
+                        };
+                        let mnotes = if !tr.manual_notes.is_empty() {
+                            format!(" [Manual Notes: {}]", tr.manual_notes)
+                        } else {
+                            String::new()
+                        };
+                        let gm = if !tr.gm_notes.is_empty() {
+                            format!(" *(GM: {})*", tr.gm_notes)
+                        } else {
+                            String::new()
+                        };
+                        format!(
+                            "{}: {} [{}/{} XP, total {}, {:+}]{}{}{}{}",
+                            tr.name,
+                            tr.format_stage(),
+                            tr.current_xp,
+                            tr.xp_to_next,
+                            tr.cumulative_xp,
+                            tr.check_modifier,
+                            bn,
+                            manual,
+                            mnotes,
+                            gm
+                        )
+                    })
+                    .collect();
+                let _ = writeln!(out, "- **Progression:** {}", tracks.join(" | "));
             }
             if !stats.is_empty() {
                 let _ = writeln!(out, "- **Stats:** {}", stats.join(", "));
@@ -981,10 +1356,35 @@ pub fn render_scene_context_markdown(
                 let _ = writeln!(out, "- **Equipped:** {}", eq.join(", "));
             }
             if !bag.is_empty() {
-                let _ = writeln!(out, "- **Carried:** {}", bag.join(", "));
+                if bag.len() > 6 {
+                    let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
+                    for item in ch.current.equipment.iter().filter(|i| !i.equipped) {
+                        let grp = crate::models::primary_item_group(
+                            &item.tags,
+                            item.slot.as_deref(),
+                            &item.name,
+                        );
+                        let label = if item.quantity > 1 {
+                            format!("{} x{}", item.name, item.quantity)
+                        } else {
+                            item.name.clone()
+                        };
+                        grouped.entry(grp).or_default().push(label);
+                    }
+                    let chunks: Vec<String> = grouped
+                        .into_iter()
+                        .map(|(g, list)| format!("[{g}] {}", list.join(", ")))
+                        .collect();
+                    let _ = writeln!(out, "- **Carried (by tag):** {}", chunks.join(" | "));
+                } else {
+                    let _ = writeln!(out, "- **Carried:** {}", bag.join(", "));
+                }
             }
             if !skills.is_empty() {
                 let _ = writeln!(out, "- **Skills:** {}", skills.join("; "));
+            }
+            if !ch.key_proficiencies.is_empty() {
+                let _ = writeln!(out, "- **Proficiencies:** {}", ch.key_proficiencies.join("; "));
             }
             if !techs.is_empty() {
                 let _ = writeln!(out, "- **Techniques:** {}", techs.join("; "));
@@ -993,6 +1393,34 @@ pub fn render_scene_context_markdown(
                 let _ = writeln!(out, "- **Goals:** {}", ch.current.active_goals.join(" | "));
             }
             let _ = writeln!(out);
+        }
+    }
+
+    // High-priority GM-Only Secrets & Active Hidden Blueprints surfaced immediately after Characters in Scene (GM POV ONLY)
+    if pkt.perspective == "gm" {
+        let priority_secrets: Vec<&TriggeredLore> = pkt
+            .triggered_lore
+            .iter()
+            .filter(|l| l.visibility == "gm_secret")
+            .collect();
+        if !priority_secrets.is_empty() {
+            let _ = writeln!(
+                out,
+                "## High-Priority GM Secrets & Active Hidden Blueprints ({})",
+                priority_secrets.len()
+            );
+            let _ = writeln!(
+                out,
+                "> **GM-ONLY DOWNSTREAM DIRECTIVE:** Adjudicate hidden mechanics, gradual physical trajectories, and NPC motivations using these authoritative secrets without leaking hidden explanations to player POV.\n"
+            );
+            for l in &priority_secrets {
+                let _ = writeln!(
+                    out,
+                    "### [GM SECRET] {} (`{}` | {} | trigger: {})",
+                    l.title, l.id, l.category, l.trigger_reason
+                );
+                let _ = writeln!(out, "{}\n", l.body);
+            }
         }
     }
 
@@ -1012,13 +1440,21 @@ pub fn render_scene_context_markdown(
         let _ = writeln!(out);
     }
 
-    if !pkt.triggered_lore.is_empty() {
-        let _ = writeln!(out, "## Triggered Lorebook ({})", pkt.triggered_lore.len());
-        for l in &pkt.triggered_lore {
+    let non_secret_lore: Vec<&TriggeredLore> = if pkt.perspective == "gm" {
+        pkt.triggered_lore
+            .iter()
+            .filter(|l| l.visibility != "gm_secret")
+            .collect()
+    } else {
+        pkt.triggered_lore.iter().collect()
+    };
+    if !non_secret_lore.is_empty() {
+        let _ = writeln!(out, "## Triggered Lorebook ({})", non_secret_lore.len());
+        for l in non_secret_lore {
             let secret_tag = if l.visibility == "gm_secret" {
-                " [GM SECRET - DO NOT LEAK]"
+                " (visibility: gm_secret)"
             } else if l.visibility == "rumor" {
-                " [RUMOR]"
+                " (visibility: rumor)"
             } else {
                 ""
             };
@@ -1057,7 +1493,7 @@ pub fn render_scene_context_markdown(
                 );
             }
             if !t.gm_notes.is_empty() {
-                let _ = writeln!(out, "- **[GM NOTES]:** {}", t.gm_notes);
+                let _ = writeln!(out, "- **GM Reference Notes:** {}", t.gm_notes);
             }
             let _ = writeln!(out, "{}\n", t.content);
         }
@@ -1254,6 +1690,14 @@ pub fn render_scene_context_markdown(
         let _ = writeln!(out);
     }
 
+    if !pkt.prominent_figure_movements.is_empty() {
+        let _ = writeln!(out, "## Living World: Prominent Figures Away / In Transit");
+        for mv in &pkt.prominent_figure_movements {
+            let _ = writeln!(out, "- {mv}");
+        }
+        let _ = writeln!(out);
+    }
+
     if !pkt.npc_blind_spots.is_empty() {
         let _ = writeln!(out, "## Epistemic Blind Spots (Actors Do NOT Know These)");
         for bs in &pkt.npc_blind_spots {
@@ -1263,7 +1707,7 @@ pub fn render_scene_context_markdown(
     }
 
     if !pkt.gm_only_secrets.is_empty() {
-        let _ = writeln!(out, "## [GM EYES ONLY — DO NOT LEAK TO PLAYERS OR UNAWARE NPCS]");
+        let _ = writeln!(out, "## GM EYES ONLY (Hidden World Notes)");
         for sec in &pkt.gm_only_secrets {
             let _ = writeln!(out, "- {sec}");
         }

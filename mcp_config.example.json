@@ -5,7 +5,9 @@
       "args": [
         "mcp",
         "--campaign",
-        "/absolute/path/to/your-campaign"
+        "/absolute/path/to/your-campaign",
+        "--tool-profile",
+        "play"
       ]
     }
   }

@@ -12,6 +12,8 @@ pub mod mechanics;
 pub mod models;
 pub mod oauth;
 pub mod projection;
+pub mod routines;
 pub mod search;
+pub mod signals;
 pub mod web;
 pub mod world_sim;

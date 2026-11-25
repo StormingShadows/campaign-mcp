@@ -107,6 +107,27 @@ impl WorldClock {
 
         self.season != old_season
     }
+
+    /// Deterministic total elapsed in-world hours for scheduling trips, ETAs, and visit windows.
+    pub fn total_hours(&self) -> i64 {
+        let num_seasons = self.seasons.len().max(1) as i64;
+        let dps = self.days_per_season.max(1) as i64;
+        let season_idx = self
+            .seasons
+            .iter()
+            .position(|s| s.eq_ignore_ascii_case(&self.season))
+            .unwrap_or(0) as i64;
+        let year_days = (self.year as i64) * num_seasons * dps;
+        let day_offset = season_idx * dps + (self.day.saturating_sub(1) as i64);
+        (year_days + day_offset) * 24 + (self.hour as i64)
+    }
+
+    /// Returns a cloned clock advanced by `add_hours` hours (for ETA formatting without mutating self).
+    pub fn clock_after_hours(&self, add_hours: u64) -> Self {
+        let mut c = self.clone();
+        c.advance(add_hours.saturating_mul(60));
+        c
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,7 +149,7 @@ pub struct ResourcePool {
     pub unit: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct Item {
     pub name: String,
     #[serde(default)]
@@ -143,6 +164,280 @@ pub struct Item {
     pub tags: Vec<String>,
     #[serde(default)]
     pub description: String,
+    /// Optional dimensional measurements for wearable garments/armor (e.g. Shoulders, Chest, Waist, Hips, Inseam -> "49 cm", "110 cm", "91 cm", "104 cm").
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub garment_measurements: BTreeMap<String, String>,
+    /// Optional garment cut / stretch profile: "fitted" | "tailored" | "standard" | "relaxed" | "loose" | "stretch" | "rigid_armor".
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub garment_cut: String,
+    /// Optional garment taper / silhouette profile: "straight" | "boxy" | "athletic_v" | "tailored_waist" | "hourglass" | "a_line" | "relaxed_drape".
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub garment_taper: String,
+}
+
+/// Canonical genre-agnostic primary category tags recognized for inventory organization.
+pub const CANONICAL_ITEM_CATEGORY_TAGS: &[&str] = &[
+    "clothing",
+    "armor",
+    "weapon",
+    "tool",
+    "book",
+    "document",
+    "cultivation",
+    "magic",
+    "tech",
+    "consumable",
+    "medicine",
+    "food",
+    "provisions",
+    "camping",
+    "travel",
+    "artifact",
+    "keepsake",
+    "key",
+    "currency",
+    "quest",
+    "gear",
+];
+
+/// Normalizes a single inventory/catalog tag into clean lowercase kebab-case.
+pub fn normalize_item_tag(raw: &str) -> String {
+    let mut out = String::new();
+    let mut prev_dash = false;
+    for ch in raw.trim().to_lowercase().chars() {
+        if ch.is_alphanumeric() {
+            out.push(ch);
+            prev_dash = false;
+        } else if matches!(ch, '-' | '_' | ' ' | '/' | ':') {
+            if !out.is_empty() && !prev_dash {
+                out.push('-');
+                prev_dash = true;
+            }
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
+/// Normalizes and deduplicates a list of item tags while preserving order.
+pub fn normalize_item_tags(tags: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in tags {
+        let norm = normalize_item_tag(raw);
+        if !norm.is_empty() && !out.iter().any(|e: &String| e == &norm) {
+            out.push(norm);
+        }
+    }
+    out
+}
+
+/// Returns true if the tag list already contains at least one primary category tag.
+pub fn has_primary_item_category_tag(tags: &[String]) -> bool {
+    tags.iter().any(|t| {
+        let n = normalize_item_tag(t);
+        CANONICAL_ITEM_CATEGORY_TAGS
+            .iter()
+            .any(|c| *c != "gear" && *c == n)
+    })
+}
+
+/// Deterministically infers clean genre-agnostic category tags from an item's name, slot, type, description, and garment sizing.
+pub fn infer_item_tags(
+    name: &str,
+    slot: Option<&str>,
+    item_type: Option<&str>,
+    description: &str,
+    has_garment_sizing: bool,
+) -> Vec<String> {
+    let mut tags: Vec<String> = Vec::new();
+    let mut push = |t: &str| {
+        let n = normalize_item_tag(t);
+        if !n.is_empty() && !tags.iter().any(|e| e == &n) {
+            tags.push(n);
+        }
+    };
+
+    let nl = name.to_lowercase();
+    let sl = slot.unwrap_or("").to_lowercase();
+    let tl = item_type.unwrap_or("").to_lowercase();
+    let dl = description.to_lowercase();
+    let hay = format!("{nl} {sl} {dl}");
+    let has_kw = |text: &str, kw: &str| -> bool {
+        if kw.contains(' ') {
+            return text.contains(kw);
+        }
+        text.split(|c: char| !c.is_alphanumeric() && c != '-')
+            .any(|w| w == kw || w.strip_suffix('s') == Some(kw) || w.strip_suffix("es") == Some(kw))
+    };
+
+    if has_garment_sizing {
+        push("clothing");
+        push("sized-apparel");
+    }
+
+    match tl.as_str() {
+        "clothing" | "apparel" | "garment" | "outfit" => push("clothing"),
+        "armor" | "armour" => push("armor"),
+        "weapon" => push("weapon"),
+        "tool" => push("tool"),
+        "book" | "manual" | "scroll" => push("book"),
+        "record" | "document" => push("document"),
+        "artifact" | "relic" => push("artifact"),
+        "keepsake" => push("keepsake"),
+        "consumable" => push("consumable"),
+        "key" => push("key"),
+        _ => {}
+    }
+
+    if matches!(
+        sl.as_str(),
+        "outerwear" | "shirt" | "trousers" | "pants" | "footwear" | "headwear" | "legwear" | "waist" | "outfit" | "cloak" | "boots" | "gloves"
+    ) || [
+        "jacket", "tunic", "under-tunic", "shirt", "trouser", "pants", "cloak", "robe", "coat", "dress", "skirt",
+        "boot", "shoe", "belt", "leg-wrap", "glove", "hat", "cap", "scarf",
+        "clothing", "attire", "garment", "outfit", "vest", "sash", "mantle", "headwrap",
+    ]
+    .iter()
+    .any(|k| has_kw(&nl, k))
+    {
+        push("clothing");
+    }
+
+    if ["armor", "armour", "mail", "breastplate", "brigandine", "helmet", "helm", "shield", "greaves", "gauntlet"]
+        .iter()
+        .any(|k| has_kw(&nl, k) || has_kw(&sl, k))
+    {
+        push("armor");
+    }
+
+    if ["sword", "saber", "sabre", "blade", "dagger", "spear", "halberd", "bow", "crossbow", "arrow", "mace", "staff", "pistol", "rifle", "blaster", "club", "whip"]
+        .iter()
+        .any(|k| has_kw(&nl, k))
+    {
+        push("weapon");
+    }
+
+    if ["hatchet", "axe", "knife", "chisel", "hammer", "saw", "flint", "flint-and-steel", "fire kit", "tinder", "kit", "lockpick", "wrench", "compass", "needle", "engraving", "pliers", "shovel", "crowbar", "tool"]
+        .iter()
+        .any(|k| has_kw(&nl, k))
+    {
+        push("tool");
+    }
+
+    if ["book", "handbook", "manual", "scroll", "tome", "grimoire", "journal", "diary", "codex", "scripture", "volume"]
+        .iter()
+        .any(|k| has_kw(&nl, k))
+    {
+        push("book");
+    }
+
+    if ["letter", "vouch", "voucher", "charter", "deed", "archive", "ledger", "map", "contract", "permit", "pass", "record", "edict", "warrant", "certificate"]
+        .iter()
+        .any(|k| has_kw(&nl, k))
+    {
+        push("document");
+    }
+
+    if ["jade disk", "jade disc", "jade slip", "talisman", "spirit stone", "pill", "elixir", "formation", "cultivation"]
+        .iter()
+        .any(|k| has_kw(&hay, k))
+    {
+        push("cultivation");
+    } else if ["wand", "rune", "enchanted", "spell", "grimoire", "amulet", "arcane"]
+        .iter()
+        .any(|k| has_kw(&nl, k))
+    {
+        push("magic");
+    } else if ["cyberdeck", "scanner", "datapad", "medkit", "implant", "holo", "battery", "cell"]
+        .iter()
+        .any(|k| has_kw(&nl, k))
+    {
+        push("tech");
+    }
+
+    if ["provision", "ration", "food", "bread", "rice", "tea", "wine", "herb", "salve", "potion", "bandage", "ammo", "ammunition", "oil", "candle"]
+        .iter()
+        .any(|k| has_kw(&nl, k))
+    {
+        push("consumable");
+        if ["provision", "ration", "food", "bread", "rice"].iter().any(|k| has_kw(&nl, k)) {
+            push("provisions");
+        }
+    }
+
+    if ["bedroll", "blanket", "tent", "cord", "rope", "flask", "waterskin", "canteen", "lantern", "torch", "satchel", "backpack", "pack"]
+        .iter()
+        .any(|k| has_kw(&nl, k))
+    {
+        push("camping");
+    }
+
+    if ["coin pouch", "purse", "money", "bill of exchange", "draft"].iter().any(|k| has_kw(&nl, k)) {
+        push("currency");
+    }
+
+    if ["seal", "signet", "relic", "heirloom", "keepsake", "ring", "pendant", "locket", "medallion"]
+        .iter()
+        .any(|k| has_kw(&nl, k))
+    {
+        push("artifact");
+    }
+
+    if has_kw(&nl, "spare") {
+        push("spare");
+    }
+
+    drop(push);
+    if tags.is_empty() {
+        tags.push("gear".to_string());
+    }
+    tags
+}
+
+/// Returns a clean human-readable primary group label for organizing long inventories.
+pub fn primary_item_group(tags: &[String], slot: Option<&str>, name: &str) -> String {
+    let norm = normalize_item_tags(tags);
+    let check = |t: &str| norm.iter().any(|x| x == t);
+    if check("clothing") {
+        return "Clothing & Apparel".to_string();
+    }
+    if check("armor") {
+        return "Armor & Protection".to_string();
+    }
+    if check("weapon") {
+        return "Weapons".to_string();
+    }
+    if check("tool") || check("tools") || check("craft") || check("carpentry") {
+        return "Tools & Craft".to_string();
+    }
+    if check("book") || check("document") {
+        return "Books & Documents".to_string();
+    }
+    if check("cultivation") || check("magic") || check("tech") {
+        return "Cultivation, Magic & Tech".to_string();
+    }
+    if check("artifact") || check("keepsake") || check("key") || check("quest") {
+        return "Artifacts & Keepsakes".to_string();
+    }
+    if check("medicine") || check("medical") || check("healing") {
+        return "Medicine & Healing".to_string();
+    }
+    if check("consumable") || check("provisions") || check("food") || check("ration") || check("seasoning") || check("drink") {
+        return "Food, Provisions & Consumables".to_string();
+    }
+    if check("camping") || check("travel") || check("travel-supplies") {
+        return "Camping & Travel".to_string();
+    }
+    if check("currency") {
+        return "Currency & Pouches".to_string();
+    }
+    let inferred = infer_item_tags(name, slot, None, "", false);
+    if inferred.first().map(String::as_str) != Some("gear") {
+        return primary_item_group(&inferred, slot, "");
+    }
+    "General Gear".to_string()
 }
 
 fn default_qty() -> i64 {
@@ -160,6 +455,15 @@ pub struct Skill {
     pub modifier: Option<String>,
     #[serde(default)]
     pub description: String,
+    /// Optional governing ability/stat (e.g. "Dexterity", "Wisdom"). Auto-resolved from RulesetProfile.skill_table if omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub governing_stat: Option<String>,
+    /// Accumulated practice/activity XP driving automatic proficiency & rank progression.
+    #[serde(default)]
+    pub xp: u64,
+    /// Optional explicit proficiency tier (e.g. "untrained", "proficient", "expertise").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proficiency_tier: Option<String>,
 }
 
 fn default_rank() -> String {
@@ -181,6 +485,21 @@ pub struct Technique {
     pub effect: String,
     #[serde(default)]
     pub description: String,
+    /// Optional linked StoryText ID (e.g. cultivation manual, scroll, grimoire) teaching this technique.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_text_id: Option<String>,
+    /// Optional linked CatalogItem ID for a physical manual/artifact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_item_id: Option<String>,
+    /// Optional linked parallel progression track ID (e.g. cultivation manual track).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progression_track_id: Option<String>,
+    /// Auto-resolved human-readable title of the linked manual/book.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub manual_title: String,
+    /// Character/GM notes specific to cultivating or practicing this manual technique (breathing cadence, meridian quirks, incompatibilities, comprehension insights).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub manual_notes: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -534,11 +853,11 @@ fn default_mime() -> String {
 
 /// First-class cataloged carryable item: weapons, armor, tools, artifacts, keepsakes,
 /// books, manuals, scrolls, records, keys, and relics with full ownership & provenance tracking.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CatalogItem {
     pub id: String,
     pub name: String,
-    /// e.g. "weapon", "armor", "tool", "artifact", "keepsake", "book", "manual", "scroll", "record", "relic", "key", "consumable"
+    /// e.g. "clothing", "apparel", "armor", "weapon", "tool", "artifact", "keepsake", "book", "manual", "scroll", "record", "relic", "key", "consumable"
     #[serde(default = "default_item_type")]
     pub item_type: String,
     #[serde(default)]
@@ -579,6 +898,15 @@ pub struct CatalogItem {
     pub tags: Vec<String>,
     #[serde(default)]
     pub related_ids: Vec<String>,
+    /// Optional dimensional measurements for wearable garments/armor (e.g. Shoulders, Chest, Waist, Hips, Thigh, Inseam).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub garment_measurements: BTreeMap<String, String>,
+    /// Optional garment cut/stretch profile: "fitted" | "tailored" | "standard" | "relaxed" | "loose" | "stretch" | "rigid_armor".
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub garment_cut: String,
+    /// Optional garment taper/silhouette profile: "straight" | "boxy" | "athletic_v" | "tailored_waist" | "hourglass" | "a_line" | "relaxed_drape".
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub garment_taper: String,
     #[serde(default)]
     pub created_at_world_time: String,
     #[serde(default)]
@@ -658,12 +986,12 @@ fn default_rel_visibility() -> String {
     "public".to_string()
 }
 
-/// Blades-in-the-Dark style Progress Clock / Quest / Threat Tracker.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Blades-in-the-Dark style Progress Clock / Quest / Threat / Timed Countdown Tracker.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProgressClock {
     pub id: String,
     pub name: String,
-    /// e.g. "quest", "threat", "faction", "ritual", "travel", "training"
+    /// e.g. "quest", "threat", "faction", "ritual", "travel", "training", "upkeep"
     #[serde(default = "default_clock_kind")]
     pub kind: String,
     pub filled: i64,
@@ -674,6 +1002,18 @@ pub struct ProgressClock {
     pub description: String,
     #[serde(default)]
     pub related_ids: Vec<String>,
+    /// Optional automatic time-ticking cadence in in-world hours (e.g. `24` for a daily rent/countdown clock).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cadence_hours: Option<u64>,
+    /// Last `WorldClock::total_hours()` anchor used for automatic cadence ticking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_tick_total_hours: Option<i64>,
+    /// Consequence / alarm directive surfaced on the Signal Bus when this clock fills.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub consequence_on_fill: String,
+    /// When true (e.g. recurring monthly rent or weekly tithe), automatically resets `filled = 0` after firing `CLOCK_FILLED`!
+    #[serde(default)]
+    pub auto_reset: bool,
 }
 
 fn default_clock_kind() -> String {
@@ -747,6 +1087,8 @@ pub enum EventPayload {
         #[serde(default)]
         unit: Option<String>,
         #[serde(default)]
+        remove: bool,
+        #[serde(default)]
         reason: String,
     },
     StatChanged {
@@ -792,6 +1134,18 @@ pub enum EventPayload {
         #[serde(default)]
         slot: Option<String>,
         equipped: bool,
+    },
+    ItemTagsUpdated {
+        character_id: String,
+        item_name: String,
+        #[serde(default)]
+        add_tags: Vec<String>,
+        #[serde(default)]
+        remove_tags: Vec<String>,
+        #[serde(default)]
+        replace_tags: Option<Vec<String>>,
+        #[serde(default)]
+        reason: String,
     },
     SkillUpdated {
         character_id: String,

@@ -57,34 +57,39 @@ pub fn project_character(
                 set_current,
                 set_max,
                 unit,
+                remove,
                 ..
             } if character_id == &baseline.id => {
-                let entry = current
-                    .resources
-                    .entry(resource.clone())
-                    .or_insert_with(|| ResourcePool {
-                        current: 0,
-                        max: 100,
-                        unit: unit.clone().unwrap_or_default(),
-                    });
-                if let Some(u) = unit {
-                    if !u.is_empty() {
-                        entry.unit = u.clone();
+                if *remove {
+                    current.resources.remove(resource);
+                } else {
+                    let entry = current
+                        .resources
+                        .entry(resource.clone())
+                        .or_insert_with(|| ResourcePool {
+                            current: 0,
+                            max: 100,
+                            unit: unit.clone().unwrap_or_default(),
+                        });
+                    if let Some(u) = unit {
+                        if !u.is_empty() {
+                            entry.unit = u.clone();
+                        }
                     }
-                }
-                if let Some(new_max) = set_max {
-                    entry.max = *new_max;
-                }
-                if let Some(val) = set_current {
-                    entry.current = *val;
-                } else if let Some(d) = delta {
-                    entry.current += *d;
-                }
-                if entry.max > 0 && entry.current > entry.max {
-                    entry.current = entry.max;
-                }
-                if entry.current < 0 {
-                    entry.current = 0;
+                    if let Some(new_max) = set_max {
+                        entry.max = *new_max;
+                    }
+                    if let Some(val) = set_current {
+                        entry.current = *val;
+                    } else if let Some(d) = delta {
+                        entry.current += *d;
+                    }
+                    if entry.max > 0 && entry.current > entry.max {
+                        entry.current = entry.max;
+                    }
+                    if entry.current < 0 {
+                        entry.current = 0;
+                    }
                 }
             }
             EventPayload::StatChanged {
@@ -150,6 +155,30 @@ pub fn project_character(
                     if item.durability.is_some() {
                         existing.durability = item.durability.clone();
                     }
+                    if !item.tags.is_empty() {
+                        for t in &item.tags {
+                            if !existing.tags.iter().any(|et| et.eq_ignore_ascii_case(t)) {
+                                existing.tags.push(t.clone());
+                            }
+                        }
+                    }
+                    if !item.garment_measurements.is_empty() {
+                        for (mk, mv) in &item.garment_measurements {
+                            if mv.trim().is_empty() {
+                                existing.garment_measurements.remove(mk);
+                            } else {
+                                existing
+                                    .garment_measurements
+                                    .insert(mk.clone(), mv.trim().to_string());
+                            }
+                        }
+                    }
+                    if !item.garment_cut.trim().is_empty() {
+                        existing.garment_cut = item.garment_cut.trim().to_string();
+                    }
+                    if !item.garment_taper.trim().is_empty() {
+                        existing.garment_taper = item.garment_taper.trim().to_string();
+                    }
                 } else {
                     current.equipment.push(item.clone());
                 }
@@ -183,6 +212,37 @@ pub fn project_character(
                     existing.equipped = *equipped;
                     if slot.is_some() {
                         existing.slot = slot.clone();
+                    }
+                }
+            }
+            EventPayload::ItemTagsUpdated {
+                character_id,
+                item_name,
+                add_tags,
+                remove_tags,
+                replace_tags,
+                ..
+            } if character_id == &baseline.id => {
+                if let Some(existing) = current
+                    .equipment
+                    .iter_mut()
+                    .find(|i| i.name.eq_ignore_ascii_case(item_name))
+                {
+                    if let Some(ref rep) = replace_tags {
+                        existing.tags = crate::models::normalize_item_tags(rep);
+                    } else {
+                        existing.tags = crate::models::normalize_item_tags(&existing.tags);
+                    }
+                    if !remove_tags.is_empty() {
+                        let rem_norm = crate::models::normalize_item_tags(remove_tags);
+                        existing.tags.retain(|t| !rem_norm.iter().any(|r| r == t));
+                    }
+                    if !add_tags.is_empty() {
+                        for t in crate::models::normalize_item_tags(add_tags) {
+                            if !existing.tags.iter().any(|e| e == &t) {
+                                existing.tags.push(t);
+                            }
+                        }
                     }
                 }
             }
@@ -371,12 +431,48 @@ pub fn load_all_character_projections(
         Some(seq) => db.list_events_up_to(seq)?,
         None => db.list_all_events()?,
     };
+    Ok(project_characters_bucketed(&baselines, &events))
+}
+
+fn project_characters_bucketed(
+    baselines: &[CharacterBaseline],
+    events: &[WorldEvent],
+) -> BTreeMap<String, CharacterProjection> {
+    let mut buckets: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::with_capacity(baselines.len());
+    for b in baselines {
+        buckets.insert(b.id.clone(), Vec::new());
+    }
+
+    for (idx, ev) in events.iter().enumerate() {
+        let mut touched: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for eid in &ev.affected_entities {
+            if buckets.contains_key(eid.as_str()) {
+                touched.insert(eid.as_str());
+            }
+        }
+        if let Some(cid) = payload_character_target(&ev.payload) {
+            if buckets.contains_key(cid) {
+                touched.insert(cid);
+            }
+        }
+        for cid in touched {
+            if let Some(vec) = buckets.get_mut(cid) {
+                vec.push(idx);
+            }
+        }
+    }
+
     let mut map = BTreeMap::new();
     for b in baselines {
-        let proj = project_character(&b, &events);
+        let slice_events: Vec<WorldEvent> = buckets
+            .get(&b.id)
+            .map(|idxs| idxs.iter().map(|&i| events[i].clone()).collect())
+            .unwrap_or_default();
+        let proj = project_character(b, &slice_events);
         map.insert(b.id.clone(), proj);
     }
-    Ok(map)
+    map
 }
 
 pub fn load_character_projection(
@@ -399,12 +495,14 @@ pub fn load_all_place_projections(
     as_of_seq: Option<i64>,
 ) -> Result<BTreeMap<String, PlaceProjection>> {
     let meta = db.get_campaign_meta()?;
-    let char_projections = load_all_character_projections(db, as_of_seq)?;
+    let char_baselines = db.list_character_baselines()?;
     let place_baselines = db.list_place_baselines()?;
     let events = match as_of_seq {
         Some(seq) => db.list_events_up_to(seq)?,
         None => db.list_all_events()?,
     };
+
+    let char_projections = project_characters_bucketed(&char_baselines, &events);
 
     // Derive world clock at as_of_seq if needed
     let mut clock = meta.clock.clone();
@@ -416,15 +514,55 @@ pub fn load_all_place_projections(
         }
     }
 
+    let mut place_buckets: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::with_capacity(place_baselines.len());
+    let mut present_by_place: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::with_capacity(place_baselines.len());
+    for pb in &place_baselines {
+        place_buckets.insert(pb.id.clone(), Vec::new());
+        present_by_place.insert(pb.id.clone(), Vec::new());
+    }
+    for cp in char_projections.values() {
+        if let Some(ref loc) = cp.current.current_location {
+            if let Some(list) = present_by_place.get_mut(loc.as_str()) {
+                list.push(cp.baseline.id.clone());
+            }
+        }
+    }
+
+    for (idx, ev) in events.iter().enumerate() {
+        let mut touched: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        if let Some(ref lid) = ev.location_id {
+            if place_buckets.contains_key(lid.as_str()) {
+                touched.insert(lid.as_str());
+            }
+        }
+        for eid in &ev.affected_entities {
+            if place_buckets.contains_key(eid.as_str()) {
+                touched.insert(eid.as_str());
+            }
+        }
+        for pid in payload_place_targets(&ev.payload) {
+            if place_buckets.contains_key(pid) {
+                touched.insert(pid);
+            }
+        }
+        for pid in touched {
+            if let Some(vec) = place_buckets.get_mut(pid) {
+                vec.push(idx);
+            }
+        }
+    }
+
     let mut map = BTreeMap::new();
     for pb in place_baselines {
-        let mut present: Vec<String> = char_projections
-            .values()
-            .filter(|cp| cp.current.current_location.as_deref() == Some(pb.id.as_str()))
-            .map(|cp| cp.baseline.id.clone())
-            .collect();
+        let mut present = present_by_place.remove(&pb.id).unwrap_or_default();
         present.sort();
-        let proj = project_place(&pb, &events, &clock, present);
+        let slice_events: Vec<WorldEvent> = place_buckets
+            .get(&pb.id)
+            .map(|idxs| idxs.iter().map(|&i| events[i].clone()).collect())
+            .unwrap_or_default();
+        let proj = project_place(&pb, &slice_events, &clock, present);
         map.insert(pb.id.clone(), proj);
     }
     Ok(map)
@@ -435,10 +573,69 @@ pub fn load_place_projection(
     place_id: &str,
     as_of_seq: Option<i64>,
 ) -> Result<PlaceProjection> {
+    if as_of_seq.is_none() {
+        if let Some(pb) = db.get_place_baseline(place_id)? {
+            let meta = db.get_campaign_meta()?;
+            let char_projections = load_all_character_projections(db, None)?;
+            let mut present: Vec<String> = char_projections
+                .values()
+                .filter(|cp| cp.current.current_location.as_deref() == Some(pb.id.as_str()))
+                .map(|cp| cp.baseline.id.clone())
+                .collect();
+            present.sort();
+            // Include events linked in event_entities OR having location_id == place_id
+            let events = db.list_events_for_place_or_entity(place_id)?;
+            return Ok(project_place(&pb, &events, &meta.clock, present));
+        }
+    }
     let all = load_all_place_projections(db, as_of_seq)?;
     all.get(place_id)
         .cloned()
         .ok_or_else(|| anyhow!("Place '{place_id}' not found"))
+}
+
+fn payload_character_target(payload: &EventPayload) -> Option<&str> {
+    match payload {
+        EventPayload::CharacterCreated { character_id }
+        | EventPayload::CharacterMoved { character_id, .. }
+        | EventPayload::ResourceChanged { character_id, .. }
+        | EventPayload::StatChanged { character_id, .. }
+        | EventPayload::CharacterStatusChanged { character_id, .. }
+        | EventPayload::ConditionAdded { character_id, .. }
+        | EventPayload::ConditionRemoved { character_id, .. }
+        | EventPayload::ItemAcquired { character_id, .. }
+        | EventPayload::ItemRemoved { character_id, .. }
+        | EventPayload::ItemEquipped { character_id, .. }
+        | EventPayload::ItemTagsUpdated { character_id, .. }
+        | EventPayload::SkillUpdated { character_id, .. }
+        | EventPayload::TechniqueUpdated { character_id, .. }
+        | EventPayload::GoalUpdated { character_id, .. } => Some(character_id.as_str()),
+        EventPayload::DiceRolled { actor_id, .. } => actor_id.as_deref(),
+        _ => None,
+    }
+}
+
+fn payload_place_targets(payload: &EventPayload) -> Vec<&str> {
+    match payload {
+        EventPayload::PlaceCreated { place_id }
+        | EventPayload::PlaceWeatherChanged { place_id, .. }
+        | EventPayload::PlaceConditionChanged { place_id, .. }
+        | EventPayload::PlaceControlChanged { place_id, .. }
+        | EventPayload::LandmarkUpdated { place_id, .. }
+        | EventPayload::RouteUpdated { place_id, .. } => vec![place_id.as_str()],
+        EventPayload::CharacterMoved {
+            from_place,
+            to_place,
+            ..
+        } => {
+            let mut v = vec![to_place.as_str()];
+            if let Some(fp) = from_place.as_deref() {
+                v.push(fp);
+            }
+            v
+        }
+        _ => Vec::new(),
+    }
 }
 
 fn event_targets_character(payload: &EventPayload, char_id: &str) -> bool {
@@ -453,6 +650,7 @@ fn event_targets_character(payload: &EventPayload, char_id: &str) -> bool {
         | EventPayload::ItemAcquired { character_id, .. }
         | EventPayload::ItemRemoved { character_id, .. }
         | EventPayload::ItemEquipped { character_id, .. }
+        | EventPayload::ItemTagsUpdated { character_id, .. }
         | EventPayload::SkillUpdated { character_id, .. }
         | EventPayload::TechniqueUpdated { character_id, .. }
         | EventPayload::GoalUpdated { character_id, .. } => character_id == char_id,

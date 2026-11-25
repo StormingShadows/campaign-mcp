@@ -68,6 +68,9 @@ enum Commands {
         /// Allow HTTP clients to read local host files via `import_attachment(source_path)` (disabled by default for security)
         #[arg(long)]
         allow_local_file_import: bool,
+        /// MCP tool profile: 'play' (12 sanitized domain tools, ~80% fewer tokens), 'compact-full' (+admin), or 'legacy' (all 86+ tools; also reads CHRONICLE_TOOL_PROFILE)
+        #[arg(long)]
+        tool_profile: Option<String>,
     },
 
     /// Run the Model Context Protocol (MCP) server (stdio for Codex CLI/Antigravity/Claude/Cursor, or Streamable HTTP for ChatGPT Web/Desktop/Colab).
@@ -99,6 +102,9 @@ enum Commands {
         /// Allow HTTP clients to read local host files via `import_attachment(source_path)` (disabled by default for security)
         #[arg(long)]
         allow_local_file_import: bool,
+        /// MCP tool profile: 'play' (12 sanitized domain tools, ~80% fewer tokens), 'compact-full' (+admin), or 'legacy' (all 86+ tools; also reads CHRONICLE_TOOL_PROFILE)
+        #[arg(long)]
+        tool_profile: Option<String>,
     },
 
     /// Multi-dimensional 'Search By' queries across Characters, Places, Lore, Texts, Attachments, Events, Relations, or Everything.
@@ -143,6 +149,9 @@ enum Commands {
         /// Target format: mcp, openai, anthropic, or openapi
         #[arg(long, short = 'f', default_value = "openai")]
         format: String,
+        /// Tool profile: 'play', 'compact-full', or 'legacy'
+        #[arg(long)]
+        tool_profile: Option<String>,
     },
 
     /// Re-compile all referencable Markdown documents from the SQLite event ledger.
@@ -225,6 +234,20 @@ enum Commands {
         expression: String,
         #[arg(long)]
         seed: Option<u64>,
+    },
+
+    /// Execute any Chronicle MCP tool (or a JSON batch file of `[{"tool": "...", "args": {...}}]`) directly from CLI.
+    Tool {
+        #[arg(long, short = 'c')]
+        campaign: PathBuf,
+        /// Tool name (e.g. "scene", "diagnose_campaign"), or "batch" when passing a JSON array file via --args-file
+        name: String,
+        /// Inline JSON arguments object
+        #[arg(long, default_value = "{}")]
+        args: String,
+        /// Optional path to a UTF-8 JSON file containing tool args (or an array of `{tool, args}` steps when name == "batch")
+        #[arg(long)]
+        args_file: Option<PathBuf>,
     },
 }
 
@@ -512,6 +535,17 @@ enum SearchCommands {
 }
 
 fn main() -> Result<()> {
+    let builder = std::thread::Builder::new()
+        .name("chronicle-main".to_string())
+        .stack_size(16 * 1024 * 1024);
+    let handle = builder.spawn(run_cli)?;
+    match handle.join() {
+        Ok(res) => res,
+        Err(_) => anyhow::bail!("Chronicle main thread panicked"),
+    }
+}
+
+fn run_cli() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -541,7 +575,11 @@ fn main() -> Result<()> {
             oauth,
             oauth_secret,
             allow_local_file_import,
+            tool_profile,
         } => {
+            if let Some(ref tp) = tool_profile {
+                chronicle::mcp::set_active_tool_profile(Some(chronicle::mcp::ToolProfile::parse_opt(Some(tp))));
+            }
             let token = bearer_token.or_else(|| std::env::var("CHRONICLE_MCP_TOKEN").ok());
             let oa_secret = oauth_secret.or_else(|| std::env::var("CHRONICLE_OAUTH_SECRET").ok());
             let oauth_enabled = oauth || oa_secret.is_some();
@@ -569,7 +607,11 @@ fn main() -> Result<()> {
             oauth,
             oauth_secret,
             allow_local_file_import,
+            tool_profile,
         } => {
+            if let Some(ref tp) = tool_profile {
+                chronicle::mcp::set_active_tool_profile(Some(chronicle::mcp::ToolProfile::parse_opt(Some(tp))));
+            }
             if transport.eq_ignore_ascii_case("http")
                 || transport.eq_ignore_ascii_case("streamable-http")
                 || transport.eq_ignore_ascii_case("streamable_http")
@@ -664,7 +706,13 @@ fn main() -> Result<()> {
             println!("  File Path    : {}", abs.display());
         }
 
-        Commands::ExportTools { format } => {
+        Commands::ExportTools {
+            format,
+            tool_profile,
+        } => {
+            if let Some(ref tp) = tool_profile {
+                chronicle::mcp::set_active_tool_profile(Some(chronicle::mcp::ToolProfile::parse_opt(Some(tp))));
+            }
             let val = if format.eq_ignore_ascii_case("openapi") {
                 build_openapi_spec()
             } else {
@@ -897,6 +945,57 @@ fn main() -> Result<()> {
             let res = roll_dice(&expression, seed)?;
             println!("{}", serde_json::to_string_pretty(&res)?);
         }
+
+        Commands::Tool {
+            campaign,
+            name,
+            args,
+            args_file,
+        } => {
+            let engine = CampaignEngine::open(&campaign)?;
+            let parsed: serde_json::Value = if let Some(path) = args_file {
+                let raw = std::fs::read_to_string(&path)?;
+                serde_json::from_str(&raw)?
+            } else {
+                serde_json::from_str(&args)?
+            };
+            if name.eq_ignore_ascii_case("batch") {
+                let steps = parsed
+                    .as_array()
+                    .ok_or_else(|| anyhow::anyhow!("batch requires a JSON array of {{tool, args}} objects"))?;
+                let results = engine.with_deferred_compile(|eng| -> Result<Vec<serde_json::Value>> {
+                    let mut out = Vec::with_capacity(steps.len());
+                    for (idx, step) in steps.iter().enumerate() {
+                        let tname = step
+                            .get("tool")
+                            .and_then(|v| v.as_str())
+                            .ok_or_else(|| anyhow::anyhow!("Step #{idx} missing 'tool' string"))?;
+                        let targs = step
+                            .get("args")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!({}));
+                        let res = chronicle::mcp::execute_tool(eng, tname, targs)
+                            .map_err(|e| anyhow::anyhow!("Step #{idx} ({tname}) failed: {e}"))?;
+                        out.push(serde_json::json!({
+                            "index": idx,
+                            "tool": tname,
+                            "result": res
+                        }));
+                    }
+                    Ok(out)
+                })?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "batch_completed": results.len(),
+                        "results": results
+                    }))?
+                );
+            } else {
+                let res = chronicle::mcp::execute_tool(&engine, &name, parsed)?;
+                println!("{}", serde_json::to_string_pretty(&res)?);
+            }
+        }
     }
 
     Ok(())
@@ -1007,6 +1106,7 @@ fn handle_search(campaign: PathBuf, target: SearchCommands) -> Result<()> {
                 tag: a.tag,
                 related_to: a.related_to,
                 limit: Some(a.limit),
+                ..Default::default()
             })?;
             println!("{}", serde_json::to_string_pretty(&res)?);
         }

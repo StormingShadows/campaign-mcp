@@ -1,4 +1,4 @@
-use chronicle::context::SceneContextRequest;
+﻿use chronicle::context::SceneContextRequest;
 use chronicle::engine::CampaignEngine;
 use chronicle::mcp::{execute_tool, export_tool_schemas};
 use chronicle::models::{
@@ -137,6 +137,7 @@ fn seed_test_fixture(engine: &mut CampaignEngine) {
                 durability: Some("100%".into()),
                 tags: vec!["weapon".into()],
                 description: "Balanced blade.".into(),
+                ..Default::default()
             }],
             initial_skills: vec![Skill {
                 name: "Tracking".into(),
@@ -144,6 +145,9 @@ fn seed_test_fixture(engine: &mut CampaignEngine) {
                 category: "Survival".into(),
                 modifier: Some("+3".into()),
                 description: "Follow faint trails.".into(),
+                governing_stat: None,
+                xp: 0,
+                proficiency_tier: None,
             }],
             initial_techniques: vec![Technique {
                 name: "Ash Step".into(),
@@ -153,6 +157,11 @@ fn seed_test_fixture(engine: &mut CampaignEngine) {
                 mastery: "Practiced".into(),
                 effect: "Quick dash.".into(),
                 description: String::new(),
+                source_text_id: None,
+                source_item_id: None,
+                progression_track_id: None,
+                manual_title: String::new(),
+                manual_notes: String::new(),
             }],
             initial_goals: vec!["Investigate the Old Shrine".into()],
             tags: vec!["pc".into()],
@@ -188,6 +197,11 @@ fn seed_test_fixture(engine: &mut CampaignEngine) {
                 mastery: "Mastered".into(),
                 effect: "Reinforce protective runes.".into(),
                 description: String::new(),
+                source_text_id: None,
+                source_item_id: None,
+                progression_track_id: None,
+                manual_title: String::new(),
+                manual_notes: String::new(),
             }],
             initial_goals: vec![],
             tags: vec!["scholar".into()],
@@ -321,6 +335,7 @@ fn seed_test_fixture(engine: &mut CampaignEngine) {
             status: "active".into(),
             description: "Stabilize the Old Shrine before it fractures.".into(),
             related_ids: vec!["glass-hollow".into(), "aria-vale".into()],
+            ..Default::default()
         })
         .unwrap();
 
@@ -355,6 +370,7 @@ fn seed_test_fixture(engine: &mut CampaignEngine) {
                 durability: None,
                 tags: vec!["relic".into()],
                 description: "Hums near monoliths.".into(),
+                ..Default::default()
             },
             "Looted at shrine",
         )
@@ -370,6 +386,11 @@ fn seed_test_fixture(engine: &mut CampaignEngine) {
                 mastery: "Refined".into(),
                 effect: "Faster dash.".into(),
                 description: String::new(),
+                source_text_id: None,
+                source_item_id: None,
+                progression_track_id: None,
+                manual_title: String::new(),
+                manual_notes: String::new(),
             },
             "Breakthrough",
         )
@@ -3785,4 +3806,2598 @@ fn test_audit_fixes_hash_chain_schema_compat_routes_skill_validation_and_secret_
     );
     assert!(tampered_rep.expected_hash.is_some());
     assert!(tampered_rep.stored_hash.is_some());
+
+    // =========================================================================
+    // 7. Cross-version restore_backup: restore a pre-Phase-1 backup (10-col
+    //    `events`, 5-col `relations`, no Phase 1-4 tables) into a live Phase 1-4 DB!
+    // =========================================================================
+    let tmp_bak = TempDir::new().unwrap();
+    let mut eng_bak = CampaignEngine::open(tmp_bak.path()).unwrap();
+    seed_test_fixture(&mut eng_bak);
+    let bkp_res = execute_tool(&eng_bak, "backup_campaign", json!({ "label": "legacy-10col" })).unwrap();
+    let bkp_path = std::path::PathBuf::from(bkp_res["backup_path"].as_str().unwrap());
+    let bkp_name = bkp_path.file_name().unwrap().to_string_lossy().to_string();
+    let orig_events = eng_bak.db().verify_event_chain_detailed().unwrap().total_events;
+
+    // Downgrade the backup snapshot's `events` table to 10 columns & `relations` to 5 columns
+    // (exactly matching a pre-Phase-1 Chronicle backup!) and drop a Phase-2 table (`factions`).
+    {
+        let conn = Connection::open(&bkp_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             CREATE TABLE events_old (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_number INTEGER NOT NULL,
+                world_time TEXT NOT NULL,
+                real_timestamp TEXT NOT NULL,
+                location_id TEXT,
+                affected_entities_json TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                prev_hash TEXT NOT NULL,
+                hash TEXT NOT NULL
+             );
+             INSERT INTO events_old (seq, session_number, world_time, real_timestamp, location_id, affected_entities_json, summary, payload_json, prev_hash, hash)
+               SELECT seq, session_number, world_time, real_timestamp, location_id, affected_entities_json, summary, payload_json, prev_hash, hash FROM events;
+             DROP TABLE events;
+             ALTER TABLE events_old RENAME TO events;
+
+             CREATE TABLE relations_old (
+                source_id TEXT NOT NULL,
+                source_kind TEXT NOT NULL,
+                relation_type TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                target_kind TEXT NOT NULL,
+                strength INTEGER,
+                notes TEXT NOT NULL,
+                updated_at_world_time TEXT NOT NULL,
+                PRIMARY KEY (source_id, relation_type, target_id)
+             );
+             INSERT INTO relations_old (source_id, source_kind, relation_type, target_id, target_kind, strength, notes, updated_at_world_time)
+               SELECT source_id, source_kind, relation_type, target_id, target_kind, strength, notes, updated_at_world_time FROM relations;
+             DROP TABLE relations;
+             ALTER TABLE relations_old RENAME TO relations;
+
+             DROP TABLE IF EXISTS factions;
+             PRAGMA foreign_keys = ON;",
+        )
+        .unwrap();
+    }
+
+    // Mutate live DB after backup so we prove restore actually rewinds cleanly
+    execute_tool(
+        &eng_bak,
+        "log_event",
+        json!({ "title": "Post-backup event to be rewound", "details": "Should disappear after restore" }),
+    )
+    .unwrap();
+    assert_eq!(
+        eng_bak.db().verify_event_chain_detailed().unwrap().total_events,
+        orig_events + 1
+    );
+
+    // Restoring the 10-column legacy backup into the 13-column live DB MUST succeed cleanly!
+    let restored = execute_tool(
+        &eng_bak,
+        "restore_backup",
+        json!({ "backup_filename": bkp_name }),
+    )
+    .unwrap();
+    assert!(restored["restored_from"].as_str().is_some());
+    let post_chain = eng_bak.db().verify_event_chain_detailed().unwrap();
+    assert!(post_chain.valid, "Hash chain must remain valid after cross-version backup restore");
+    assert_eq!(post_chain.total_events, orig_events);
+
+    // =========================================================================
+    // 8. ChatGPT MCP Friction & Redaction Mitigations:
+    //    - HTTP responses sanitize host filesystem paths -> relative paths
+    //    - get_character bounds event_log to 10 by default + reports total_event_count
+    //    - commit_turn(compact: true) returns unified world_time, event_seqs & receipt
+    //    - search_knowledge is annotated readOnlyHint: true
+    // =========================================================================
+    for i in 1..=12 {
+        execute_tool(
+            &eng_bak,
+            "modify_character_resource",
+            json!({
+                "character_id": "aria-vale",
+                "resource": "HP",
+                "delta": if i % 2 == 0 { 1 } else { -1 },
+                "reason": format!("Test log tick {i}")
+            }),
+        )
+        .unwrap();
+    }
+    let bounded_char = execute_tool(&eng_bak, "get_character", json!({ "character_id": "aria-vale" })).unwrap();
+    assert_eq!(bounded_char["character"]["event_log"].as_array().unwrap().len(), 10);
+    assert!(bounded_char["total_event_count"].as_u64().unwrap() > 10);
+    let full_char = execute_tool(
+        &eng_bak,
+        "get_character",
+        json!({ "character_id": "aria-vale", "event_log_limit": 0 }),
+    )
+    .unwrap();
+    assert!(full_char["character"]["event_log"].as_array().unwrap().len() > 10);
+
+    // Over HTTP (/mcp), local host path prefixes MUST be stripped from campaign_status & get_character
+    let status_rpc = json!({
+        "jsonrpc": "2.0",
+        "id": 99,
+        "method": "tools/call",
+        "params": { "name": "campaign_status", "arguments": {} }
+    });
+    let (st_http, _, body_http) = dispatch_http(
+        &eng_bak,
+        "POST",
+        "/mcp",
+        serde_json::to_vec(&status_rpc).unwrap().as_slice(),
+    );
+    assert_eq!(st_http, 200);
+    let body_str = String::from_utf8_lossy(&body_http);
+    let host_root = tmp_bak.path().display().to_string();
+    assert!(
+        !body_str.contains(&host_root),
+        "Remote HTTP MCP response must not leak local host path '{host_root}': {body_str}"
+    );
+    assert!(body_str.contains("campaign.db") && body_str.contains("docs"));
+
+    // Compact commit_turn returns unified world_time, event_seqs, and verified receipt
+    let batch = execute_tool(
+        &eng_bak,
+        "commit_turn",
+        json!({
+            "compact": true,
+            "actions": [
+                { "tool": "advance_time", "arguments": { "minutes": 30, "reason": "Bridge crossing" } },
+                { "tool": "resolve_check", "arguments": { "actor_id": "aria-vale", "action": "Balance on wet stone", "difficulty": 12, "seed": 777 } },
+                { "tool": "log_event", "arguments": { "title": "Crossed Bridge", "details": "Safely across." } }
+            ]
+        }),
+    )
+    .unwrap();
+    assert_eq!(batch["committed_actions"], 3);
+    assert_eq!(batch["event_seqs"].as_array().unwrap().len(), 3);
+    assert!(!batch["world_time"].as_str().unwrap().is_empty());
+    let receipt = batch["receipt"].as_str().unwrap();
+    assert!(receipt.contains("advance_time") && receipt.contains("resolve_check") && receipt.contains("log_event"));
+
+    // Verify search_knowledge has readOnlyHint: true
+    let tools = chronicle::mcp::all_tool_definitions();
+    let sk_tool = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "search_knowledge")
+        .unwrap();
+    assert_eq!(sk_tool["annotations"]["readOnlyHint"], true);
+
+    // Shorthand 1-call beat checkpointing via commit_turn (advance_minutes + trailing log, no actions required!)
+    let ev_before_shorthand = eng_bak.db().verify_event_chain_detailed().unwrap().total_events;
+    let beat = execute_tool(
+        &eng_bak,
+        "commit_turn",
+        json!({
+            "advance_minutes": 15,
+            "time_reason": "Negotiation at tea house",
+            "log": {
+                "title": "Agreed to Escort Caravan",
+                "details": "Aria accepted a 20-silver escort deal with Merchant Wu.",
+                "affected_entities": ["aria-vale"],
+                "tags": ["deal", "caravan"]
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(beat["committed_actions"], 2);
+    assert_eq!(beat["event_seqs"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        eng_bak.db().verify_event_chain_detailed().unwrap().total_events,
+        ev_before_shorthand + 2
+    );
+
+    // get_scene_context(format: "markdown") surfaces Last Committed Ledger Event right at the top
+    let ctx_md = execute_tool(
+        &eng_bak,
+        "get_scene_context",
+        json!({ "character_ids": ["aria-vale"], "format": "markdown" }),
+    )
+    .unwrap();
+    let ctx_str = ctx_md
+        .as_str()
+        .or_else(|| ctx_md["context_markdown"].as_str())
+        .unwrap();
+    assert!(ctx_str.contains("**Last Committed Ledger Event:**"));
+    assert!(ctx_str.contains("Agreed to Escort Caravan"));
+
+    // Previously unlogged mutators (set_item_economics, update_place_spatial) now append ledger events
+    let ev_before_mut = eng_bak.db().verify_event_chain_detailed().unwrap().total_events;
+    execute_tool(
+        &eng_bak,
+        "manage_economy",
+        json!({
+            "action": "set_item_weight",
+            "item_key": "coarse-salt",
+            "weight_kg": 10.0,
+            "unit_value": 4,
+            "currency": "silver"
+        }),
+    )
+    .unwrap();
+    execute_tool(
+        &eng_bak,
+        "manage_travel_and_exploration",
+        json!({
+            "action": "update_spatial",
+            "place_id": "glass-hollow",
+            "x": 12.0,
+            "y": 4.5,
+            "region_id": "heartland"
+        }),
+    )
+    .unwrap();
+    let final_chain = eng_bak.db().verify_event_chain_detailed().unwrap();
+    assert!(final_chain.valid);
+    assert_eq!(final_chain.total_events, ev_before_mut + 2);
+}
+
+#[test]
+fn test_verbatim_chunked_file_reads_dnd_skill_table_xp_and_dc_rubric() {
+    let tmp = TempDir::new().unwrap();
+    let mut engine = CampaignEngine::open(tmp.path()).unwrap();
+    seed_test_fixture(&mut engine);
+    engine.compile_docs().unwrap();
+
+    // =========================================================================
+    // 1. Verbatim multi-chunk file reads (zero compression, zero truncation loss,
+    //    handles .md stored with application/octet-stream, blocks path traversal!)
+    // =========================================================================
+    let mut big_doc = String::new();
+    for line_no in 1..=250 {
+        big_doc.push_str(&format!(
+            "Line {:03}: Exact verbatim archival record alpha-beta-gamma-delta-epsilon-zeta.\n",
+            line_no
+        ));
+    }
+    assert!(big_doc.chars().count() > 15_000);
+
+    let imp = execute_tool(
+        &engine,
+        "import_attachment",
+        json!({
+            "id": "archive-dossier",
+            "title": "Long Archive Dossier",
+            "filename": "archive-dossier.md",
+            "mime_type": "application/octet-stream",
+            "text_content": big_doc,
+            "category": "world-doc",
+            "summary": "Large dossier for verbatim chunk testing"
+        }),
+    )
+    .unwrap();
+    assert_eq!(imp["id"], "archive-dossier");
+
+    // get_attachment MUST detect .md text even with application/octet-stream MIME and paginate verbatim
+    let att_first = execute_tool(
+        &engine,
+        "get_attachment",
+        json!({ "attachment_id": "archive-dossier", "max_chars": 6000 }),
+    )
+    .unwrap();
+    assert_eq!(att_first["verbatim"], true);
+    assert_eq!(att_first["text_has_more"], true);
+    assert_eq!(att_first["text_next_offset_chars"], 6000);
+    assert_eq!(
+        att_first["text_total_chars"].as_u64().unwrap() as usize,
+        big_doc.chars().count()
+    );
+
+    // Multi-request verbatim reconstruction via read_campaign_file MUST match byte-for-byte!
+    let mut reassembled = String::new();
+    let mut offset = 0u64;
+    let mut chunk_calls = 0usize;
+    loop {
+        chunk_calls += 1;
+        let chunk = execute_tool(
+            &engine,
+            "read_campaign_file",
+            json!({
+                "target": "attachment:archive-dossier",
+                "offset_chars": offset,
+                "chunk_chars": 6000
+            }),
+        )
+        .unwrap();
+        assert_eq!(chunk["verbatim"], true);
+        reassembled.push_str(chunk["content"].as_str().unwrap());
+        if chunk["has_more"].as_bool().unwrap() {
+            offset = chunk["next_offset_chars"].as_u64().unwrap();
+            assert!(chunk["next_call"]["offset_chars"].as_u64().unwrap() == offset);
+        } else {
+            break;
+        }
+    }
+    assert!(chunk_calls >= 3, "Expected >= 3 chunks for 15k+ char file, got {chunk_calls}");
+    assert_eq!(
+        reassembled, big_doc,
+        "Reassembled multi-chunk read_campaign_file content must be 100% verbatim!"
+    );
+
+    // Reading compiled docs verbatim + listing files + blocking path traversal
+    let doc_idx = execute_tool(
+        &engine,
+        "read_campaign_file",
+        json!({ "doc_path": "INDEX.md" }),
+    )
+    .unwrap();
+    assert_eq!(doc_idx["verbatim"], true);
+    assert!(doc_idx["content"].as_str().unwrap().contains("Aria Vale"));
+
+    let listing = execute_tool(&engine, "read_campaign_file", json!({ "list": true })).unwrap();
+    assert!(listing["attachments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|a| a["target"] == "attachment:archive-dossier"));
+
+    let traversal_err = execute_tool(
+        &engine,
+        "read_campaign_file",
+        json!({ "target": "doc:../../Windows/win.ini" }),
+    );
+    assert!(traversal_err.is_err(), "Path traversal must be blocked!");
+
+    // Verify read_campaign_file is annotated readOnlyHint: true
+    let tools = chronicle::mcp::all_tool_definitions();
+    let rcf_tool = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "read_campaign_file")
+        .unwrap();
+    assert_eq!(rcf_tool["annotations"]["readOnlyHint"], true);
+
+    // =========================================================================
+    // 2. D&D 5e Preset, Ability Modifier Formula, Standard Skill Table,
+    //    Grounded DC Rubric + Factors, Skill XP Progression, & Totals > 20!
+    // =========================================================================
+    let prof_res = execute_tool(
+        &engine,
+        "upsert_ruleset_profile",
+        json!({ "preset": "dnd5e", "id": "default" }),
+    )
+    .unwrap();
+    assert_eq!(prof_res["profile"]["stat_modifier_mode"], "dnd5e");
+    assert!(prof_res["profile"]["skill_table"]["stealth"]["governing_stat"] == "Dexterity");
+    assert_eq!(prof_res["profile"]["dc_rubric"]["hard"], 20);
+
+    // Give Aria D&D ability scores: Dexterity 18 (+4), Strength 16 (+3)
+    execute_tool(
+        &engine,
+        "modify_character_stat",
+        json!({ "character_id": "aria-vale", "stat": "Dexterity", "set_value": 18, "reason": "D&D baseline" }),
+    )
+    .unwrap();
+    execute_tool(
+        &engine,
+        "modify_character_stat",
+        json!({ "character_id": "aria-vale", "stat": "Strength", "set_value": 16, "reason": "D&D baseline" }),
+    )
+    .unwrap();
+
+    // Untrained standard D&D skill ("Stealth") with grounded DC rubric ("hard" = 20) + factors:
+    //   - NO `stat` passed -> auto-hydrates Dexterity 18 -> +4!
+    //   - `dc_tier: "hard"` (20) + "rushed" (+2) + "proper_tools" (-2) + custom (+2) = DC 22!
+    //   - Auto-awards difficulty-scaled Skill XP on live check!
+    let check1 = execute_tool(
+        &engine,
+        "resolve_check",
+        json!({
+            "actor_id": "aria-vale",
+            "action": "Slip across the magistrate rooftop in silence",
+            "skill": "Stealth",
+            "dc_tier": "hard",
+            "dc_factors": [
+                "rushed",
+                "proper_tools",
+                { "label": "Wet roof tiles", "delta": 2, "reason": "Rain-slicked slate" }
+            ],
+            "seed": 1337
+        }),
+    )
+    .unwrap();
+    assert_eq!(check1["difficulty"], 22);
+    assert_eq!(check1["dc_breakdown"]["base_tier"], "hard");
+    assert_eq!(check1["dc_breakdown"]["base_dc"], 20);
+    assert_eq!(check1["dc_breakdown"]["final_dc"], 22);
+    let mods1 = check1["modifiers"].as_array().unwrap();
+    assert!(
+        mods1.iter().any(|m| m["source"] == "stat:Dexterity" && m["value"] == 4),
+        "Dexterity 18 must auto-hydrate as +4 for Stealth! Got: {mods1:?}"
+    );
+    assert!(
+        mods1.iter().any(|m| m["source"] == "skill:Stealth" && m["value"] == 0),
+        "Untrained standard skill Stealth should add +0 proficiency, got: {mods1:?}"
+    );
+    // Automatic Skill XP awarded on live check!
+    let prog1 = &check1["skill_progression"];
+    assert!(prog1["xp_gained"].as_u64().unwrap() > 0);
+    assert_eq!(prog1["skill_name"], "Stealth");
+
+    // Practice / activity XP increases proficiency rank automatically!
+    let xp_up = execute_tool(
+        &engine,
+        "upsert_character_skill",
+        json!({
+            "character_id": "aria-vale",
+            "name": "Stealth",
+            "add_xp": 700,
+            "reason": "Weeks of rooftop scouting and shadow-step drills"
+        }),
+    )
+    .unwrap();
+    assert_eq!(xp_up["progression"]["leveled_up"], true);
+    assert_eq!(xp_up["progression"]["new_rank"], "Adept");
+    assert_eq!(xp_up["progression"]["new_bonus"], 4);
+
+    // Subsequent d20 check hydrates BOTH Dexterity (+4) AND Stealth Adept (+4) = +8!
+    // Find a seed where d20 roll is high enough to confirm total > 20 naturally!
+    let mut saw_over_20 = false;
+    for s in 1u64..=30 {
+        let chk = execute_tool(
+            &engine,
+            "resolve_check",
+            json!({
+                "actor_id": "aria-vale",
+                "action": "Vanish from watchtower lanterns",
+                "skill": "Stealth",
+                "dc_tier": "hard",
+                "seed": s,
+                "log_to_ledger": false
+            }),
+        )
+        .unwrap();
+        let roll = chk["roll"].as_i64().unwrap();
+        let total = chk["total"].as_i64().unwrap();
+        let mods = chk["modifiers"].as_array().unwrap();
+        assert!(mods.iter().any(|m| m["source"] == "stat:Dexterity" && m["value"] == 4));
+        assert!(mods.iter().any(|m| m["source"] == "skill:Stealth" && m["value"] == 4));
+        assert!(total >= roll + 8 || chk["modifier"].as_i64().unwrap() != 8);
+        if total > 20 {
+            saw_over_20 = true;
+            assert!(matches!(chk["outcome"].as_str().unwrap(), "success" | "critical_success"));
+            break;
+        }
+    }
+    assert!(saw_over_20, "d20 + stat (+4) + skill proficiency (+4) must exceed 20 on high rolls!");
+
+    // Final ledger chain remains 100% valid
+    let chain = engine.db().verify_event_chain_detailed().unwrap();
+    assert!(chain.valid);
+
+    // 3. Auto-scaled Skill XP on a 0-100 custom XP curve (no more 1-afternoon Mastery!)
+    let curve_100 = vec![
+        chronicle::mechanics::SkillXpThreshold { rank: "Unfamiliar".into(), min_xp: 0, bonus: 0 },
+        chronicle::mechanics::SkillXpThreshold { rank: "Mastery".into(), min_xp: 100, bonus: 5 },
+    ];
+    let small_xp = chronicle::mechanics::calculate_skill_xp_gain("success", 15, &curve_100);
+    assert!(
+        (1..=3).contains(&small_xp),
+        "0-100 XP curve should grant ~1-3 XP per moderate check, got {small_xp}"
+    );
+
+    // 4. Web GM Studio OAuth Sign-In (`POST /oauth/ui-login` -> unlocks `/api/status`)
+    let oauth = std::sync::Arc::new(std::sync::Mutex::new(
+        chronicle::oauth::OAuthStore::new("gm-ui-pass-123".to_string()),
+    ));
+    let (st_unauth, _, _, _) = chronicle::web::dispatch_http_with_oauth(
+        &engine,
+        &oauth,
+        "https://example.ts.net",
+        "GET",
+        "/api/status",
+        BTreeMap::new(),
+        b"",
+    );
+    assert_eq!(st_unauth, 401);
+
+    let (st_bad, _, _, _) = chronicle::web::dispatch_http_with_oauth(
+        &engine,
+        &oauth,
+        "https://example.ts.net",
+        "POST",
+        "/oauth/ui-login",
+        BTreeMap::new(),
+        br#"{"passphrase":"wrong"}"#,
+    );
+    assert_eq!(st_bad, 403);
+
+    let (st_login, _, _, login_body) = chronicle::web::dispatch_http_with_oauth(
+        &engine,
+        &oauth,
+        "https://example.ts.net",
+        "POST",
+        "/oauth/ui-login",
+        BTreeMap::new(),
+        br#"{"passphrase":"gm-ui-pass-123"}"#,
+    );
+    assert_eq!(st_login, 200);
+    let login_json: serde_json::Value = serde_json::from_slice(&login_body).unwrap();
+    let tok = login_json["access_token"].as_str().unwrap();
+    assert!(tok.starts_with("chr_at_"));
+
+    let mut hdrs = BTreeMap::new();
+    hdrs.insert("authorization".to_string(), format!("Bearer {tok}"));
+    let (st_ok, _, _, _) = chronicle::web::dispatch_http_with_oauth(
+        &engine,
+        &oauth,
+        "https://example.ts.net",
+        "GET",
+        "/api/status",
+        hdrs,
+        b"",
+    );
+    assert_eq!(st_ok, 200);
+}
+
+#[test]
+fn test_stateful_progression_xianxia_parallel_manuals_bottlenecks_and_scifi_levels() {
+    let tmp = TempDir::new().unwrap();
+    let mut engine = CampaignEngine::open(tmp.path()).unwrap();
+    seed_test_fixture(&mut engine);
+
+    // 1. Define Xianxia main Qi ladder (1-9 layers), parallel Body Tempering ladder,
+    //    custom manual-linked ladder, D&D Level 1-20 ladder, and Sci-Fi Tier ladder
+    let qi_lad = execute_tool(
+        &engine,
+        "manage_progression",
+        json!({ "action": "define_ladder", "preset": "xianxia_standard" }),
+    )
+    .unwrap();
+    assert_eq!(qi_lad["ladder"]["id"], "qi-cultivation");
+    assert_eq!(qi_lad["ladder"]["stages"][1]["sub_stages"], 9);
+
+    execute_tool(
+        &engine,
+        "manage_progression",
+        json!({ "action": "define_ladder", "preset": "body_tempering" }),
+    )
+    .unwrap();
+    execute_tool(
+        &engine,
+        "manage_progression",
+        json!({ "action": "define_ladder", "preset": "dnd_level_20" }),
+    )
+    .unwrap();
+    execute_tool(
+        &engine,
+        "manage_progression",
+        json!({ "action": "define_ladder", "preset": "scifi_tier" }),
+    )
+    .unwrap();
+
+    // Custom per-manual parallel progression ladder (1-9 layers with bespoke properties & halt condition)
+    execute_tool(
+        &engine,
+        "manage_progression",
+        json!({
+            "action": "define_ladder",
+            "ladder_id": "still-water-manual",
+            "name": "Still Water Mirroring the Moon",
+            "kind": "parallel_manual",
+            "source_text_id": "scroll-of-binding",
+            "default_check_tags": ["meditation", "calm"],
+            "stages": [
+                {
+                    "name": "Mirror-Breath First Cycle",
+                    "sub_stages": 9,
+                    "sub_stage_prefix": "Layer",
+                    "xp_per_sub_stage": 40,
+                    "breakthrough_required_at_peak": true,
+                    "breakthrough_dc_tier": "moderate",
+                    "passive_modifier": 2,
+                    "properties": ["Steady heartbeat under duress", "Cold-water meridian clarity"],
+                    "halt_conditions": ["Pavilion check-in required after Layer 5"]
+                },
+                {
+                    "name": "Still-Moon Second Cycle",
+                    "sub_stages": 9,
+                    "sub_stage_prefix": "Layer",
+                    "xp_per_sub_stage": 100,
+                    "breakthrough_required_at_peak": true,
+                    "breakthrough_dc_tier": "hard",
+                    "passive_modifier": 4,
+                    "properties": ["Reflective qi deflection"]
+                }
+            ]
+        }),
+    )
+    .unwrap();
+
+    let ladders = execute_tool(&engine, "manage_progression", json!({ "action": "list_ladders" })).unwrap();
+    assert_eq!(ladders["count"], 5);
+
+    // 2. Enroll THREE parallel tracks simultaneously on Aria Vale!
+    let qi_en = execute_tool(
+        &engine,
+        "manage_progression",
+        json!({
+            "action": "enroll_track",
+            "character_id": "aria-vale",
+            "track_id": "qi-cultivation",
+            "name": "Orthodox Qi Cultivation",
+            "track_kind": "primary_realm",
+            "ladder_id": "qi-cultivation",
+            "major_stage_index": 1,
+            "sub_stage": 1,
+            "reason": "Opened meridians into Qi Condensation Layer 1"
+        }),
+    )
+    .unwrap();
+    assert_eq!(qi_en["track"]["major_stage_name"], "Qi Condensation");
+    assert_eq!(qi_en["track"]["sub_stage"], 1);
+    assert_eq!(qi_en["track"]["sub_stage_max"], 9);
+    assert_eq!(qi_en["track"]["check_modifier"], 1);
+
+    execute_tool(
+        &engine,
+        "manage_progression",
+        json!({
+            "action": "enroll_track",
+            "character_id": "aria-vale",
+            "track_id": "body-tempering",
+            "name": "Body Tempering",
+            "track_kind": "body_refinement",
+            "ladder_id": "body-tempering",
+            "major_stage_index": 0,
+            "sub_stage": 1
+        }),
+    )
+    .unwrap();
+
+    execute_tool(
+        &engine,
+        "manage_progression",
+        json!({
+            "action": "enroll_track",
+            "character_id": "aria-vale",
+            "track_id": "still-water-manual",
+            "name": "Still Water Mirroring the Moon",
+            "track_kind": "parallel_manual",
+            "ladder_id": "still-water-manual",
+            "major_stage_index": 0,
+            "sub_stage": 1,
+            "gm_notes": "SECRET_BLUEPRINT_MISMATCH_MARKER"
+        }),
+    )
+    .unwrap();
+
+    // 3. Advance Qi Cultivation XP past all 9 layers -> MUST halt cleanly at Layer 9 bottleneck!
+    let adv_qi = execute_tool(
+        &engine,
+        "manage_progression",
+        json!({
+            "action": "advance_xp",
+            "character_id": "aria-vale",
+            "track_id": "qi-cultivation",
+            "xp": 5000,
+            "reason": "Three years of spirit-vein seclusion"
+        }),
+    )
+    .unwrap();
+    assert_eq!(adv_qi["track"]["major_stage_name"], "Qi Condensation");
+    assert_eq!(adv_qi["track"]["sub_stage"], 9);
+    assert_eq!(adv_qi["hit_bottleneck"], true);
+    assert_eq!(adv_qi["at_bottleneck"], true);
+    assert_eq!(adv_qi["track"]["cumulative_xp"], 5000);
+
+    // 4. Failed breakthrough (impossibly high DC 50) -> stays at Layer 9 bottleneck
+    let bt_fail = execute_tool(
+        &engine,
+        "manage_progression",
+        json!({
+            "action": "attempt_breakthrough",
+            "character_id": "aria-vale",
+            "track_id": "qi-cultivation",
+            "difficulty": 50,
+            "seed": 111
+        }),
+    )
+    .unwrap();
+    assert_eq!(bt_fail["succeeded"], false);
+    assert_eq!(bt_fail["track"]["major_stage_name"], "Qi Condensation");
+    assert_eq!(bt_fail["track"]["at_bottleneck"], true);
+
+    // Successful breakthrough (DC 2) -> promotes to Foundation Establishment Layer 1, unlocks Liquefied True Qi & +3 mod!
+    let bt_ok = execute_tool(
+        &engine,
+        "manage_progression",
+        json!({
+            "action": "attempt_breakthrough",
+            "character_id": "aria-vale",
+            "track_id": "qi-cultivation",
+            "difficulty": 2,
+            "seed": 222
+        }),
+    )
+    .unwrap();
+    assert_eq!(bt_ok["succeeded"], true);
+    assert_eq!(bt_ok["track"]["major_stage_name"], "Foundation Establishment");
+    assert_eq!(bt_ok["track"]["sub_stage"], 1);
+    assert_eq!(bt_ok["track"]["at_bottleneck"], false);
+    assert_eq!(bt_ok["track"]["check_modifier"], 3);
+    assert!(bt_ok["track"]["active_properties"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p.as_str().unwrap().contains("Liquefied True Qi")));
+
+    // 5. resolve_check auto-hydrates active progression track modifiers (+3 Qi Cultivation + +2 Still Water Manual = +5 on meditation!)
+    let med_chk = execute_tool(
+        &engine,
+        "resolve_check",
+        json!({
+            "actor_id": "aria-vale",
+            "action": "Stabilize spiritual meditation inside the spirit vein",
+            "dc_tier": "hard",
+            "dry_run": true
+        }),
+    )
+    .unwrap();
+    let mods = med_chk["modifiers"].as_array().unwrap();
+    assert!(
+        mods.iter().any(|m| m["source"] == "progression:qi-cultivation" && m["value"] == 3),
+        "Expected progression:qi-cultivation (+3) auto-hydrated! Got: {mods:?}"
+    );
+    assert!(
+        mods.iter().any(|m| m["source"] == "progression:still-water-manual" && m["value"] == 2),
+        "Expected progression:still-water-manual (+2) auto-hydrated! Got: {mods:?}"
+    );
+
+    // 6. Halted track blocks XP advancement until cleared via update_track
+    execute_tool(
+        &engine,
+        "manage_progression",
+        json!({
+            "action": "update_track",
+            "character_id": "aria-vale",
+            "track_id": "body-tempering",
+            "status": "halted",
+            "reason": "Pavilion safety halt pending check-in"
+        }),
+    )
+    .unwrap();
+    let halt_err = execute_tool(
+        &engine,
+        "manage_progression",
+        json!({
+            "action": "advance_xp",
+            "character_id": "aria-vale",
+            "track_id": "body-tempering",
+            "xp": 100
+        }),
+    );
+    assert!(halt_err.is_err(), "Halted track must refuse XP advancement until cleared");
+
+    // 7. Flat D&D Level 1-20 & Sci-Fi Tier 1-5 ladders work identically on another character
+    execute_tool(
+        &engine,
+        "manage_progression",
+        json!({
+            "action": "enroll_track",
+            "character_id": "archivist-bren",
+            "track_id": "character-level",
+            "name": "Scholar Level",
+            "track_kind": "level",
+            "ladder_id": "character-level",
+            "major_stage_index": 0
+        }),
+    )
+    .unwrap();
+    let lvl_up = execute_tool(
+        &engine,
+        "manage_progression",
+        json!({
+            "action": "advance_xp",
+            "character_id": "archivist-bren",
+            "track_id": "character-level",
+            "xp": 1000,
+            "reason": "Solved the Whispering Archive cipher"
+        }),
+    )
+    .unwrap();
+    assert_eq!(lvl_up["major_promoted"], true);
+    assert_eq!(lvl_up["track"]["major_stage_name"], "Level 3");
+
+    // 8. Compiled character sheet & POV-safe Scene Context verification
+    engine.compile_docs().unwrap();
+    let aria_md = std::fs::read_to_string(tmp.path().join("docs/characters/aria-vale.md")).unwrap();
+    assert!(aria_md.contains("### Progression, Realms & Parallel Tracks"));
+    assert!(aria_md.contains("Foundation Establishment"));
+    assert!(aria_md.contains("Still Water Mirroring the Moon"));
+
+    let gm_ctx = execute_tool(
+        &engine,
+        "get_scene_context",
+        json!({ "character_ids": ["aria-vale"], "perspective": "gm", "format": "markdown" }),
+    )
+    .unwrap();
+    let gm_str = gm_ctx.as_str().or_else(|| gm_ctx["context_markdown"].as_str()).unwrap();
+    assert!(gm_str.contains("Foundation Establishment"));
+    assert!(gm_str.contains("SECRET_BLUEPRINT_MISMATCH_MARKER"));
+
+    let pc_ctx = execute_tool(
+        &engine,
+        "get_scene_context",
+        json!({ "character_ids": ["aria-vale"], "perspective": "aria-vale", "include_gm_secrets": true, "format": "markdown" }),
+    )
+    .unwrap();
+    let pc_str = pc_ctx.as_str().or_else(|| pc_ctx["context_markdown"].as_str()).unwrap();
+    assert!(pc_str.contains("Foundation Establishment"));
+    assert!(
+        !pc_str.contains("SECRET_BLUEPRINT_MISMATCH_MARKER"),
+        "Progression track gm_notes must NEVER leak to player POV!"
+    );
+
+    // 9. Web GM Studio UI & REST Progression endpoints verification
+    let oauth = std::sync::Arc::new(std::sync::Mutex::new(
+        chronicle::oauth::OAuthStore::new("gm-prog-pass".to_string()),
+    ));
+    let (st_ui, _, _, ui_body) = chronicle::web::dispatch_http_with_oauth(
+        &engine,
+        &oauth,
+        "http://127.0.0.1:7878",
+        "GET",
+        "/",
+        BTreeMap::new(),
+        b"",
+    );
+    assert_eq!(st_ui, 200);
+    let ui_html = String::from_utf8(ui_body).unwrap();
+    assert!(ui_html.contains("id=\"tab-progression\""));
+    assert!(ui_html.contains("Progression &amp; Realms"));
+    assert!(ui_html.contains("Progression, Realms &amp; Parallel Tracks"));
+    assert!(ui_html.contains("quickSkillXp"));
+
+    let (_, _, _, login_body) = chronicle::web::dispatch_http_with_oauth(
+        &engine,
+        &oauth,
+        "http://127.0.0.1:7878",
+        "POST",
+        "/oauth/ui-login",
+        BTreeMap::new(),
+        br#"{"passphrase":"gm-prog-pass"}"#,
+    );
+    let tok = serde_json::from_slice::<serde_json::Value>(&login_body).unwrap()["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut auth_h = BTreeMap::new();
+    auth_h.insert("authorization".to_string(), format!("Bearer {tok}"));
+
+    let (st_char, _, _, char_body) = chronicle::web::dispatch_http_with_oauth(
+        &engine,
+        &oauth,
+        "http://127.0.0.1:7878",
+        "GET",
+        "/api/characters/aria-vale",
+        auth_h.clone(),
+        b"",
+    );
+    assert_eq!(st_char, 200);
+    let char_json: serde_json::Value = serde_json::from_slice(&char_body).unwrap();
+    assert_eq!(char_json["progression_tracks"].as_array().unwrap().len(), 3);
+    assert_eq!(char_json["progression_ladders"].as_array().unwrap().len(), 5);
+
+    let (st_prog, _, _, prog_body) = chronicle::web::dispatch_http_with_oauth(
+        &engine,
+        &oauth,
+        "http://127.0.0.1:7878",
+        "GET",
+        "/api/progression",
+        auth_h.clone(),
+        b"",
+    );
+    assert_eq!(st_prog, 200);
+    let prog_json: serde_json::Value = serde_json::from_slice(&prog_body).unwrap();
+    assert_eq!(prog_json["ladder_count"], 5);
+    assert_eq!(prog_json["track_count"], 4);
+
+    let (st_prog_bren, _, _, bren_body) = chronicle::web::dispatch_http_with_oauth(
+        &engine,
+        &oauth,
+        "http://127.0.0.1:7878",
+        "GET",
+        "/api/progression?character_id=archivist-bren",
+        auth_h,
+        b"",
+    );
+    assert_eq!(st_prog_bren, 200);
+    let bren_json: serde_json::Value = serde_json::from_slice(&bren_body).unwrap();
+    assert_eq!(bren_json["track_count"], 1);
+    assert_eq!(bren_json["tracks"][0]["major_stage_name"], "Level 3");
+
+    // 10. XP Revert, Correction, Stage Demotion, Stage/Full Reset, Remove Track & Skill XP Reset
+    // 10a. Revert XP across a sub-stage / major-stage boundary on archivist-bren's Level 3 track (-800 XP -> steps back!)
+    let rev_bren = execute_tool(
+        &engine,
+        "manage_progression",
+        json!({
+            "action": "revert_xp",
+            "character_id": "archivist-bren",
+            "track_id": "character-level",
+            "xp": 800,
+            "allow_demote": true,
+            "reason": "Reverting miscalculated quest XP award"
+        }),
+    )
+    .unwrap();
+    assert_eq!(rev_bren["major_demoted"], true);
+    assert_eq!(rev_bren["track"]["major_stage_name"], "Level 1");
+    assert_eq!(rev_bren["track"]["current_xp"], 200);
+    assert_eq!(rev_bren["track"]["cumulative_xp"], 200);
+
+    // 10b. Reset current stage XP on aria-vale's Foundation Establishment track via reset_xp
+    execute_tool(
+        &engine,
+        "manage_progression",
+        json!({
+            "action": "advance_xp",
+            "character_id": "aria-vale",
+            "track_id": "qi-cultivation",
+            "xp": 400,
+            "reason": "Temporary meditation award to test reset"
+        }),
+    )
+    .unwrap();
+    let stg_reset = execute_tool(
+        &engine,
+        "manage_progression",
+        json!({
+            "action": "reset_xp",
+            "character_id": "aria-vale",
+            "track_id": "qi-cultivation",
+            "reset_stage_xp": true,
+            "reason": "Clear accidental meditation XP"
+        }),
+    )
+    .unwrap();
+    assert_eq!(stg_reset["track"]["current_xp"], 0);
+    assert_eq!(stg_reset["track"]["major_stage_name"], "Foundation Establishment");
+
+    // 10c. Full track reset back to Stage 0, Sub-stage 1, 0 XP
+    let full_reset = execute_tool(
+        &engine,
+        "manage_progression",
+        json!({
+            "action": "reset_xp",
+            "character_id": "archivist-bren",
+            "track_id": "character-level",
+            "reset_track": true,
+            "reason": "Campaign rebalance reset"
+        }),
+    )
+    .unwrap();
+    assert_eq!(full_reset["track"]["major_stage_index"], 0);
+    assert_eq!(full_reset["track"]["sub_stage"], 1);
+    assert_eq!(full_reset["track"]["current_xp"], 0);
+    assert_eq!(full_reset["track"]["cumulative_xp"], 0);
+
+    // 10d. Remove a mistakenly enrolled track cleanly
+    let rem = execute_tool(
+        &engine,
+        "manage_progression",
+        json!({
+            "action": "remove_track",
+            "character_id": "archivist-bren",
+            "track_id": "character-level",
+            "reason": "Removed test track"
+        }),
+    )
+    .unwrap();
+    assert_eq!(rem["removed"], true);
+    assert!(engine.list_character_progressions("archivist-bren").unwrap().is_empty());
+
+    // 10e. Skill XP negative delta (revert) & reset_xp recalculate rank/modifier downwards cleanly!
+    execute_tool(
+        &engine,
+        "upsert_character_skill",
+        json!({
+            "character_id": "aria-vale",
+            "name": "Stealth",
+            "add_xp": 500,
+            "reason": "Over-awarded stealth XP"
+        }),
+    )
+    .unwrap();
+    let after_award = engine.get_character("aria-vale", None).unwrap();
+    let st_awarded = after_award.current.skills.iter().find(|s| s.name == "Stealth").unwrap();
+    assert!(st_awarded.xp >= 500);
+    assert_ne!(st_awarded.rank, "Untrained");
+
+    let sk_rev = execute_tool(
+        &engine,
+        "upsert_character_skill",
+        json!({
+            "character_id": "aria-vale",
+            "name": "Stealth",
+            "add_xp": -450,
+            "reason": "Reverting accidental 450 XP award"
+        }),
+    )
+    .unwrap();
+    assert_eq!(sk_rev["new_xp"], st_awarded.xp - 450);
+    assert_eq!(sk_rev["rank_changed"], true);
+
+    let sk_reset = execute_tool(
+        &engine,
+        "upsert_character_skill",
+        json!({
+            "character_id": "aria-vale",
+            "name": "Stealth",
+            "reset_xp": true,
+            "reason": "Full skill XP reset"
+        }),
+    )
+    .unwrap();
+    assert_eq!(sk_reset["new_xp"], 0);
+    assert_eq!(sk_reset["new_rank"], "Untrained");
+    assert_eq!(sk_reset["new_modifier"], "+0");
+
+    // 11. Cultivation Manual Linking & Manual Notes on both Progression Tracks and Techniques
+    execute_tool(
+        &engine,
+        "upsert_text",
+        json!({
+            "id": "still-water-manual",
+            "title": "Still Water Mirroring the Moon Codex",
+            "medium": "manual",
+            "subject": "Water-Attribute Qi Cultivation",
+            "summary": "Orthodox calming meridian circulation scripture.",
+            "content": "Chapter 1: Settle the breath like winter ice over a deep well.",
+            "read_status": "read"
+        }),
+    )
+    .unwrap();
+
+    // Link manual + add cultivation notes onto aria-vale's parallel manual track
+    let linked_track = execute_tool(
+        &engine,
+        "manage_progression",
+        json!({
+            "action": "update_track",
+            "character_id": "aria-vale",
+            "track_id": "still-water-manual",
+            "source_text_id": "still-water-manual",
+            "manual_notes": "Requires slow 9-count exhale; incompatible with fiery Yang-surge arts.",
+            "reason": "Linked canonical cultivation manual and breathing notes"
+        }),
+    )
+    .unwrap();
+    assert_eq!(linked_track["track"]["source_text_id"], "still-water-manual");
+    assert_eq!(
+        linked_track["track"]["manual_title"],
+        "Still Water Mirroring the Moon Codex"
+    );
+    assert!(linked_track["track"]["manual_notes"]
+        .as_str()
+        .unwrap()
+        .contains("9-count exhale"));
+
+    // Link the same manual + parallel track + manual notes onto a cultivation technique
+    let linked_tech = execute_tool(
+        &engine,
+        "upsert_character_technique",
+        json!({
+            "character_id": "aria-vale",
+            "name": "Mirror Moon Palm",
+            "tier": "Mortal High",
+            "cost": "8 Qi",
+            "mastery": "Minor Success",
+            "effect": "Redirects incoming qi strikes with calm water-phase force.",
+            "source_text_id": "still-water-manual",
+            "progression_track_id": "still-water-manual",
+            "manual_notes": "Must rotate dantian counter-clockwise before releasing palm strike.",
+            "reason": "Comprehended from Chapter 1 of Still Water Codex"
+        }),
+    )
+    .unwrap();
+    let mirror_palm = linked_tech["techniques"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "Mirror Moon Palm")
+        .unwrap();
+    assert_eq!(mirror_palm["source_text_id"], "still-water-manual");
+    assert_eq!(
+        mirror_palm["manual_title"],
+        "Still Water Mirroring the Moon Codex"
+    );
+    assert_eq!(mirror_palm["progression_track_id"], "still-water-manual");
+    assert!(mirror_palm["manual_notes"]
+        .as_str()
+        .unwrap()
+        .contains("counter-clockwise"));
+
+    // Verify compiled Markdown & Scene Context include linked manual & manual notes
+    engine.compile_docs().unwrap();
+    let aria_md_manual =
+        std::fs::read_to_string(tmp.path().join("docs/characters/aria-vale.md")).unwrap();
+    assert!(aria_md_manual.contains("[Still Water Mirroring the Moon Codex](../texts/still-water-manual.md)"));
+    assert!(aria_md_manual.contains("9-count exhale"));
+    assert!(aria_md_manual.contains("Mirror Moon Palm"));
+    assert!(aria_md_manual.contains("counter-clockwise"));
+
+    let ctx_manual = execute_tool(
+        &engine,
+        "get_scene_context",
+        json!({ "character_ids": ["aria-vale"], "perspective": "aria-vale", "format": "markdown" }),
+    )
+    .unwrap();
+    let ctx_manual_str = ctx_manual
+        .as_str()
+        .or_else(|| ctx_manual["context_markdown"].as_str())
+        .unwrap();
+    assert!(ctx_manual_str.contains("Still Water Mirroring the Moon Codex"));
+    assert!(ctx_manual_str.contains("9-count exhale"));
+    assert!(ctx_manual_str.contains("counter-clockwise"));
+
+    // Verify REST API surfaces `manuals` list for Web GM Studio dropdowns
+    let mut auth_h2 = BTreeMap::new();
+    auth_h2.insert("authorization".to_string(), format!("Bearer {tok}"));
+    let (st_prog2, _, _, prog_body2) = chronicle::web::dispatch_http_with_oauth(
+        &engine,
+        &oauth,
+        "http://127.0.0.1:7878",
+        "GET",
+        "/api/progression",
+        auth_h2,
+        b"",
+    );
+    assert_eq!(st_prog2, 200);
+    let prog_json2: serde_json::Value = serde_json::from_slice(&prog_body2).unwrap();
+    assert!(prog_json2["manuals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["id"] == "still-water-manual"));
+
+    // Verify new UI controls exist in served HTML
+    assert!(ui_html.contains("modalEditTrack"));
+    assert!(ui_html.contains("modalEditTechnique"));
+    assert!(ui_html.contains("et_source_text"));
+    assert!(ui_html.contains("et_manual_notes"));
+    assert!(ui_html.contains("tm_manual_notes"));
+    assert!(ui_html.contains("adjustTrackXp"));
+    assert!(ui_html.contains("resetTrackXp"));
+    assert!(ui_html.contains("resetSkillXp"));
+
+    // Final SHA-256 chain validity
+    assert!(engine.db().verify_event_chain_detailed().unwrap().valid);
+}
+
+#[test]
+fn test_dedicated_player_character_sheet_avatar_titles_and_segregated_xp() {
+    let tmp = TempDir::new().unwrap();
+    let mut engine = CampaignEngine::open(tmp.path()).unwrap();
+    seed_test_fixture(&mut engine);
+
+    // 1. Update Avatar, Body, Proportions & Measurements (omitting character_id defaults to primary PC aria-vale!)
+    let av = execute_tool(
+        &engine,
+        "manage_player_character",
+        json!({
+            "action": "update_avatar",
+            "avatar_summary": "Lean mountain scout with a runner's frame, weathered hands, and steady slate-grey eyes.",
+            "height": "174 cm",
+            "weight": "63 kg",
+            "chronological_age": "23",
+            "apparent_age": "Early 20s",
+            "lifespan_years": 120,
+            "body_type_or_build": "Lean athletic",
+            "silhouette": "Compact runner's frame",
+            "proportions_summary": "7.5 heads tall, long reach",
+            "eyes": "Slate-grey, sharp focus",
+            "hair": "Dark ash-brown, braided back",
+            "voice_and_speech": "Low, unhurried cadence",
+            "measurements": {
+                "Shoulders": "44 cm",
+                "Chest": "92 cm",
+                "Waist": "71 cm",
+                "Inseam": "81 cm"
+            },
+            "reason": "Initialized canonical PC avatar body profile"
+        }),
+    )
+    .unwrap();
+    assert_eq!(av["character_id"], "aria-vale");
+    assert_eq!(av["avatar"]["height"], "174 cm");
+    assert_eq!(av["avatar"]["measurements"]["Waist"], "71 cm");
+    assert!(av["visual_prompt"].as_str().unwrap().contains("174 cm"));
+
+    // 2. Permanent Physical Markers & Modular Wardrobe Outfits
+    execute_tool(
+        &engine,
+        "manage_player_character",
+        json!({
+            "action": "upsert_marker",
+            "kind": "scar",
+            "location": "Left forearm",
+            "description": "Crescent burn scar from an ash-lamp shard",
+            "origin_or_story": "Winter watch at Glass Hollow",
+            "visible_when_clothed": true
+        }),
+    )
+    .unwrap();
+    execute_tool(
+        &engine,
+        "manage_player_character",
+        json!({
+            "action": "upsert_outfit",
+            "name": "Ridge Scout Cloak",
+            "occasion": "adventuring",
+            "outer_layer": "Waxed charcoal travel cloak",
+            "top_layer": "Fitted grey linen tunic",
+            "bottoms": "Reinforced riding trousers",
+            "footwear": "Soft-soled mountain boots",
+            "color_palette": "Charcoal, slate, weathered leather",
+            "set_active": true
+        }),
+    )
+    .unwrap();
+
+    // 3. Titles & Epithets (public + GM-secret) & Innate Traits/Physique
+    execute_tool(
+        &engine,
+        "manage_player_character",
+        json!({
+            "action": "upsert_title",
+            "name": "Lantern-Bearer of Glass Hollow",
+            "kind": "epithet",
+            "equipped": true,
+            "source": "Cleared the fog shrine",
+            "mechanical_effect": "+1 Persuasion with mountain wardens",
+            "visibility": "public"
+        }),
+    )
+    .unwrap();
+    execute_tool(
+        &engine,
+        "manage_player_character",
+        json!({
+            "action": "upsert_title",
+            "name": "Marked by the Sunken Seal",
+            "kind": "curse",
+            "equipped": true,
+            "visibility": "gm_secret",
+            "mechanical_effect": "SECRET_TITLE_MARKER"
+        }),
+    )
+    .unwrap();
+    execute_tool(
+        &engine,
+        "manage_player_character",
+        json!({
+            "action": "upsert_trait",
+            "name": "Clear-Stream Meridian Physique",
+            "category": "physique",
+            "rank_or_grade": "Mortal Upper",
+            "effect": "Steady qi circulation under cold weather"
+        }),
+    )
+    .unwrap();
+
+    // 4. Segregated Stat Training XP (auto-promotes +1 live stat, reverts negative XP, spends free stat point)
+    let before_con = *engine.get_character("aria-vale", None).unwrap().current.stats.get("Constitution").unwrap_or(&0);
+    let st_xp = execute_tool(
+        &engine,
+        "manage_player_character",
+        json!({
+            "action": "adjust_stat_xp",
+            "stat": "Constitution",
+            "delta_xp": 120,
+            "training_notes": "Weighted ridge marches",
+            "auto_promote": true
+        }),
+    )
+    .unwrap();
+    assert_eq!(st_xp["points_promoted"], 1);
+    assert_eq!(st_xp["entry"]["current_xp"], 20);
+    let after_con = *engine.get_character("aria-vale", None).unwrap().current.stats.get("Constitution").unwrap();
+    assert_eq!(after_con, before_con + 1);
+
+    // Award & spend 1 unspent stat point
+    execute_tool(
+        &engine,
+        "manage_player_character",
+        json!({ "action": "adjust_stat_xp", "unspent_stat_points_delta": 2 }),
+    )
+    .unwrap();
+    let spent = execute_tool(
+        &engine,
+        "manage_player_character",
+        json!({ "action": "adjust_stat_xp", "stat": "Constitution", "spend_stat_point": true }),
+    )
+    .unwrap();
+    assert_eq!(spent["unspent_stat_points"], 1);
+
+    // 5. Segregated Job / Class XP (advance -> level-up -> negative revert with demotion!)
+    execute_tool(
+        &engine,
+        "manage_player_character",
+        json!({
+            "action": "upsert_job",
+            "name": "Ridge Scout",
+            "role": "primary",
+            "tier_or_rank": "Journeyman",
+            "perks_and_features": ["Silent Footwork", "Trail Sense"]
+        }),
+    )
+    .unwrap();
+    let job_up = execute_tool(
+        &engine,
+        "manage_player_character",
+        json!({ "action": "adjust_job_xp", "job_id": "ridge-scout", "delta_xp": 300 }),
+    )
+    .unwrap();
+    assert_eq!(job_up["job"]["level"], 2);
+    assert_eq!(job_up["job"]["current_xp"], 50);
+
+    let job_rev = execute_tool(
+        &engine,
+        "manage_player_character",
+        json!({ "action": "adjust_job_xp", "job_id": "ridge-scout", "delta_xp": -100, "allow_demote": true }),
+    )
+    .unwrap();
+    assert_eq!(job_rev["job"]["level"], 1);
+
+    // 6. Formal Proficiencies (Weapon / Tool / Language with XP promote & revert/reset)
+    execute_tool(
+        &engine,
+        "manage_player_character",
+        json!({
+            "action": "upsert_proficiency",
+            "name": "Jian Straight Sword",
+            "category": "weapon",
+            "rank": "Familiar",
+            "xp": 50
+        }),
+    )
+    .unwrap();
+    let prof_up = execute_tool(
+        &engine,
+        "manage_player_character",
+        json!({ "action": "adjust_proficiency_xp", "id": "jian-straight-sword", "delta_xp": 210 }),
+    )
+    .unwrap();
+    assert_eq!(prof_up["proficiency"]["rank"], "Expertise");
+    assert_eq!(prof_up["proficiency"]["bonus"], "+4");
+
+    let prof_reset = execute_tool(
+        &engine,
+        "manage_player_character",
+        json!({ "action": "adjust_proficiency_xp", "id": "jian-straight-sword", "reset_xp": true }),
+    )
+    .unwrap();
+    assert_eq!(prof_reset["proficiency"]["xp"], 0);
+    assert_eq!(prof_reset["proficiency"]["rank"], "Untrained");
+
+    // 7. Compiled Markdown & POV-safe Scene Context verification
+    engine.compile_docs().unwrap();
+    let md = std::fs::read_to_string(tmp.path().join("docs/characters/aria-vale.md")).unwrap();
+    assert!(md.contains("### Avatar, Body, Proportions & Wardrobe"));
+    assert!(md.contains("174 cm"));
+    assert!(md.contains("Crescent burn scar"));
+    assert!(md.contains("Ridge Scout Cloak"));
+    assert!(md.contains("### Titles & Epithets"));
+    assert!(md.contains("Lantern-Bearer of Glass Hollow"));
+    assert!(md.contains("### Stat Training XP"));
+    assert!(md.contains("### Jobs, Classes & Occupations"));
+    assert!(md.contains("### Formal Proficiencies"));
+    assert!(md.contains("Jian Straight Sword"));
+
+    let pc_ctx = execute_tool(
+        &engine,
+        "get_scene_context",
+        json!({ "character_ids": ["aria-vale"], "perspective": "aria-vale", "include_gm_secrets": true, "format": "markdown" }),
+    )
+    .unwrap();
+    let pc_str = pc_ctx.as_str().or_else(|| pc_ctx["context_markdown"].as_str()).unwrap();
+    assert!(pc_str.contains("Lantern-Bearer of Glass Hollow"));
+    assert!(pc_str.contains("Ridge Scout Cloak"));
+    assert!(pc_str.contains("Ridge Scout"));
+    assert!(
+        !pc_str.contains("SECRET_TITLE_MARKER"),
+        "GM-secret titles must NEVER leak to player POV!"
+    );
+
+    // 8. REST GET /api/pc & Web GM Studio HTML verification
+    let oauth = std::sync::Arc::new(std::sync::Mutex::new(
+        chronicle::oauth::OAuthStore::new("gm-pc-pass".to_string()),
+    ));
+    let (_, _, _, login_body) = chronicle::web::dispatch_http_with_oauth(
+        &engine,
+        &oauth,
+        "http://127.0.0.1:7878",
+        "POST",
+        "/oauth/ui-login",
+        BTreeMap::new(),
+        br#"{"passphrase":"gm-pc-pass"}"#,
+    );
+    let tok = serde_json::from_slice::<serde_json::Value>(&login_body).unwrap()["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut auth_h = BTreeMap::new();
+    auth_h.insert("authorization".to_string(), format!("Bearer {tok}"));
+
+    let (st_pc, _, _, pc_body) = chronicle::web::dispatch_http_with_oauth(
+        &engine,
+        &oauth,
+        "http://127.0.0.1:7878",
+        "GET",
+        "/api/pc",
+        auth_h,
+        b"",
+    );
+    assert_eq!(st_pc, 200);
+    let pc_json: serde_json::Value = serde_json::from_slice(&pc_body).unwrap();
+    assert_eq!(pc_json["character_id"], "aria-vale");
+    assert_eq!(pc_json["profile"]["avatar"]["height"], "174 cm");
+    assert_eq!(pc_json["profile"]["jobs"].as_array().unwrap().len(), 1);
+    assert_eq!(pc_json["profile"]["titles"].as_array().unwrap().len(), 2);
+
+    let (st_ui, _, _, ui_body) = chronicle::web::dispatch_http_with_oauth(
+        &engine,
+        &oauth,
+        "http://127.0.0.1:7878",
+        "GET",
+        "/",
+        BTreeMap::new(),
+        b"",
+    );
+    assert_eq!(st_ui, 200);
+    let ui_html = String::from_utf8(ui_body).unwrap();
+    assert!(ui_html.contains("id=\"tab-pc\""));
+    assert!(ui_html.contains("Player Character"));
+    assert!(ui_html.contains("pcSaveAvatar"));
+    assert!(ui_html.contains("pcAdjustJobXp"));
+    assert!(ui_html.contains("pcAdjustStatXp"));
+
+    assert!(engine.db().verify_event_chain_detailed().unwrap().valid);
+}
+
+#[test]
+fn test_living_world_prominent_npc_travel_networking_detours_and_rumors() {
+    let tmp = TempDir::new().unwrap();
+    let mut engine = CampaignEngine::open(tmp.path()).unwrap();
+    seed_test_fixture(&mut engine);
+
+    // 1. Add a second settlement (`salt-quay`) and a prominent merchant NPC (`merchant-lin`) + open bidirectional route
+    execute_tool(
+        &engine,
+        "create_place",
+        json!({
+            "id": "salt-quay",
+            "name": "Salt Quay",
+            "place_type": "port",
+            "terrain": "coastal",
+            "climate": "temperate",
+            "description": "Busy river-port where salt guilds and envoys trade."
+        }),
+    )
+    .unwrap();
+    execute_tool(
+        &engine,
+        "manage_travel_and_exploration",
+        json!({
+            "action": "upsert_route",
+            "id": "watch-to-salt",
+            "from_place_id": "watch-keep",
+            "to_place_id": "salt-quay",
+            "bidirectional": true,
+            "distance_km": 48.0,
+            "terrain": "road",
+            "status": "open"
+        }),
+    )
+    .unwrap();
+    execute_tool(
+        &engine,
+        "manage_travel_and_exploration",
+        json!({
+            "action": "upsert_route",
+            "id": "hollow-to-salt",
+            "from_place_id": "glass-hollow",
+            "to_place_id": "salt-quay",
+            "bidirectional": true,
+            "distance_km": 36.0,
+            "terrain": "trail",
+            "status": "open"
+        }),
+    )
+    .unwrap();
+    execute_tool(
+        &engine,
+        "create_character",
+        json!({
+            "id": "merchant-lin",
+            "name": "Guildmaster Lin",
+            "title": "Salt Guild Factor",
+            "kind": "npc",
+            "archetype": "Merchant",
+            "faction": "Salt Guild",
+            "initial_location": "salt-quay"
+        }),
+    )
+    .unwrap();
+
+    // Give Archivist Bren a public knowledge claim to carry & spread when networking!
+    execute_tool(
+        &engine,
+        "record_knowledge",
+        json!({
+            "claim_id": "grain-shortage-north",
+            "subject": "Northern Grain Harvest",
+            "claim": "Early frost cut the northern valley grain yield by a third.",
+            "truth_status": "true",
+            "visibility": "public",
+            "known_by": ["archivist-bren"],
+            "stance": "documented",
+            "confidence": 85,
+            "source": "archive dispatch"
+        }),
+    )
+    .unwrap();
+
+    // 2. Configure Archivist Bren as a prominent networking envoy and dispatch a trip to Salt Quay
+    execute_tool(
+        &engine,
+        "simulate_autonomy",
+        json!({
+            "mode": "configure_mobility",
+            "character_id": "archivist-bren",
+            "prominent": true,
+            "mobility_mode": "networking_envoy",
+            "home_place_id": "watch-keep",
+            "preferred_destinations": ["salt-quay"],
+            "trip_cadence_days": 5,
+            "stay_duration_days": 2,
+            "travel_speed_mode": "mount"
+        }),
+    )
+    .unwrap();
+
+    let disp = execute_tool(
+        &engine,
+        "simulate_autonomy",
+        json!({
+            "mode": "dispatch_trip",
+            "character_id": "archivist-bren",
+            "destination_place_id": "salt-quay",
+            "purpose": "networking",
+            "details": "Tariff audit & grain intelligence exchange",
+            "stay_duration_days": 2,
+            "travel_speed_mode": "mount"
+        }),
+    )
+    .unwrap();
+    assert_eq!(disp["trip"]["destination_place_id"], "salt-quay");
+
+    // While in transit, `get_scene_context` explicitly shows Bren IN TRANSIT (not a sitting duck!)
+    let ctx_transit = execute_tool(
+        &engine,
+        "get_scene_context",
+        json!({ "place_id": "watch-keep", "format": "markdown" }),
+    )
+    .unwrap();
+    let ctx_transit_str = ctx_transit
+        .as_str()
+        .or_else(|| ctx_transit["context_markdown"].as_str())
+        .unwrap();
+    assert!(ctx_transit_str.contains("## Living World: Prominent Figures Away / In Transit"));
+    assert!(ctx_transit_str.contains("Archivist Bren"));
+    assert!(ctx_transit_str.contains("IN TRANSIT"));
+
+    // 3. Advance world time by 24h -> Bren arrives in Salt Quay, networks with Guildmaster Lin, and spreads the grain rumor!
+    let tick1 = execute_tool(
+        &engine,
+        "advance_world",
+        json!({
+            "duration_hours": 24,
+            "place_ids": ["salt-quay"],
+            "tick_npc_movements": true,
+            "seed": 42
+        }),
+    )
+    .unwrap();
+    assert!(tick1["npc_movements"]["events_count"].as_u64().unwrap() >= 1);
+    let bren_now = engine.get_character("archivist-bren", None).unwrap();
+    assert_eq!(bren_now.current.current_location.as_deref(), Some("salt-quay"));
+    let bren_prof = engine.get_character_profile("archivist-bren").unwrap();
+    assert_eq!(bren_prof.mobility.current_status, "visiting");
+    assert!(
+        !bren_prof.mobility.recent_engagements.is_empty(),
+        "Arrival must log a business/networking engagement"
+    );
+    // Guildmaster Lin organically learned the public grain claim from networking with Bren!
+    let lin_beliefs = engine.db().list_beliefs_for_actor("merchant-lin").unwrap();
+    assert!(
+        lin_beliefs.iter().any(|b| b.claim_id == "grain-shortage-north"),
+        "Networking arrival should organically propagate public rumors between prominent figures!"
+    );
+
+    // 4. Sever ALL routes out of Salt Quay -> after 3 more days, Bren tries to return home and becomes STRANDED (never teleports!)
+    execute_tool(
+        &engine,
+        "manage_travel_and_exploration",
+        json!({
+            "action": "upsert_route",
+            "id": "watch-to-salt",
+            "from_place_id": "watch-keep",
+            "to_place_id": "salt-quay",
+            "bidirectional": true,
+            "distance_km": 48.0,
+            "terrain": "road",
+            "status": "destroyed"
+        }),
+    )
+    .unwrap();
+    execute_tool(
+        &engine,
+        "manage_travel_and_exploration",
+        json!({
+            "action": "upsert_route",
+            "id": "hollow-to-salt",
+            "from_place_id": "glass-hollow",
+            "to_place_id": "salt-quay",
+            "bidirectional": true,
+            "distance_km": 36.0,
+            "terrain": "trail",
+            "status": "blocked"
+        }),
+    )
+    .unwrap();
+    execute_tool(
+        &engine,
+        "advance_world",
+        json!({
+            "duration_days": 3,
+            "place_ids": ["salt-quay"],
+            "tick_npc_movements": true,
+            "seed": 43
+        }),
+    )
+    .unwrap();
+    let bren_stranded = engine.get_character_profile("archivist-bren").unwrap();
+    assert_eq!(bren_stranded.mobility.current_status, "stranded");
+    assert_eq!(
+        engine.get_character("archivist-bren", None).unwrap().current.current_location.as_deref(),
+        Some("salt-quay"),
+        "Stranded NPC must NOT teleport across severed routes!"
+    );
+
+    // 5. Compiled Markdown, REST `/api/world/movements`, and Web UI verification
+    engine.compile_docs().unwrap();
+    let bren_md = std::fs::read_to_string(tmp.path().join("docs/characters/archivist-bren.md")).unwrap();
+    assert!(bren_md.contains("### Mobility, Business Travel & Networking"));
+    assert!(bren_md.contains("Recent Business & Networking Engagements"));
+
+    let oauth = std::sync::Arc::new(std::sync::Mutex::new(
+        chronicle::oauth::OAuthStore::new("gm-mv-pass".to_string()),
+    ));
+    let (_, _, _, login_body) = chronicle::web::dispatch_http_with_oauth(
+        &engine,
+        &oauth,
+        "http://127.0.0.1:7878",
+        "POST",
+        "/oauth/ui-login",
+        BTreeMap::new(),
+        br#"{"passphrase":"gm-mv-pass"}"#,
+    );
+    let tok = serde_json::from_slice::<serde_json::Value>(&login_body).unwrap()["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut auth_h = BTreeMap::new();
+    auth_h.insert("authorization".to_string(), format!("Bearer {tok}"));
+    let (st_mv, _, _, mv_body) = chronicle::web::dispatch_http_with_oauth(
+        &engine,
+        &oauth,
+        "http://127.0.0.1:7878",
+        "GET",
+        "/api/world/movements",
+        auth_h,
+        b"",
+    );
+    assert_eq!(st_mv, 200);
+    let mv_json: serde_json::Value = serde_json::from_slice(&mv_body).unwrap();
+    assert!(mv_json["figures"].as_array().unwrap().len() >= 2);
+    assert!(!mv_json["recent_engagements"].as_array().unwrap().is_empty());
+
+    let (st_ui, _, _, ui_body) = chronicle::web::dispatch_http_with_oauth(
+        &engine,
+        &oauth,
+        "http://127.0.0.1:7878",
+        "GET",
+        "/",
+        BTreeMap::new(),
+        b"",
+    );
+    assert_eq!(st_ui, 200);
+    let ui_html = String::from_utf8(ui_body).unwrap();
+    assert!(ui_html.contains("dashMovementsBody"));
+    assert!(ui_html.contains("modalNpcMobility"));
+    assert!(ui_html.contains("modalDispatchTrip"));
+
+    assert!(engine.db().verify_event_chain_detailed().unwrap().valid);
+}
+
+#[test]
+fn test_sparse_multiscale_2d_map_grids_compass_fog_and_atlas_api() {
+    let tmp = TempDir::new().unwrap();
+    let mut engine = CampaignEngine::open(tmp.path()).unwrap();
+    seed_test_fixture(&mut engine);
+
+    // 1. Create two grids at completely different genre scales (Regional 5 km + Sci-Fi Sector 1 AU)
+    let reg = execute_tool(
+        &engine,
+        "manage_travel_and_exploration",
+        json!({
+            "action": "upsert_grid",
+            "grid_id": "valley-region",
+            "name": "Glass Valley Regional Atlas",
+            "scale_kind": "region",
+            "width": 16,
+            "height": 12,
+            "cell_scale_label": "5 km",
+            "default_terrain": "wilderness",
+            "description": "Sparse regional grid spanning Glass Hollow and Watch Keep."
+        }),
+    )
+    .unwrap();
+    assert_eq!(reg["grid"]["id"], "valley-region");
+
+    let scifi = execute_tool(
+        &engine,
+        "manage_travel_and_exploration",
+        json!({
+            "action": "upsert_grid",
+            "grid_id": "helix-sector",
+            "name": "Helix Star Sector",
+            "scale_kind": "space_sector",
+            "width": 12,
+            "height": 10,
+            "cell_scale_label": "1 AU",
+            "default_terrain": "vacuum"
+        }),
+    )
+    .unwrap();
+    assert_eq!(scifi["grid"]["scale_kind"], "space_sector");
+
+    // 2. Batch-paint sparse cells: anchor Glass Hollow at (4,5), Watch Keep at (8,5), adjacent ridge at (4,4) with GM secret, and unexplored ruin at (5,5)
+    let batch = execute_tool(
+        &engine,
+        "manage_travel_and_exploration",
+        json!({
+            "action": "set_cell",
+            "grid_id": "valley-region",
+            "cells": [
+                {
+                    "x": 4, "y": 5,
+                    "terrain": "ruins",
+                    "place_id": "glass-hollow",
+                    "fog_status": "charted"
+                },
+                {
+                    "x": 8, "y": 5,
+                    "terrain": "urban",
+                    "place_id": "watch-keep",
+                    "faction_control": "wardens",
+                    "fog_status": "charted"
+                },
+                {
+                    "x": 4, "y": 4,
+                    "terrain": "mountain",
+                    "landmark_name": "Whispering Ridge",
+                    "hazards": ["Rockslide"],
+                    "fog_status": "surveyed",
+                    "gm_notes": "SECRET_CELL_AMBUSH_MARKER"
+                },
+                {
+                    "x": 5, "y": 5,
+                    "terrain": "forest",
+                    "landmark_name": "HIDDEN_SHRINE_FOG_MARKER",
+                    "fog_status": "unexplored"
+                }
+            ],
+            "reason": "Charted Glass Valley sparse grid"
+        }),
+    )
+    .unwrap();
+    assert_eq!(batch["updated_count"], 4);
+
+    // Anchoring a place on (x, y) automatically syncs PlaceSpatialExt.coordinates!
+    let gh_sp = engine.db().get_place_spatial("glass-hollow").unwrap().unwrap();
+    assert_eq!(gh_sp.coordinates, Some([4.0, 5.0]));
+    assert_eq!(gh_sp.map_region, "valley-region");
+
+    // 3. Verify compact, token-safe 3x3 compass neighborhood in get_scene_context & strict POV fog/secret isolation!
+    let gm_ctx = execute_tool(
+        &engine,
+        "get_scene_context",
+        json!({ "place_id": "glass-hollow", "perspective": "gm", "include_gm_secrets": true, "format": "markdown" }),
+    )
+    .unwrap();
+    let gm_str = gm_ctx.as_str().or_else(|| gm_ctx["context_markdown"].as_str()).unwrap();
+    assert!(gm_str.contains("Glass Valley Regional Atlas"));
+    assert!(gm_str.contains("N (4,4): mountain [Landmark: Whispering Ridge]"));
+    assert!(gm_str.contains("SECRET_CELL_AMBUSH_MARKER"));
+    assert!(gm_str.contains("HIDDEN_SHRINE_FOG_MARKER"));
+    assert!(gm_str.contains("4.0 cells E")); // Watch Keep is at (8,5) -> 4 cells East of (4,5)!
+
+    let pc_ctx = execute_tool(
+        &engine,
+        "get_scene_context",
+        json!({ "place_id": "glass-hollow", "perspective": "aria-vale", "include_gm_secrets": true, "format": "markdown" }),
+    )
+    .unwrap();
+    let pc_str = pc_ctx.as_str().or_else(|| pc_ctx["context_markdown"].as_str()).unwrap();
+    assert!(pc_str.contains("N (4,4): mountain [Landmark: Whispering Ridge]"));
+    assert!(pc_str.contains("E (5,5): Unexplored"));
+    assert!(
+        !pc_str.contains("SECRET_CELL_AMBUSH_MARKER"),
+        "Cell gm_notes must NEVER leak to player POV!"
+    );
+    assert!(
+        !pc_str.contains("HIDDEN_SHRINE_FOG_MARKER"),
+        "Unexplored fog cell landmarks must NEVER leak to player POV!"
+    );
+
+    // 4. Compiled Place Markdown includes Map Grid Position & Neighbors
+    engine.compile_docs().unwrap();
+    let gh_md = std::fs::read_to_string(tmp.path().join("docs/places/glass-hollow.md")).unwrap();
+    assert!(gh_md.contains("### Map Grid Position & Neighbors"));
+    assert!(gh_md.contains("Whispering Ridge"));
+
+    // 5. Clear cell & auto_layout_grid work cleanly
+    let clr = execute_tool(
+        &engine,
+        "manage_travel_and_exploration",
+        json!({ "action": "clear_cell", "grid_id": "valley-region", "x": 5, "y": 5 }),
+    )
+    .unwrap();
+    assert_eq!(clr["cleared"], true);
+
+    // 6. REST `/api/maps` & `/api/maps/<id>` (with route lines + character pins!) and Web UI HTML verification
+    let oauth = std::sync::Arc::new(std::sync::Mutex::new(
+        chronicle::oauth::OAuthStore::new("gm-map-pass".to_string()),
+    ));
+    let (_, _, _, login_body) = chronicle::web::dispatch_http_with_oauth(
+        &engine,
+        &oauth,
+        "http://127.0.0.1:7878",
+        "POST",
+        "/oauth/ui-login",
+        BTreeMap::new(),
+        br#"{"passphrase":"gm-map-pass"}"#,
+    );
+    let tok = serde_json::from_slice::<serde_json::Value>(&login_body).unwrap()["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut auth_h = BTreeMap::new();
+    auth_h.insert("authorization".to_string(), format!("Bearer {tok}"));
+
+    let (st_list, _, _, list_body) = chronicle::web::dispatch_http_with_oauth(
+        &engine,
+        &oauth,
+        "http://127.0.0.1:7878",
+        "GET",
+        "/api/maps",
+        auth_h.clone(),
+        b"",
+    );
+    assert_eq!(st_list, 200);
+    let list_json: serde_json::Value = serde_json::from_slice(&list_body).unwrap();
+    assert_eq!(list_json["count"], 2);
+
+    let (st_one, _, _, one_body) = chronicle::web::dispatch_http_with_oauth(
+        &engine,
+        &oauth,
+        "http://127.0.0.1:7878",
+        "GET",
+        "/api/maps/valley-region",
+        auth_h,
+        b"",
+    );
+    assert_eq!(st_one, 200);
+    let one_json: serde_json::Value = serde_json::from_slice(&one_body).unwrap();
+    assert_eq!(one_json["placed_places"].as_array().unwrap().len(), 2);
+    assert!(!one_json["routes"].as_array().unwrap().is_empty());
+    assert!(!one_json["character_pins"].as_array().unwrap().is_empty());
+
+    let (st_ui, _, _, ui_body) = chronicle::web::dispatch_http_with_oauth(
+        &engine,
+        &oauth,
+        "http://127.0.0.1:7878",
+        "GET",
+        "/",
+        BTreeMap::new(),
+        b"",
+    );
+    assert_eq!(st_ui, 200);
+    let ui_html = String::from_utf8(ui_body).unwrap();
+    assert!(ui_html.contains("atlasGridCard"));
+    assert!(ui_html.contains("modalNewGrid"));
+    assert!(ui_html.contains("onAtlasCellClick"));
+
+    assert!(engine.db().verify_event_chain_detailed().unwrap().valid);
+}
+
+#[test]
+fn test_active_signal_bus_stage_rules_routines_auto_clocks_hydration_currency_and_domain_facades() {
+    use chronicle::mcp::{tool_definitions_for_profile, ToolProfile};
+
+    // 1. Verify Sanitized MCP Tool Surface (~80% token reduction) & Annotations
+    let play_tools = tool_definitions_for_profile(ToolProfile::Play);
+    let play_arr = play_tools.as_array().unwrap();
+    assert_eq!(play_arr.len(), 12, "Play profile must expose 12 unified tools");
+    let play_json = serde_json::to_string(&play_tools).unwrap();
+    let legacy_json = serde_json::to_string(&chronicle::mcp::all_tool_definitions()).unwrap();
+    assert!(
+        play_json.len() < 32_000 && play_json.len() * 3 < legacy_json.len(),
+        "Play profile ({} chars) should be dramatically smaller than legacy ({} chars)",
+        play_json.len(),
+        legacy_json.len()
+    );
+    let query_tool = play_arr.iter().find(|t| t["name"] == "query").unwrap();
+    assert_eq!(query_tool["annotations"]["readOnlyHint"], true);
+    let compact_full = tool_definitions_for_profile(ToolProfile::CompactFull);
+    assert_eq!(compact_full.as_array().unwrap().len(), 13);
+
+    // 2. Setup fresh temp campaign using ONLY Unified Domain Facade Tools!
+    let tmp = TempDir::new().unwrap();
+    let engine = CampaignEngine::open(tmp.path()).unwrap();
+    engine
+        .init_campaign("Active Engine Test", "Multi-genre active rules", "d20", None)
+        .unwrap();
+
+    execute_tool(
+        &engine,
+        "world",
+        json!({ "op": "create_place", "id": "workshop", "name": "Timber Workshop", "terrain": "Urban" }),
+    )
+    .unwrap();
+    execute_tool(
+        &engine,
+        "world",
+        json!({ "op": "create_place", "id": "market-ward", "name": "Market Ward", "terrain": "Urban" }),
+    )
+    .unwrap();
+
+    execute_tool(
+        &engine,
+        "character",
+        json!({
+            "op": "create",
+            "id": "lin-mo",
+            "name": "Lin Mo",
+            "kind": "pc",
+            "initial_location": "workshop",
+            "initial_stats": { "Strength": 14, "Dexterity": 12, "Charisma": 10 },
+            "initial_skills": [{ "name": "Carpentry", "rank": "Apprentice", "governing_stat": "Dexterity", "xp": 160 }]
+        }),
+    )
+    .unwrap();
+
+    // Set Day-1 baseline avatar & fitted trousers (Hips 99 cm)
+    execute_tool(
+        &engine,
+        "character",
+        json!({
+            "op": "pc_sheet",
+            "sub_action": "update_avatar",
+            "character_id": "lin-mo",
+            "height": "178 cm",
+            "weight": "80 kg",
+            "facial_hair": "Light jaw stubble",
+            "measurements": {
+                "Shoulders": "49 cm",
+                "Chest": "108 cm",
+                "Waist": "88 cm",
+                "Hips": "96 cm"
+            }
+        }),
+    )
+    .unwrap();
+    execute_tool(
+        &engine,
+        "character",
+        json!({
+            "op": "equipment",
+            "sub_action": "acquire",
+            "character_id": "lin-mo",
+            "item_name": "Fitted Work Trousers",
+            "equipped": true,
+            "garment_cut": "fitted",
+            "garment_taper": "straight",
+            "garment_measurements": { "Waist": "90 cm", "Hips": "98 cm" }
+        }),
+    )
+    .unwrap();
+
+    // 3. Declarative StageTransitionRule on Body-Tempering Track (Layer 2) + D&D ASI Ladder Rule
+    execute_tool(
+        &engine,
+        "progression",
+        json!({ "op": "define_ladder", "preset": "body_tempering", "ladder_id": "still-water" }),
+    )
+    .unwrap();
+    execute_tool(
+        &engine,
+        "progression",
+        json!({
+            "op": "enroll_track",
+            "character_id": "lin-mo",
+            "track_id": "still-water",
+            "ladder_id": "still-water",
+            "name": "Still Water Body Manual",
+            "track_kind": "parallel_manual",
+            "stage_rules": {
+                "2": {
+                    "appearance_stage": "Layer 2 — Supple Sinew",
+                    "height": "176 cm",
+                    "weight": "76 kg",
+                    "facial_hair": "",
+                    "measurements": {
+                        "Shoulders": "46 cm",
+                        "Chest": "104 cm",
+                        "Waist": "78 cm",
+                        "Hips": "106 cm"
+                    },
+                    "stat_deltas": { "Strength": -2, "Dexterity": 2 },
+                    "unspent_stat_points_delta": 1,
+                    "upsert_conditions": [{
+                        "name": "Softened Leverage",
+                        "kind": "condition",
+                        "severity": "minor",
+                        "notes": "-2 [scope: strength, brawling] Reduced raw brute burst"
+                    }],
+                    "grant_traits": [{
+                        "name": "Fluid Joint Alignment",
+                        "category": "physique",
+                        "effect": "+1 [scope: dexterity, carpentry] Smooth fine motor control"
+                    }],
+                    "checkpoint_summary": "Layer 2 shifted frame softer and wider at the hips; jaw stubble vanished.",
+                    "narrative_directive": "Reflect softened shoulders, cleared facial hair, and binding trousers at the hips."
+                }
+            }
+        }),
+    )
+    .unwrap();
+
+    // Advance 45 XP (Layer 1 threshold is 40 XP) -> enters Layer 2 and executes StageTransitionRule atomically!
+    let adv_res = execute_tool(
+        &engine,
+        "progression",
+        json!({
+            "op": "advance_xp",
+            "character_id": "lin-mo",
+            "track_id": "still-water",
+            "xp": 45,
+            "reason": "Evening meridian circulation"
+        }),
+    )
+    .unwrap();
+    assert_eq!(adv_res["stages_advanced"], 1);
+    assert_eq!(adv_res["stage_rules_applied"].as_array().unwrap().len(), 1);
+
+    let prof_after = engine.get_character_profile("lin-mo").unwrap();
+    assert_eq!(prof_after.avatar.baseline_height, "178 cm", "Day-1 baseline height auto-preserved!");
+    assert_eq!(prof_after.avatar.height, "176 cm");
+    assert_eq!(prof_after.avatar.facial_hair, "", "Facial hair explicitly cleared!");
+    assert_eq!(prof_after.avatar.baseline_measurements.get("Hips").map(String::as_str), Some("96 cm"));
+    assert_eq!(prof_after.avatar.measurements.get("Hips").map(String::as_str), Some("106 cm"));
+    assert_eq!(prof_after.unspent_stat_points, 1);
+    assert_eq!(prof_after.avatar.transformation_log.len(), 1);
+
+    let proj_after = engine.get_character("lin-mo", None).unwrap();
+    assert_eq!(proj_after.current.stats.get("Strength").copied(), Some(12));
+    assert_eq!(proj_after.current.stats.get("Dexterity").copied(), Some(14));
+    assert!(proj_after.current.conditions.iter().any(|c| c.name == "Softened Leverage"));
+    assert!(
+        proj_after
+            .current
+            .conditions
+            .iter()
+            .any(|c| c.name == "Apparel Discomfort: Binding & Chafing")
+    );
+
+    // Also verify D&D 1-20 preset ladder-scoped ASI stage_rule at Level 4 (+2 unspent_stat_points)
+    execute_tool(
+        &engine,
+        "progression",
+        json!({ "op": "define_ladder", "preset": "dnd_level_20", "ladder_id": "dnd-lvl" }),
+    )
+    .unwrap();
+    execute_tool(
+        &engine,
+        "progression",
+        json!({
+            "op": "enroll_track",
+            "character_id": "lin-mo",
+            "track_id": "class-level",
+            "ladder_id": "dnd-lvl",
+            "name": "Artificer Level",
+            "track_kind": "level"
+        }),
+    )
+    .unwrap();
+    // Level 1 (300) + Level 2 (600) + Level 3 (1800) = 2700 XP -> reaches Level 4!
+    execute_tool(
+        &engine,
+        "progression",
+        json!({ "op": "advance_xp", "character_id": "lin-mo", "track_id": "class-level", "xp": 2700 }),
+    )
+    .unwrap();
+    let prof_asi = engine.get_character_profile("lin-mo").unwrap();
+    assert_eq!(prof_asi.unspent_stat_points, 3, "1 from manual + 2 from D&D Level 4 ASI!");
+
+    // 4. Full Check Hydration (Title + Trait + Proficiency + Injury + Encumbrance + Apparel) + Coupled XP Trickle
+    execute_tool(
+        &engine,
+        "character",
+        json!({
+            "op": "pc_sheet",
+            "sub_action": "upsert_title",
+            "character_id": "lin-mo",
+            "name": "Steady Joiner",
+            "equipped": true,
+            "stat_modifiers": { "Dexterity": 1 }
+        }),
+    )
+    .unwrap();
+    execute_tool(
+        &engine,
+        "character",
+        json!({
+            "op": "pc_sheet",
+            "sub_action": "upsert_proficiency",
+            "character_id": "lin-mo",
+            "name": "Mortise Chisel",
+            "category": "tool",
+            "rank": "Proficient",
+            "bonus": "+2"
+        }),
+    )
+    .unwrap();
+    execute_tool(
+        &engine,
+        "character",
+        json!({
+            "op": "pc_sheet",
+            "sub_action": "upsert_job",
+            "character_id": "lin-mo",
+            "name": "Carpentry Apprentice",
+            "role": "occupation",
+            "governing_stats": ["Dexterity"]
+        }),
+    )
+    .unwrap();
+    // Add an injury directly in DB (without duplicate StatusCondition) & heavy timber cargo to verify table hydration
+    engine
+        .db()
+        .upsert_injury(&chronicle::world_sim::InjuryRecord {
+            id: "sprained-wrist".into(),
+            character_id: "lin-mo".into(),
+            name: "Sprained Wrist".into(),
+            severity: "moderate".into(),
+            body_location: "wrist".into(),
+            complications: vec![],
+            treated: false,
+            recovery_days_total: 5,
+            recovery_days_remaining: 5,
+            status: "active".into(),
+            source_event_id: None,
+            notes: String::new(),
+            inflicted_at_world_time: String::new(),
+            updated_at_world_time: String::new(),
+        })
+        .unwrap();
+    execute_tool(
+        &engine,
+        "character",
+        json!({
+            "op": "equipment",
+            "sub_action": "acquire",
+            "character_id": "lin-mo",
+            "item_name": "Oak Timber Beam",
+            "quantity": 5
+        }),
+    )
+    .unwrap();
+
+    let chk = execute_tool(
+        &engine,
+        "resolve",
+        json!({
+            "op": "check",
+            "actor_id": "lin-mo",
+            "action": "Carve fine wrist-angled mortise chisel joint while sprint-hauling",
+            "skill": "Carpentry",
+            "dc_tier": "moderate",
+            "dc_factors": ["proper_tools"],
+            "seed": 77
+        }),
+    )
+    .unwrap();
+    let mod_sources: Vec<String> = chk["modifiers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["source"].as_str().unwrap().to_string())
+        .collect();
+    assert!(mod_sources.iter().any(|s| s == "stat:Dexterity"));
+    assert!(mod_sources.iter().any(|s| s == "skill:Carpentry"));
+    assert!(mod_sources.iter().any(|s| s == "title:Steady Joiner"));
+    assert!(mod_sources.iter().any(|s| s == "trait:Fluid Joint Alignment"));
+    assert!(mod_sources.iter().any(|s| s == "proficiency:Mortise Chisel"));
+    assert!(mod_sources.iter().any(|s| s == "injury:Sprained Wrist"));
+    assert!(mod_sources.iter().any(|s| s.starts_with("encumbrance:")));
+    assert!(mod_sources.iter().any(|s| s == "apparel:fit_movement"));
+    // Verify coupled Stat Training XP & Job XP trickled automatically!
+    assert!(chk.get("stat_xp_gained").is_some(), "Governing Stat Training XP must trickle!");
+    assert!(!chk["job_xp_gained"].as_array().unwrap().is_empty(), "Matching active Job XP must trickle!");
+
+    // 5. Multi-Denomination Currency Auto-Change-Making + Cross-Family Guard
+    execute_tool(
+        &engine,
+        "economy",
+        json!({ "op": "set_balance", "owner_id": "lin-mo", "currency": "silver_tael", "amount": 1, "notes": "Savings" }),
+    )
+    .unwrap();
+    let tx = execute_tool(
+        &engine,
+        "economy",
+        json!({
+            "op": "execute_transaction",
+            "kind": "purchase",
+            "buyer_id": "lin-mo",
+            "seller_id": "tea-stall",
+            "amount": 40,
+            "currency": "copper_cash",
+            "item_name": "Hot Ginger Tea",
+            "notes": "Morning tea"
+        }),
+    )
+    .unwrap();
+    assert_eq!(tx["buyer_balance"], 960, "1 silver_tael (1000) - 40 copper_cash = 960 copper_cash change!");
+    assert_eq!(engine.db().get_currency_balance("lin-mo", "silver_tael").unwrap(), 0);
+    // Cross-family guard: D&D `gp` must NEVER convert from Xianxia `copper_cash`!
+    let cross_err = execute_tool(
+        &engine,
+        "economy",
+        json!({
+            "op": "execute_transaction",
+            "kind": "purchase",
+            "buyer_id": "lin-mo",
+            "seller_id": "foreign-mage",
+            "amount": 1,
+            "currency": "gp"
+        }),
+    );
+    assert!(cross_err.is_err(), "Cross-family currency conversion must be rejected!");
+
+    // 6. Auto-Ticking ProgressClock + Standing CharacterRoutine + Epistemic Signal Isolation
+    execute_tool(
+        &engine,
+        "world",
+        json!({
+            "op": "clock",
+            "sub_action": "create",
+            "clock_id": "monthly-rent",
+            "name": "Workshop Rent Countdown",
+            "kind": "upkeep",
+            "segments": 3,
+            "filled": 0,
+            "cadence_hours": 24,
+            "auto_reset": true,
+            "consequence_on_fill": "Pay 120 copper_cash rent to Landlord Zhao",
+            "related_ids": ["lin-mo", "workshop"]
+        }),
+    )
+    .unwrap();
+
+    execute_tool(
+        &engine,
+        "character",
+        json!({
+            "op": "routine",
+            "sub_action": "upsert",
+            "routine": {
+                "id": "daily-benchwork",
+                "character_id": "lin-mo",
+                "name": "Daily Joinery & Breathing",
+                "category": "work",
+                "cadence_hours": 24,
+                "require_location_id": "workshop",
+                "halt_on_injury_severity": "severe",
+                "progression_xp": { "still-water": 10 },
+                "skill_xp": { "Carpentry": 15 },
+                "currency_deltas": { "copper_cash": 25 }
+            }
+        }),
+    )
+    .unwrap();
+
+    // Advance 3 days (4320 min) in a single deferred-compile commit_turn!
+    let turn = execute_tool(
+        &engine,
+        "commit_turn",
+        json!({
+            "advance_minutes": 4320,
+            "time_reason": "Three days of steady joinery",
+            "log": { "title": "Three Days at the Bench", "details": "Worked through three quiet days." }
+        }),
+    )
+    .unwrap();
+    assert!(!turn["signals"].as_array().unwrap().is_empty(), "commit_turn must return active signals!");
+    let rent_clock = engine.db().get_clock("monthly-rent").unwrap().unwrap();
+    assert_eq!(rent_clock.filled, 0, "Auto-reset clock should wrap 3/3 back to 0/3!");
+    assert_eq!(engine.db().get_currency_balance("lin-mo", "copper_cash").unwrap(), 960 + 75);
+
+    // GM Scene Context shows CRITICAL CLOCK_FILLED (gm_secret) AND OUTGROWN_GARMENT / STAGE_RULE_APPLIED at the very top!
+    let gm_md = execute_tool(
+        &engine,
+        "scene",
+        json!({ "op": "context", "place_id": "workshop", "character_ids": ["lin-mo"], "perspective": "gm" }),
+    )
+    .unwrap();
+    let gm_str = gm_md.as_str().unwrap();
+    assert!(gm_str.contains("## Engine Alarms & Active Directives"));
+    assert!(gm_str.contains("CLOCK_FILLED"));
+    assert!(gm_str.contains("OUTGROWN_GARMENT"));
+    assert!(gm_str.contains("STAGE_RULE_APPLIED"));
+
+    // Player POV Context strictly hides gm_secret CLOCK_FILLED while preserving player/public alarms!
+    let player_md = execute_tool(
+        &engine,
+        "scene",
+        json!({ "op": "context", "place_id": "workshop", "character_ids": ["lin-mo"], "perspective": "player" }),
+    )
+    .unwrap();
+    let player_str = player_md.as_str().unwrap();
+    assert!(!player_str.contains("CLOCK_FILLED"), "gm_secret signal must never leak to player POV!");
+    assert!(player_str.contains("OUTGROWN_GARMENT"));
+
+    // Move Lin Mo away from `workshop` and advance 1 day -> routine auto-pauses and emits ROUTINE_PAUSED!
+    execute_tool(
+        &engine,
+        "character",
+        json!({ "op": "move", "character_id": "lin-mo", "to_place_id": "market-ward" }),
+    )
+    .unwrap();
+    execute_tool(&engine, "world", json!({ "op": "advance_time", "minutes": 1440 })).unwrap();
+    let sigs_after_move = execute_tool(&engine, "scene", json!({ "op": "signals", "perspective": "player" })).unwrap();
+    assert!(
+        sigs_after_move["signals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["code"] == "ROUTINE_PAUSED"),
+        "Leaving required location must pause routine and raise ROUTINE_PAUSED signal!"
+    );
+
+    // Acknowledge/resolve a live-derived signal (OUTGROWN_GARMENT) and verify it suppresses cleanly!
+    let outgrown_id = sigs_after_move["signals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["code"] == "OUTGROWN_GARMENT")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    execute_tool(&engine, "scene", json!({ "op": "resolve_signal", "signal_id": outgrown_id })).unwrap();
+    let sigs_after_resolve = execute_tool(&engine, "scene", json!({ "op": "signals", "perspective": "player" })).unwrap();
+    assert!(
+        !sigs_after_resolve["signals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["code"] == "OUTGROWN_GARMENT"),
+        "Resolved live signal must stay suppressed!"
+    );
+
+    // Verify REST /api/signals and /api/routines endpoints & SHA-256 chain integrity
+    let (st_sig, _, sig_body) = dispatch_http(&engine, "GET", "/api/signals", b"");
+    assert_eq!(st_sig, 200);
+    assert!(serde_json::from_slice::<serde_json::Value>(&sig_body).unwrap()["count"].as_u64().unwrap() >= 1);
+
+    let (st_rt, _, rt_body) = dispatch_http(&engine, "GET", "/api/routines?character_id=lin-mo", b"");
+    assert_eq!(st_rt, 200);
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&rt_body).unwrap()["count"], 1);
+
+    assert!(engine.db().verify_event_chain_detailed().unwrap().valid);
+}
+
+#[test]
+fn test_inventory_tag_system_auto_tagging_filtering_catalog_sync_and_grouped_rendering() {
+    let tmp = TempDir::new().unwrap();
+    let engine = CampaignEngine::open(tmp.path()).unwrap();
+    engine
+        .init_campaign("Tag System Test", "Inventory tagging & retrieval", "d20", None)
+        .unwrap();
+
+    execute_tool(
+        &engine,
+        "world",
+        json!({ "op": "create_place", "id": "inn", "name": "Wayfarer Inn", "terrain": "Urban" }),
+    )
+    .unwrap();
+    execute_tool(
+        &engine,
+        "character",
+        json!({ "op": "create", "id": "hero", "name": "Shen Li", "kind": "pc", "initial_location": "inn" }),
+    )
+    .unwrap();
+
+    // 1. Auto-inference on acquire + catalog item sync
+    for (name, slot, equipped, extra) in [
+        ("Wool Shoulder Cloak", Some("Outerwear"), true, json!({})),
+        ("Iron Hatchet", None, false, json!({})),
+        ("Flint-and-Steel Fire Kit", None, false, json!({})),
+        ("Guild Charter Letter", None, false, json!({})),
+        ("Simple Practice Jade Disk", None, false, json!({})),
+        ("Canvas Bedroll", None, false, json!({})),
+        ("Spare Linen Tunic", Some("Shirt"), false, json!({ "garment_cut": "standard", "garment_measurements": { "Chest": "104 cm" } })),
+        ("Travel Provisions", None, false, json!({})),
+        ("Copper Coin Pouch", None, false, json!({})),
+    ] {
+        let mut payload = json!({
+            "op": "equipment",
+            "sub_action": "acquire",
+            "character_id": "hero",
+            "name": name,
+            "equipped": equipped
+        });
+        if let Some(sl) = slot {
+            payload["slot"] = json!(sl);
+        }
+        if let Some(obj) = extra.as_object() {
+            for (k, v) in obj {
+                payload[k] = v.clone();
+            }
+        }
+        execute_tool(&engine, "character", payload).unwrap();
+    }
+
+    // 2. Single-item tag add/remove + batch tag + catalog item tag mirroring
+    execute_tool(
+        &engine,
+        "economy",
+        json!({
+            "op": "upsert_item",
+            "id": "iron-hatchet",
+            "name": "Iron Hatchet",
+            "item_type": "tool",
+            "current_holder_id": "hero"
+        }),
+    )
+    .unwrap();
+    execute_tool(
+        &engine,
+        "character",
+        json!({
+            "op": "equipment",
+            "sub_action": "tag",
+            "character_id": "hero",
+            "name": "Wool Shoulder Cloak",
+            "add_tags": ["Winter Gear", "Travel"]
+        }),
+    )
+    .unwrap();
+    execute_tool(
+        &engine,
+        "character",
+        json!({
+            "op": "equipment",
+            "sub_action": "tag",
+            "character_id": "hero",
+            "items": [
+                { "name": "Iron Hatchet", "add_tags": ["craft", "woodworking"] },
+                { "name": "Spare Linen Tunic", "add_tags": ["workwear"], "remove_tags": ["spare"] }
+            ]
+        }),
+    )
+    .unwrap();
+
+    // Verify catalog item mirrored the new tags from inventory!
+    let cat_hatchet = engine.get_catalog_item("iron-hatchet").unwrap();
+    assert!(cat_hatchet.tags.contains(&"craft".to_string()));
+    assert!(cat_hatchet.tags.contains(&"woodworking".to_string()));
+
+    // Verify catalog-side tag_item mirrors back into inventory!
+    execute_tool(
+        &engine,
+        "economy",
+        json!({
+            "op": "tag_item",
+            "item_id": "iron-hatchet",
+            "add_tags": ["heirloom"],
+            "remove_tags": ["woodworking"]
+        }),
+    )
+    .unwrap();
+
+    // 3. Multi-tag inventory retrieval (`all` vs `any`, `exclude_tags`, `tag_facets`, `group_counts`)
+    let and_res = execute_tool(
+        &engine,
+        "query",
+        json!({
+            "op": "search_inventory",
+            "character_id": "hero",
+            "tags": ["tool", "heirloom"],
+            "tag_match": "all"
+        }),
+    )
+    .unwrap();
+    assert_eq!(and_res["count"], 1);
+    assert_eq!(and_res["items"][0]["item"]["name"], "Iron Hatchet");
+    assert!(!and_res["items"][0]["item"]["tags"].as_array().unwrap().iter().any(|t| t == "woodworking"));
+
+    let or_res = execute_tool(
+        &engine,
+        "query",
+        json!({
+            "op": "search_inventory",
+            "character_id": "hero",
+            "tags": ["cultivation", "document"],
+            "tag_match": "any"
+        }),
+    )
+    .unwrap();
+    assert_eq!(or_res["count"], 2);
+
+    let excl_res = execute_tool(
+        &engine,
+        "character",
+        json!({
+            "op": "equipment",
+            "sub_action": "search",
+            "character_id": "hero",
+            "exclude_tags": ["clothing"]
+        }),
+    )
+    .unwrap();
+    assert_eq!(excl_res["count"], 7);
+    assert!(excl_res["tag_facets"]["clothing"].as_u64().unwrap() == 2);
+
+    // 4. Verify REST /api/items?tags=... & /api/inventory?tags=...
+    let (st_i, _, body_i) = dispatch_http(&engine, "GET", "/api/items?tags=tool,heirloom&tag_match=all", b"");
+    assert_eq!(st_i, 200);
+    let j_i: serde_json::Value = serde_json::from_slice(&body_i).unwrap();
+    assert_eq!(j_i["count"], 1);
+    assert!(j_i["tag_facets"]["heirloom"].as_u64().unwrap() >= 1);
+
+    let (st_inv, _, body_inv) = dispatch_http(&engine, "GET", "/api/inventory?character_id=hero&tags=winter-gear", b"");
+    assert_eq!(st_inv, 200);
+    let j_inv: serde_json::Value = serde_json::from_slice(&body_inv).unwrap();
+    assert_eq!(j_inv["count"], 1);
+    assert_eq!(j_inv["items"][0]["item"]["name"], "Wool Shoulder Cloak");
+
+    // 5. Verify grouped Markdown docs & tag-grouped Scene Context brief (>6 carried items)
+    let char_md = std::fs::read_to_string(engine.docs_dir().join("characters").join("hero.md")).unwrap();
+    assert!(char_md.contains("> **Inventory Tags:**"));
+    assert!(char_md.contains("#### Tools & Craft"));
+    assert!(char_md.contains("#### Clothing & Apparel"));
+
+    let scene_md = execute_tool(
+        &engine,
+        "scene",
+        json!({ "op": "context", "place_id": "inn", "character_ids": ["hero"], "perspective": "player" }),
+    )
+    .unwrap();
+    assert!(scene_md.as_str().unwrap().contains("- **Carried (by tag):**"));
+    assert!(engine.db().verify_event_chain_detailed().unwrap().valid);
 }

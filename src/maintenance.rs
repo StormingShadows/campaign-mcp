@@ -117,6 +117,8 @@ pub fn diagnose_campaign(engine: &CampaignEngine) -> Result<DiagnosticReport> {
     counts.insert("attachments".to_string(), attachments.len());
     counts.insert("relations".to_string(), relations.len());
     counts.insert("clocks".to_string(), clocks.len());
+    let factions = db.list_factions()?;
+    counts.insert("factions".to_string(), factions.len());
     counts.insert("events".to_string(), event_count);
 
     // Build known entity ID sets
@@ -127,6 +129,7 @@ pub fn diagnose_campaign(engine: &CampaignEngine) -> Result<DiagnosticReport> {
     let item_ids: BTreeSet<String> = items.iter().map(|i| i.id.clone()).collect();
     let att_ids: BTreeSet<String> = attachments.iter().map(|a| a.id.clone()).collect();
     let clock_ids: BTreeSet<String> = clocks.iter().map(|c| c.id.clone()).collect();
+    let faction_ids: BTreeSet<String> = factions.iter().map(|f| f.id.clone()).collect();
 
     let mut all_known_ids: BTreeSet<String> = BTreeSet::new();
     for s in [
@@ -137,6 +140,7 @@ pub fn diagnose_campaign(engine: &CampaignEngine) -> Result<DiagnosticReport> {
         &item_ids,
         &att_ids,
         &clock_ids,
+        &faction_ids,
     ] {
         all_known_ids.extend(s.iter().cloned());
     }
@@ -146,6 +150,8 @@ pub fn diagnose_campaign(engine: &CampaignEngine) -> Result<DiagnosticReport> {
             Some("character")
         } else if place_ids.contains(eid) {
             Some("place")
+        } else if faction_ids.contains(eid) {
+            Some("faction")
         } else if text_ids.contains(eid) {
             Some("text")
         } else if item_ids.contains(eid) {
@@ -974,6 +980,7 @@ pub struct UpdateCharacterBaselineRequest {
     pub appearance: Option<String>,
     pub personality: Option<String>,
     pub backstory: Option<String>,
+    pub initial_stats: Option<BTreeMap<String, i64>>,
     pub tags: Option<Vec<String>>,
     pub notes: Option<String>,
     #[serde(default)]
@@ -1025,6 +1032,10 @@ pub fn update_character_baseline(
     if let Some(v) = req.backstory {
         b.backstory = v;
         changed.push("backstory".to_string());
+    }
+    if let Some(v) = req.initial_stats {
+        b.initial_stats = v;
+        changed.push("initial_stats".to_string());
     }
     if let Some(v) = req.tags {
         b.tags = dedupe_trimmed(v);
@@ -1583,6 +1594,7 @@ pub fn reclassify_entity(
                 related_ids: extracted.related_ids,
                 created_at_world_time: String::new(),
                 updated_at_world_time: String::new(),
+                ..Default::default()
             };
             let (saved, _) = engine.upsert_catalog_item(item, "Reclassified into carryable items")?;
             saved.id
@@ -1957,8 +1969,65 @@ pub fn rename_or_merge_entity(
                 merged = false;
             }
         }
+        "faction" => {
+            let old = db
+                .get_faction(&old_id)?
+                .ok_or_else(|| anyhow!("Faction '{old_id}' not found"))?;
+            if let Some(mut target) = db.get_faction(&new_id)? {
+                if !req.allow_merge {
+                    bail!("Faction '{new_id}' already exists (pass allow_merge: true to merge).");
+                }
+                if target.origins.is_empty() && !old.origins.is_empty() {
+                    target.origins = old.origins;
+                }
+                if target.leadership_model.is_empty() && !old.leadership_model.is_empty() {
+                    target.leadership_model = old.leadership_model;
+                }
+                if target.ideology.is_empty() && !old.ideology.is_empty() {
+                    target.ideology = old.ideology;
+                }
+                if target.leader_id.is_none() {
+                    target.leader_id = old.leader_id;
+                }
+                for m in old.members {
+                    if !target
+                        .members
+                        .iter()
+                        .any(|tm| tm.character_id == m.character_id)
+                    {
+                        target.members.push(m);
+                    }
+                }
+                target.territory.extend(old.territory);
+                target.territory = dedupe_slugs(target.territory);
+                for (rk, rv) in old.resources {
+                    target.resources.entry(rk).or_insert(rv);
+                }
+                for (rk, rv) in old.reputation {
+                    target.reputation.entry(rk).or_insert(rv);
+                }
+                for o in old.objectives {
+                    if !target.objectives.iter().any(|to| to.goal_id == o.goal_id) {
+                        target.objectives.push(o);
+                    }
+                }
+                target.internal_conflicts.extend(old.internal_conflicts);
+                target.internal_conflicts = dedupe_trimmed(target.internal_conflicts);
+                target.tags.extend(old.tags);
+                target.tags = dedupe_trimmed(target.tags);
+                db.upsert_faction(&target)?;
+                db.delete_faction(&old_id)?;
+                merged = true;
+            } else {
+                let mut renamed = old;
+                renamed.id = new_id.clone();
+                db.upsert_faction(&renamed)?;
+                db.delete_faction(&old_id)?;
+                merged = false;
+            }
+        }
         other => bail!(
-            "Unsupported register '{other}' for rename_or_merge_entity. Supported: character, place, lore, text, item, attachment."
+            "Unsupported register '{other}' for rename_or_merge_entity. Supported: character, place, lore, text, item, attachment, faction."
         ),
     }
 
@@ -2252,6 +2321,10 @@ pub fn delete_entity(
             let id = slugify(&req.entity_id);
             (id.clone(), db.delete_clock(&id)?)
         }
+        "faction" => {
+            let id = slugify(&req.entity_id);
+            (id.clone(), db.delete_faction(&id)?)
+        }
         other => bail!("Unsupported register '{other}' for delete_entity."),
     };
 
@@ -2512,8 +2585,9 @@ fn normalize_register(raw: &str) -> Result<&'static str> {
         "history" | "histories" | "entity_history" => Ok("history"),
         "attachment" | "attachments" | "doc" | "docs" => Ok("attachment"),
         "clock" | "clocks" => Ok("clock"),
+        "faction" | "factions" | "organization" | "sect" | "guild" => Ok("faction"),
         other => bail!(
-            "Unknown register '{other}'. Expected one of: character, place, lore, text, item, history, attachment, clock."
+            "Unknown register '{other}'. Expected one of: character, place, lore, text, item, history, attachment, clock, faction."
         ),
     }
 }

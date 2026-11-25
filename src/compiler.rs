@@ -100,7 +100,16 @@ pub fn compile_all_docs(db: &CampaignDb, docs_dir: &Path) -> Result<CompileRepor
     for (id, cp) in &characters {
         let relations = db.list_relations_for_entity(id)?;
         let histories = db.list_histories_for_entity(id)?;
-        let md = render_character_markdown(cp, &relations, &histories, &name_map);
+        let progressions = db.list_character_progressions(id)?;
+        let profile = db.get_character_profile(id)?;
+        let md = render_character_markdown(
+            cp,
+            &relations,
+            &histories,
+            &progressions,
+            profile.as_ref(),
+            &name_map,
+        );
         let path = chars_dir.join(format!("{id}.md"));
         fs::write(&path, md).with_context(|| format!("Failed writing {}", path.display()))?;
     }
@@ -109,7 +118,23 @@ pub fn compile_all_docs(db: &CampaignDb, docs_dir: &Path) -> Result<CompileRepor
     for (id, pp) in &places {
         let relations = db.list_relations_for_entity(id)?;
         let histories = db.list_histories_for_entity(id)?;
-        let md = render_place_markdown(pp, &relations, &histories, &name_map);
+        let mut grid_lines = Vec::new();
+        if let Ok(anchors) = db.find_map_cells_for_place(id) {
+            for ac in anchors {
+                if let (Ok(Some(grid)), Ok(all_cells)) =
+                    (db.get_map_grid(&ac.grid_id), db.list_map_cells(&ac.grid_id))
+                {
+                    grid_lines.extend(crate::world_sim::format_grid_neighborhood_lines(
+                        &grid,
+                        &all_cells,
+                        ac.x,
+                        ac.y,
+                        true,
+                    ));
+                }
+            }
+        }
+        let md = render_place_markdown(pp, &relations, &histories, &grid_lines, &name_map);
         let path = places_dir.join(format!("{id}.md"));
         fs::write(&path, md).with_context(|| format!("Failed writing {}", path.display()))?;
     }
@@ -237,6 +262,8 @@ pub fn render_character_markdown(
     proj: &CharacterProjection,
     relations: &[GraphRelation],
     histories: &[EntityHistoryEntry],
+    progressions: &[crate::world_sim::CharacterProgressionTrack],
+    profile: Option<&crate::autonomy::CharacterProfileExt>,
     name_map: &BTreeMap<String, (String, String)>,
 ) -> String {
     let b = &proj.baseline;
@@ -453,6 +480,387 @@ pub fn render_character_markdown(
         let _ = writeln!(out);
     }
 
+    if let Some(prof) = profile {
+        if !prof.avatar.is_empty() {
+            let av = &prof.avatar;
+            let _ = writeln!(out, "### Avatar, Body, Proportions & Wardrobe\n");
+            if !av.appearance_stage.is_empty() {
+                let _ = writeln!(out, "> **Appearance Stage:** {}\n", av.appearance_stage);
+            }
+            if !av.avatar_summary.is_empty() {
+                let _ = writeln!(out, "{}\n", av.avatar_summary);
+            }
+            let mut body_rows: Vec<(&str, String)> = Vec::new();
+            if !av.height.is_empty() || !av.baseline_height.is_empty() {
+                let h_str = if !av.baseline_height.is_empty() && !av.height.is_empty() {
+                    match crate::autonomy::compute_measurement_delta(&av.baseline_height, &av.height)
+                    {
+                        Some(ref d) if d != "—" => {
+                            format!("{} *(baseline: {}, Δ {d})*", av.height, av.baseline_height)
+                        }
+                        _ => av.height.clone(),
+                    }
+                } else if !av.height.is_empty() {
+                    av.height.clone()
+                } else {
+                    format!("{} *(baseline)*", av.baseline_height)
+                };
+                body_rows.push(("Height", h_str));
+            }
+            if !av.weight.is_empty() || !av.baseline_weight.is_empty() {
+                let w_str = if !av.baseline_weight.is_empty() && !av.weight.is_empty() {
+                    match crate::autonomy::compute_measurement_delta(&av.baseline_weight, &av.weight)
+                    {
+                        Some(ref d) if d != "—" => {
+                            format!("{} *(baseline: {}, Δ {d})*", av.weight, av.baseline_weight)
+                        }
+                        _ => av.weight.clone(),
+                    }
+                } else if !av.weight.is_empty() {
+                    av.weight.clone()
+                } else {
+                    format!("{} *(baseline)*", av.baseline_weight)
+                };
+                body_rows.push(("Weight", w_str));
+            }
+            if !av.chronological_age.is_empty() || !av.apparent_age.is_empty() || av.lifespan_years.is_some() {
+                let age_str = format!(
+                    "Chronological: {} | Apparent: {}{}",
+                    non_empty(&av.chronological_age),
+                    non_empty(&av.apparent_age),
+                    av.lifespan_years.map(|y| format!(" | Lifespan: ~{y} yrs")).unwrap_or_default()
+                );
+                body_rows.push(("Age & Lifespan", age_str));
+            }
+            if !av.body_type_or_build.is_empty() { body_rows.push(("Build", av.body_type_or_build.clone())); }
+            if !av.silhouette.is_empty() { body_rows.push(("Silhouette", av.silhouette.clone())); }
+            if !av.posture_and_gait.is_empty() { body_rows.push(("Posture & Gait", av.posture_and_gait.clone())); }
+            if !av.proportions_summary.is_empty() { body_rows.push(("Proportions", av.proportions_summary.clone())); }
+            if !av.clothing_fit.is_empty() { body_rows.push(("Clothing Fit", av.clothing_fit.clone())); }
+            if !av.perceived_change_note.is_empty() { body_rows.push(("Self-Perceived Change", av.perceived_change_note.clone())); }
+            if !av.transformation_trajectory.is_empty() { body_rows.push(("Active Trajectory *(GM Only)*", av.transformation_trajectory.clone())); }
+            if !av.face_shape_and_features.is_empty() { body_rows.push(("Face", av.face_shape_and_features.clone())); }
+            if !av.eyes.is_empty() { body_rows.push(("Eyes", av.eyes.clone())); }
+            if !av.skin_tone_and_texture.is_empty() { body_rows.push(("Skin", av.skin_tone_and_texture.clone())); }
+            if !av.hair.is_empty() { body_rows.push(("Hair", av.hair.clone())); }
+            if !av.facial_hair.is_empty() { body_rows.push(("Facial Hair", av.facial_hair.clone())); }
+            if !av.voice_and_speech.is_empty() { body_rows.push(("Voice & Speech", av.voice_and_speech.clone())); }
+            if !av.scent_or_aura.is_empty() { body_rows.push(("Scent / Aura", av.scent_or_aura.clone())); }
+            if !body_rows.is_empty() {
+                let _ = writeln!(out, "| Aspect | Current Observable Details |");
+                let _ = writeln!(out, "| :--- | :--- |");
+                for (k, v) in body_rows {
+                    let _ = writeln!(out, "| **{k}** | {} |", escape_pipe(&v));
+                }
+                let _ = writeln!(out);
+            }
+            let m_rows = av.measurement_rows();
+            if !m_rows.is_empty() {
+                if !av.baseline_measurements.is_empty() {
+                    let _ = writeln!(out, "**Measurements (Baseline vs. Current):**");
+                    let _ = writeln!(out, "| Measurement | Baseline | Current | Change (Δ) |");
+                    let _ = writeln!(out, "| :--- | :--- | :--- | :--- |");
+                    for (mk, mb, mc, md) in &m_rows {
+                        let _ = writeln!(
+                            out,
+                            "| **{mk}** | {} | {} | {} |",
+                            escape_pipe(non_empty(mb)),
+                            escape_pipe(non_empty(mc)),
+                            escape_pipe(md)
+                        );
+                    }
+                } else {
+                    let _ = writeln!(out, "**Measurements:**");
+                    let _ = writeln!(out, "| Measurement | Current |");
+                    let _ = writeln!(out, "| :--- | :--- |");
+                    for (mk, _, mc, _) in &m_rows {
+                        let _ = writeln!(out, "| **{mk}** | {} |", escape_pipe(non_empty(mc)));
+                    }
+                }
+                let _ = writeln!(out);
+            }
+            if !av.transformation_log.is_empty() {
+                let _ = writeln!(out, "**Transformation Checkpoints:**");
+                let _ = writeln!(out, "| Stage | World Time | Height / Weight | Key Metrics | Summary |");
+                let _ = writeln!(out, "| :--- | :--- | :--- | :--- | :--- |");
+                for cp in &av.transformation_log {
+                    let hw = [cp.height.as_str(), cp.weight.as_str()]
+                        .into_iter()
+                        .filter(|s| !s.trim().is_empty())
+                        .collect::<Vec<_>>()
+                        .join(" / ");
+                    let km = ["Shoulders", "Chest", "Waist", "Hips"]
+                        .into_iter()
+                        .filter_map(|k| cp.measurements.get(k).map(|v| format!("{k} {v}")))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let _ = writeln!(
+                        out,
+                        "| **{}** | {} | {} | {} | {} |",
+                        escape_pipe(non_empty(&cp.stage)),
+                        escape_pipe(non_empty(&cp.world_time)),
+                        escape_pipe(non_empty(&hw)),
+                        escape_pipe(non_empty(&km)),
+                        escape_pipe(non_empty(&cp.summary))
+                    );
+                }
+                let _ = writeln!(out);
+            }
+            if !av.permanent_markers.is_empty() {
+                let _ = writeln!(out, "**Permanent Markers (Scars, Tattoos, Marks):**");
+                for m in &av.permanent_markers {
+                    let _ = writeln!(
+                        out,
+                        "- **{}** ({}): {}{}",
+                        m.kind,
+                        m.location,
+                        m.description,
+                        if m.origin_or_story.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" — *{}*", m.origin_or_story)
+                        }
+                    );
+                }
+                let _ = writeln!(out);
+            }
+            if let Some(o) = av.active_outfit_ref() {
+                let _ = writeln!(
+                    out,
+                    "**Active Outfit:** {} ({}) — {}\n",
+                    o.name,
+                    non_empty(&o.occasion),
+                    if !o.description.is_empty() { &o.description } else { &o.notes }
+                );
+            }
+        }
+
+        if !prof.titles.is_empty() {
+            let _ = writeln!(out, "### Titles & Epithets\n");
+            let _ = writeln!(out, "| Title | Kind | Active | Source | Mechanical Effect |");
+            let _ = writeln!(out, "| :--- | :--- | :---: | :--- | :--- |");
+            for t in &prof.titles {
+                let _ = writeln!(
+                    out,
+                    "| **{}** | `{}` | {} | {} | {} |",
+                    escape_pipe(&t.name),
+                    t.kind,
+                    if t.equipped { "Equipped" } else { "Stored" },
+                    escape_pipe(non_empty(&t.source)),
+                    escape_pipe(non_empty(&t.mechanical_effect))
+                );
+            }
+            let _ = writeln!(out);
+        }
+
+        if !prof.traits_and_perks.is_empty() {
+            let _ = writeln!(out, "### Innate Traits, Physique & Perks\n");
+            let _ = writeln!(out, "| Trait | Category | Grade | Effect |");
+            let _ = writeln!(out, "| :--- | :--- | :--- | :--- |");
+            for tr in &prof.traits_and_perks {
+                let _ = writeln!(
+                    out,
+                    "| **{}** | `{}` | {} | {} |",
+                    escape_pipe(&tr.name),
+                    tr.category,
+                    non_empty(&tr.rank_or_grade),
+                    escape_pipe(if !tr.effect.is_empty() { &tr.effect } else { &tr.notes })
+                );
+            }
+            let _ = writeln!(out);
+        }
+
+        if !prof.stat_training.is_empty() || prof.unspent_stat_points > 0 {
+            let _ = writeln!(
+                out,
+                "### Stat Training XP (Segregated Attribute Conditioning)\n"
+            );
+            if prof.unspent_stat_points > 0 {
+                let _ = writeln!(out, "> **Unspent Stat Points:** `{}`\n", prof.unspent_stat_points);
+            }
+            if !prof.stat_training.is_empty() {
+                let _ = writeln!(out, "| Stat | Training XP | Total XP | Points Gained | Notes |");
+                let _ = writeln!(out, "| :--- | ---: | ---: | ---: | :--- |");
+                for (st, e) in &prof.stat_training {
+                    let _ = writeln!(
+                        out,
+                        "| **{st}** | `{}/{}` | `{}` | `+{}` | {} |",
+                        e.current_xp,
+                        e.xp_to_next,
+                        e.cumulative_xp,
+                        e.points_gained_from_training,
+                        escape_pipe(&e.training_notes)
+                    );
+                }
+                let _ = writeln!(out);
+            }
+        }
+
+        if !prof.jobs.is_empty() {
+            let _ = writeln!(out, "### Jobs, Classes & Occupations (Segregated Job XP)\n");
+            let _ = writeln!(out, "| Job / Class | Role | Level & Rank | Job XP (Stage / Total) | Perks & Notes |");
+            let _ = writeln!(out, "| :--- | :--- | :--- | ---: | :--- |");
+            for j in &prof.jobs {
+                let rank_lbl = if j.tier_or_rank.is_empty() {
+                    format!("Lv {}", j.level)
+                } else {
+                    format!("Lv {} ({})", j.level, j.tier_or_rank)
+                };
+                let mut pn = Vec::new();
+                if !j.perks_and_features.is_empty() {
+                    pn.push(j.perks_and_features.join("; "));
+                }
+                if !j.notes.is_empty() {
+                    pn.push(j.notes.clone());
+                }
+                let _ = writeln!(
+                    out,
+                    "| **{}**{} | `{}` | {} | `{}/{}` (total `{}`) | {} |",
+                    escape_pipe(&j.name),
+                    if j.active { "" } else { " *(Inactive)*" },
+                    j.role,
+                    rank_lbl,
+                    j.current_xp,
+                    j.xp_to_next,
+                    j.cumulative_xp,
+                    escape_pipe(&pn.join(" | "))
+                );
+            }
+            let _ = writeln!(out);
+        }
+
+        if !prof.proficiencies.is_empty() {
+            let _ = writeln!(out, "### Formal Proficiencies\n");
+            let _ = writeln!(out, "| Proficiency | Category | Rank | XP | Bonus | Notes |");
+            let _ = writeln!(out, "| :--- | :--- | :--- | ---: | :--- | :--- |");
+            for p in &prof.proficiencies {
+                let _ = writeln!(
+                    out,
+                    "| **{}** | `{}` | {} | `{}/{}` | {} | {} |",
+                    escape_pipe(&p.name),
+                    p.category,
+                    p.rank,
+                    p.xp,
+                    p.xp_to_next,
+                    non_empty(&p.bonus),
+                    escape_pipe(&p.notes)
+                );
+            }
+            let _ = writeln!(out);
+        }
+
+        if prof.mobility.is_configured() {
+            let m = &prof.mobility;
+            let _ = writeln!(out, "### Mobility, Business Travel & Networking\n");
+            let _ = writeln!(
+                out,
+                "- **Prominent:** `{}` | **Mode:** `{}` | **Status:** `{}` | **Home Base:** {} | **Cadence:** every {}d (stay {}d, `{}`)",
+                m.prominent,
+                m.mobility_mode,
+                m.current_status,
+                m.home_place_id
+                    .as_deref()
+                    .map(|h| link_from_subdir(h, "..", name_map))
+                    .unwrap_or_else(|| "*Unset*".to_string()),
+                m.trip_cadence_days,
+                m.stay_duration_days,
+                m.travel_speed_mode
+            );
+            if !m.preferred_destinations.is_empty() {
+                let stops: Vec<String> = m
+                    .preferred_destinations
+                    .iter()
+                    .map(|d| link_from_subdir(d, "..", name_map))
+                    .collect();
+                let _ = writeln!(out, "- **Business / Networking Circuit:** {}", stops.join(" -> "));
+            }
+            if let Some(ref tr) = m.active_trip {
+                let _ = writeln!(
+                    out,
+                    "- **Active Trip:** {} -> {} (`{}`) | Departed: {} | ETA: {} | Return After: {}{}",
+                    link_from_subdir(&tr.origin_place_id, "..", name_map),
+                    link_from_subdir(&tr.destination_place_id, "..", name_map),
+                    tr.purpose,
+                    tr.departed_at_world_time,
+                    tr.eta_world_time,
+                    tr.return_after_world_time,
+                    if tr.detour_note.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" | *{}*", tr.detour_note)
+                    }
+                );
+            }
+            if !m.recent_engagements.is_empty() {
+                let _ = writeln!(out, "\n**Recent Business & Networking Engagements:**");
+                for eng in m.recent_engagements.iter().rev().take(5) {
+                    let _ = writeln!(
+                        out,
+                        "- [{}] ({}) {}",
+                        eng.world_time, eng.purpose, eng.summary
+                    );
+                }
+            }
+            let _ = writeln!(out);
+        }
+    }
+
+    if !progressions.is_empty() {
+        let _ = writeln!(out, "### Progression, Realms & Parallel Tracks\n");
+        let _ = writeln!(
+            out,
+            "| Track | Kind | Current Stage | XP (Stage / Total) | Mod | Status | Properties & Halt Conditions |"
+        );
+        let _ = writeln!(
+            out,
+            "| :--- | :--- | :--- | ---: | ---: | :--- | :--- |"
+        );
+        for tr in progressions {
+            let status_txt = if tr.at_bottleneck {
+                format!("**BOTTLENECK** ({})", tr.status)
+            } else {
+                tr.status.clone()
+            };
+            let mut details = Vec::new();
+            if !tr.active_properties.is_empty() {
+                details.push(format!("Props: {}", tr.active_properties.join("; ")));
+            }
+            if !tr.halt_conditions.is_empty() {
+                details.push(format!("Halts: {}", tr.halt_conditions.join("; ")));
+            }
+            if let Some(ref src) = tr.source_text_id {
+                let link = link_from_subdir(src, "..", name_map);
+                if !tr.manual_title.is_empty() && !link.contains(&tr.manual_title) {
+                    details.push(format!("Manual: {} ({})", tr.manual_title, link));
+                } else {
+                    details.push(format!("Manual: {link}"));
+                }
+            } else if let Some(ref src_it) = tr.source_item_id {
+                details.push(format!("Manual Item: {}", link_from_subdir(src_it, "..", name_map)));
+            } else if !tr.manual_title.is_empty() {
+                details.push(format!("Manual: {}", tr.manual_title));
+            }
+            if !tr.manual_notes.is_empty() {
+                details.push(format!("Manual Notes: {}", tr.manual_notes));
+            }
+            let _ = writeln!(
+                out,
+                "| **{}** (`{}`) | `{}` | {} | `{}/{}` (total `{}`) | `{:+}` | {} | {} |",
+                tr.name,
+                tr.track_id,
+                tr.track_kind,
+                tr.format_stage(),
+                tr.current_xp,
+                tr.xp_to_next,
+                tr.cumulative_xp,
+                tr.check_modifier,
+                status_txt,
+                escape_pipe(&details.join(" | "))
+            );
+        }
+        let _ = writeln!(out);
+    }
+
     let _ = writeln!(out, "### Active Status Effects & Conditions\n");
     if c.conditions.is_empty() {
         let _ = writeln!(out, "*None active.*\n");
@@ -478,44 +886,138 @@ pub fn render_character_markdown(
     let equipped: Vec<_> = c.equipment.iter().filter(|i| i.equipped).collect();
     let carried: Vec<_> = c.equipment.iter().filter(|i| !i.equipped).collect();
 
+    let format_item_notes_with_fit = |item: &crate::models::Item| -> String {
+        let mut parts = Vec::new();
+        if !item.description.trim().is_empty() {
+            parts.push(item.description.trim().to_string());
+        }
+        if !item.garment_measurements.is_empty() {
+            let mut mkeys: Vec<&String> = item.garment_measurements.keys().collect();
+            mkeys.sort_by(|a, b| {
+                crate::autonomy::measurement_sort_rank(a)
+                    .cmp(&crate::autonomy::measurement_sort_rank(b))
+                    .then_with(|| a.to_lowercase().cmp(&b.to_lowercase()))
+            });
+            let dim_str: Vec<String> = mkeys
+                .into_iter()
+                .map(|k| format!("{k}: {}", item.garment_measurements[k]))
+                .collect();
+            let cut_taper: Vec<&str> = [item.garment_cut.as_str(), item.garment_taper.as_str()]
+                .into_iter()
+                .filter(|s| !s.trim().is_empty())
+                .collect();
+            let cut_lbl = if cut_taper.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", cut_taper.join(" / "))
+            };
+            parts.push(format!("Size{cut_lbl}: {}", dim_str.join(", ")));
+            if let Some(prof) = profile {
+                if let Some(rep) = crate::autonomy::evaluate_garment_fit(item, &prof.avatar) {
+                    parts.push(format!("Live Fit: **{}**", rep.summary));
+                }
+            }
+        }
+        parts.join(" | ")
+    };
+
     let _ = writeln!(out, "### Current Equipment & Inventory\n");
+    if !c.equipment.is_empty() {
+        let mut tag_counts: BTreeMap<String, usize> = BTreeMap::new();
+        for item in &c.equipment {
+            for t in crate::models::normalize_item_tags(&item.tags) {
+                *tag_counts.entry(t).or_insert(0) += 1;
+            }
+        }
+        if !tag_counts.is_empty() {
+            let mut pairs: Vec<(String, usize)> = tag_counts.into_iter().collect();
+            pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            let summary_line: Vec<String> = pairs
+                .into_iter()
+                .map(|(t, n)| format!("`{t}` ({n})"))
+                .collect();
+            let _ = writeln!(out, "> **Inventory Tags:** {}\n", summary_line.join(" · "));
+        }
+    }
     if !equipped.is_empty() {
         let _ = writeln!(out, "**Equipped Gear:**\n");
-        let _ = writeln!(out, "| Slot | Item | Qty | Durability | Notes |");
-        let _ = writeln!(out, "| :--- | :--- | ---: | :--- | :--- |");
+        let _ = writeln!(out, "| Slot | Item | Qty | Tags | Durability | Notes & Live Fit |");
+        let _ = writeln!(out, "| :--- | :--- | ---: | :--- | :--- | :--- |");
         for item in &equipped {
+            let tags = if item.tags.is_empty() {
+                "—".to_string()
+            } else {
+                item.tags.join(", ")
+            };
+            let notes_txt = format_item_notes_with_fit(item);
             let _ = writeln!(
                 out,
-                "| {} | **{}** | {} | {} | {} |",
+                "| {} | **{}** | {} | {} | {} | {} |",
                 item.slot.as_deref().unwrap_or("Equipped"),
                 item.name,
                 item.quantity,
+                escape_pipe(&tags),
                 item.durability.as_deref().unwrap_or("—"),
-                escape_pipe(&item.description)
+                escape_pipe(&notes_txt)
             );
         }
         let _ = writeln!(out);
     }
     if !carried.is_empty() {
         let _ = writeln!(out, "**Carried Inventory:**\n");
-        let _ = writeln!(out, "| Item | Qty | Tags | Notes |");
-        let _ = writeln!(out, "| :--- | ---: | :--- | :--- |");
-        for item in &carried {
-            let tags = if item.tags.is_empty() {
-                "—".to_string()
-            } else {
-                item.tags.join(", ")
-            };
-            let _ = writeln!(
-                out,
-                "| **{}** | {} | {} | {} |",
-                item.name,
-                item.quantity,
-                tags,
-                escape_pipe(&item.description)
-            );
+        if carried.len() > 6 {
+            let mut grouped: BTreeMap<String, Vec<&crate::models::Item>> = BTreeMap::new();
+            for item in &carried {
+                let grp = crate::models::primary_item_group(
+                    &item.tags,
+                    item.slot.as_deref(),
+                    &item.name,
+                );
+                grouped.entry(grp).or_default().push(item);
+            }
+            for (grp, list) in grouped {
+                let _ = writeln!(out, "#### {grp} ({})\n", list.len());
+                let _ = writeln!(out, "| Item | Qty | Tags | Notes & Sizing |");
+                let _ = writeln!(out, "| :--- | ---: | :--- | :--- |");
+                for item in list {
+                    let tags = if item.tags.is_empty() {
+                        "—".to_string()
+                    } else {
+                        item.tags.join(", ")
+                    };
+                    let notes_txt = format_item_notes_with_fit(item);
+                    let _ = writeln!(
+                        out,
+                        "| **{}** | {} | {} | {} |",
+                        item.name,
+                        item.quantity,
+                        escape_pipe(&tags),
+                        escape_pipe(&notes_txt)
+                    );
+                }
+                let _ = writeln!(out);
+            }
+        } else {
+            let _ = writeln!(out, "| Item | Qty | Tags | Notes & Sizing |");
+            let _ = writeln!(out, "| :--- | ---: | :--- | :--- |");
+            for item in &carried {
+                let tags = if item.tags.is_empty() {
+                    "—".to_string()
+                } else {
+                    item.tags.join(", ")
+                };
+                let notes_txt = format_item_notes_with_fit(item);
+                let _ = writeln!(
+                    out,
+                    "| **{}** | {} | {} | {} |",
+                    item.name,
+                    item.quantity,
+                    escape_pipe(&tags),
+                    escape_pipe(&notes_txt)
+                );
+            }
+            let _ = writeln!(out);
         }
-        let _ = writeln!(out);
     }
     if equipped.is_empty() && carried.is_empty() {
         let _ = writeln!(out, "*No equipment or carried items.*\n");
@@ -523,15 +1025,16 @@ pub fn render_character_markdown(
 
     if !c.skills.is_empty() {
         let _ = writeln!(out, "### Current Skills\n");
-        let _ = writeln!(out, "| Skill | Rank | Category | Modifier | Description |");
-        let _ = writeln!(out, "| :--- | :--- | :--- | :--- | :--- |");
+        let _ = writeln!(out, "| Skill | Stat | Rank | XP | Modifier | Description |");
+        let _ = writeln!(out, "| :--- | :--- | :--- | ---: | :--- | :--- |");
         for s in &c.skills {
             let _ = writeln!(
                 out,
-                "| **{}** | {} | {} | {} | {} |",
+                "| **{}** | {} | {} | {} | {} | {} |",
                 s.name,
+                s.governing_stat.as_deref().unwrap_or("—"),
                 s.rank,
-                non_empty(&s.category),
+                s.xp,
                 s.modifier.as_deref().unwrap_or("—"),
                 escape_pipe(&s.description)
             );
@@ -541,23 +1044,43 @@ pub fn render_character_markdown(
 
     if !c.techniques.is_empty() {
         let _ = writeln!(out, "### Current Techniques & Abilities\n");
-        let _ = writeln!(out, "| Technique | Tier | Cost | Cooldown | Mastery | Effect |");
-        let _ = writeln!(out, "| :--- | :--- | :--- | :--- | :--- | :--- |");
+        let _ = writeln!(out, "| Technique | Tier | Cost | Cooldown | Mastery | Effect | Manual & Cultivation Notes |");
+        let _ = writeln!(out, "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |");
         for t in &c.techniques {
             let eff = if !t.effect.is_empty() {
                 &t.effect
             } else {
                 &t.description
             };
+            let mut mparts = Vec::new();
+            if let Some(ref src) = t.source_text_id {
+                mparts.push(format!("Manual: {}", link_from_subdir(src, "..", name_map)));
+            } else if let Some(ref src_it) = t.source_item_id {
+                mparts.push(format!("Manual: {}", link_from_subdir(src_it, "..", name_map)));
+            } else if !t.manual_title.is_empty() {
+                mparts.push(format!("Manual: {}", t.manual_title));
+            }
+            if let Some(ref pt) = t.progression_track_id {
+                mparts.push(format!("Track: `{pt}`"));
+            }
+            if !t.manual_notes.is_empty() {
+                mparts.push(format!("Notes: {}", t.manual_notes));
+            }
+            let manual_col = if mparts.is_empty() {
+                "—".to_string()
+            } else {
+                escape_pipe(&mparts.join(" | "))
+            };
             let _ = writeln!(
                 out,
-                "| **{}** | {} | {} | {} | {} | {} |",
+                "| **{}** | {} | {} | {} | {} | {} | {} |",
                 t.name,
                 non_empty(&t.tier),
                 non_empty(&t.cost),
                 non_empty(&t.cooldown),
                 non_empty(&t.mastery),
-                escape_pipe(eff)
+                escape_pipe(eff),
+                manual_col
             );
         }
         let _ = writeln!(out);
@@ -642,6 +1165,7 @@ pub fn render_place_markdown(
     proj: &PlaceProjection,
     relations: &[GraphRelation],
     histories: &[EntityHistoryEntry],
+    grid_lines: &[String],
     name_map: &BTreeMap<String, (String, String)>,
 ) -> String {
     let b = &proj.baseline;
@@ -817,6 +1341,14 @@ pub fn render_place_markdown(
                 r.status,
                 escape_pipe(&r.notes)
             );
+        }
+        let _ = writeln!(out);
+    }
+
+    if !grid_lines.is_empty() {
+        let _ = writeln!(out, "### Map Grid Position & Neighbors\n");
+        for line in grid_lines {
+            let _ = writeln!(out, "{line}");
         }
         let _ = writeln!(out);
     }
@@ -1189,6 +1721,27 @@ pub fn render_item_markdown(
             "| **Readable Text / Contents** | {} |",
             link_from_subdir(tid, "..", name_map)
         );
+    }
+    if !it.garment_cut.is_empty() || !it.garment_taper.is_empty() {
+        let _ = writeln!(
+            out,
+            "| **Garment Cut / Taper** | {} / {} |",
+            non_empty(&it.garment_cut),
+            non_empty(&it.garment_taper)
+        );
+    }
+    if !it.garment_measurements.is_empty() {
+        let mut mkeys: Vec<&String> = it.garment_measurements.keys().collect();
+        mkeys.sort_by(|a, b| {
+            crate::autonomy::measurement_sort_rank(a)
+                .cmp(&crate::autonomy::measurement_sort_rank(b))
+                .then_with(|| a.to_lowercase().cmp(&b.to_lowercase()))
+        });
+        let m_str: Vec<String> = mkeys
+            .into_iter()
+            .map(|k| format!("{k}: {}", it.garment_measurements[k]))
+            .collect();
+        let _ = writeln!(out, "| **Garment Dimensions** | {} |", escape_pipe(&m_str.join(", ")));
     }
     let _ = writeln!(out);
 
@@ -1781,6 +2334,7 @@ pub fn event_kind_label(p: &EventPayload) -> &'static str {
         EventPayload::ItemAcquired { .. } => "+Item",
         EventPayload::ItemRemoved { .. } => "-Item",
         EventPayload::ItemEquipped { .. } => "Equipment",
+        EventPayload::ItemTagsUpdated { .. } => "Item Tags",
         EventPayload::SkillUpdated { .. } => "Skill",
         EventPayload::TechniqueUpdated { .. } => "Technique",
         EventPayload::GoalUpdated { .. } => "Goal",

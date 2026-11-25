@@ -379,6 +379,105 @@ impl OAuthStore {
         redirect_resp(&loc)
     }
 
+    /// Direct Web GM Studio Sign-In (`POST /oauth/ui-login`):
+    /// Exchanges the GM OAuth Passphrase (or optional static bearer token) for a 24-hour Bearer
+    /// access token so the embedded Web GM Studio SPA works seamlessly even when `--oauth` is enabled.
+    pub fn handle_ui_login(
+        &mut self,
+        body: &[u8],
+        static_bearer: Option<&str>,
+    ) -> OAuthHttpResponse {
+        if let Some(until) = self.auth_locked_until {
+            let now = Instant::now();
+            if until > now {
+                let secs = (until - now).as_secs().max(1);
+                return OAuthHttpResponse {
+                    status: 429,
+                    status_text: "Too Many Requests",
+                    content_type: "application/json; charset=utf-8".to_string(),
+                    body: json!({
+                        "error": format!("Too many failed passphrase attempts. Try again in {secs}s.")
+                    })
+                    .to_string()
+                    .into_bytes(),
+                    extra_headers: vec![("Retry-After".to_string(), secs.to_string())],
+                };
+            } else {
+                self.auth_locked_until = None;
+                self.failed_auth_attempts = 0;
+            }
+        }
+
+        let passphrase = if let Ok(v) = serde_json::from_slice::<Value>(body) {
+            v.get("passphrase")
+                .or_else(|| v.get("token"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        } else {
+            let form = parse_form_urlencoded(&String::from_utf8_lossy(body));
+            form.get("passphrase")
+                .or_else(|| form.get("token"))
+                .cloned()
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        };
+
+        let matches_admin = constant_time_eq(passphrase.as_bytes(), self.admin_secret.as_bytes());
+        let matches_bearer = static_bearer
+            .map(|b| constant_time_eq(passphrase.as_bytes(), b.as_bytes()))
+            .unwrap_or(false);
+
+        if passphrase.is_empty() || (!matches_admin && !matches_bearer) {
+            self.failed_auth_attempts += 1;
+            if self.failed_auth_attempts >= 5 {
+                self.auth_locked_until = Some(Instant::now() + Duration::from_secs(60));
+                return OAuthHttpResponse {
+                    status: 429,
+                    status_text: "Too Many Requests",
+                    content_type: "application/json; charset=utf-8".to_string(),
+                    body: json!({
+                        "error": "Invalid passphrase. Locked for 60 seconds after 5 failed attempts."
+                    })
+                    .to_string()
+                    .into_bytes(),
+                    extra_headers: vec![("Retry-After".to_string(), "60".to_string())],
+                };
+            }
+            return json_resp(
+                403,
+                "Forbidden",
+                json!({ "error": "Invalid GM OAuth passphrase. Check your Chronicle startup output or .chronicle-serve.env." }),
+            );
+        }
+
+        self.failed_auth_attempts = 0;
+        self.auth_locked_until = None;
+
+        let now = Instant::now();
+        self.access_tokens.retain(|_, v| v.expires_at > now);
+        let access_token = Self::generate_random_secret("chr_at_");
+        self.access_tokens.insert(
+            access_token.clone(),
+            TokenRecord {
+                client_id: "chronicle-web-ui".to_string(),
+                scope: "mcp:tools mcp:resources".to_string(),
+                expires_at: now + Duration::from_secs(86400),
+            },
+        );
+        json_resp(
+            200,
+            "OK",
+            json!({
+                "access_token": access_token,
+                "token_type": "Bearer",
+                "expires_in": 86400
+            }),
+        )
+    }
+
     /// Token Exchange & Refresh (`POST /oauth/token`)
     pub fn handle_token(
         &mut self,

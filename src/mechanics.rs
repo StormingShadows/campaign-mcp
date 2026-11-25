@@ -54,11 +54,108 @@ pub struct RulesetProfile {
     /// Optional mapping of condition severity/kind ("minor", "moderate", "severe", "critical", "buff") -> numeric modifier.
     #[serde(default = "default_condition_penalties")]
     pub condition_penalties: BTreeMap<String, i64>,
+    /// How character stat values convert to check modifiers:
+    /// - "auto_dnd5e" (default): scores >= 6 use D&D formula floor((score-10)/2); small values (-5..=5) used directly.
+    /// - "dnd5e": always applies floor((score-10)/2).
+    /// - "direct": always uses raw stat value directly.
+    #[serde(default = "default_stat_modifier_mode")]
+    pub stat_modifier_mode: String,
+    /// Built-in + custom campaign skill table mapping skill slug -> governing stat & metadata.
+    #[serde(default = "default_dnd5e_skill_table")]
+    pub skill_table: BTreeMap<String, SkillDefinition>,
+    /// Progressive Skill XP thresholds driving automatic rank/proficiency increases from activities.
+    #[serde(default = "default_skill_xp_curve")]
+    pub xp_curve: Vec<SkillXpThreshold>,
+    /// Grounded DC difficulty rubric ("trivial": 5, "easy": 10, "moderate": 15, "hard": 20, "very_hard": 25, "nearly_impossible": 30).
+    #[serde(default = "default_dc_rubric")]
+    pub dc_rubric: BTreeMap<String, i64>,
+    /// Standard situational DC modifiers ("rushed": +2, "proper_tools": -2, "darkness": +3, etc.).
+    #[serde(default = "default_dc_factors")]
+    pub dc_factors: BTreeMap<String, i64>,
+    /// Automatically award difficulty-scaled Skill XP on live resolve_check calls (default: true).
+    #[serde(default = "default_true")]
+    pub auto_skill_xp: bool,
+    /// Automatically trickle non-trivial check Skill XP into governing Stat Training XP & matching active Job XP (default: true).
+    #[serde(default = "default_true")]
+    pub auto_stat_and_job_xp: bool,
+    /// When true, reaching a Stat Training XP threshold directly increments the stat by +1; when false (default), grants +1 unspent_stat_points & raises a signal.
+    #[serde(default)]
+    pub auto_apply_stat_points: bool,
+    /// Multi-denomination currency conversion rates (relative to smallest unit within the same currency family).
+    #[serde(default = "default_currency_rates")]
+    pub currency_rates: BTreeMap<String, i64>,
     /// Whether resolve_check auto-hydrates character stats/skills/conditions/items & place weather by default.
     #[serde(default = "default_true")]
     pub auto_hydrate: bool,
     #[serde(default = "default_version")]
     pub version: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillDefinition {
+    pub name: String,
+    pub governing_stat: String,
+    #[serde(default)]
+    pub category: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillXpThreshold {
+    pub rank: String,
+    pub min_xp: u64,
+    pub bonus: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum DcFactorInput {
+    Named(String),
+    Custom {
+        label: String,
+        delta: i64,
+        #[serde(default)]
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DcFactorApplied {
+    pub label: String,
+    pub delta: i64,
+    #[serde(default)]
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DcBreakdown {
+    pub base_tier: String,
+    pub base_dc: i64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub factors: Vec<DcFactorApplied>,
+    pub final_dc: i64,
+    pub rationale: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillProgressionOutcome {
+    pub character_id: String,
+    pub skill_name: String,
+    pub xp_gained: u64,
+    pub total_xp: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub xp_to_next_rank: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_rank: Option<String>,
+    pub old_rank: String,
+    pub new_rank: String,
+    pub new_bonus: i64,
+    pub leveled_up: bool,
+}
+
+fn default_stat_modifier_mode() -> String {
+    "auto_dnd5e".to_string()
 }
 
 fn default_resolution_mode() -> String {
@@ -79,15 +176,99 @@ fn default_version() -> u32 {
 
 pub fn default_rank_bonuses() -> BTreeMap<String, i64> {
     let mut m = BTreeMap::new();
-    m.insert("untrained".to_string(), -2);
+    m.insert("untrained".to_string(), 0);
+    m.insert("half_proficient".to_string(), 1);
     m.insert("novice".to_string(), 1);
+    m.insert("proficient".to_string(), 2);
+    m.insert("trained".to_string(), 2);
     m.insert("apprentice".to_string(), 2);
     m.insert("journeyman".to_string(), 3);
+    m.insert("veteran".to_string(), 3);
     m.insert("adept".to_string(), 4);
+    m.insert("expertise".to_string(), 4);
     m.insert("expert".to_string(), 5);
     m.insert("master".to_string(), 6);
     m.insert("grandmaster".to_string(), 8);
     m.insert("legendary".to_string(), 10);
+    m
+}
+
+pub fn default_dnd5e_skill_table() -> BTreeMap<String, SkillDefinition> {
+    let defs = [
+        ("Athletics", "Strength", "Physical", "Climbing, jumping, swimming, grappling, raw physical exertion"),
+        ("Acrobatics", "Dexterity", "Physical", "Balance, tumbling, agility, escaping restraints"),
+        ("Sleight of Hand", "Dexterity", "Physical", "Pickpocketing, concealment, fine manual dexterity"),
+        ("Stealth", "Dexterity", "Physical", "Hiding, moving silently, avoiding detection"),
+        ("Arcana", "Intelligence", "Lore", "Magic, runes, ley lines, spiritual formations, arcane lore"),
+        ("History", "Intelligence", "Lore", "Historical events, lineages, sects, kingdoms, ancient records"),
+        ("Investigation", "Intelligence", "Mental", "Clue deduction, searching, analyzing mechanisms and anomalies"),
+        ("Nature", "Intelligence", "Lore", "Terrain, plants, herbs, weather, beasts, natural phenomena"),
+        ("Religion", "Intelligence", "Lore", "Deities, rites, sacred traditions, cosmology, cults"),
+        ("Animal Handling", "Wisdom", "Wilderness", "Calming, riding, controlling mounts and beasts"),
+        ("Insight", "Wisdom", "Social", "Reading intentions, detecting lies, sensing mood shifts"),
+        ("Medicine", "Wisdom", "Craft", "Stabilizing wounds, diagnosing ailments, herbal treatment"),
+        ("Perception", "Wisdom", "Awareness", "Spotting hazards, hidden details, ambushes, faint sounds"),
+        ("Survival", "Wisdom", "Wilderness", "Tracking, foraging, navigating wilds, reading weather"),
+        ("Deception", "Charisma", "Social", "Bluffing, disguising intent, misleading others"),
+        ("Intimidation", "Charisma", "Social", "Coercion, commanding presence, threat display"),
+        ("Performance", "Charisma", "Social", "Music, storytelling, acting, public presentation"),
+        ("Persuasion", "Charisma", "Social", "Diplomacy, negotiation, goodwill, earnest appeal"),
+    ];
+    let mut m = BTreeMap::new();
+    for (name, stat, cat, desc) in defs {
+        m.insert(
+            slugify(name),
+            SkillDefinition {
+                name: name.to_string(),
+                governing_stat: stat.to_string(),
+                category: cat.to_string(),
+                description: desc.to_string(),
+            },
+        );
+    }
+    m
+}
+
+pub fn default_skill_xp_curve() -> Vec<SkillXpThreshold> {
+    vec![
+        SkillXpThreshold { rank: "Untrained".into(), min_xp: 0, bonus: 0 },
+        SkillXpThreshold { rank: "Novice".into(), min_xp: 50, bonus: 1 },
+        SkillXpThreshold { rank: "Apprentice".into(), min_xp: 150, bonus: 2 },
+        SkillXpThreshold { rank: "Journeyman".into(), min_xp: 350, bonus: 3 },
+        SkillXpThreshold { rank: "Adept".into(), min_xp: 700, bonus: 4 },
+        SkillXpThreshold { rank: "Expert".into(), min_xp: 1200, bonus: 5 },
+        SkillXpThreshold { rank: "Master".into(), min_xp: 2000, bonus: 6 },
+        SkillXpThreshold { rank: "Grandmaster".into(), min_xp: 3500, bonus: 8 },
+        SkillXpThreshold { rank: "Legendary".into(), min_xp: 6000, bonus: 10 },
+    ]
+}
+
+pub fn default_dc_rubric() -> BTreeMap<String, i64> {
+    let mut m = BTreeMap::new();
+    m.insert("trivial".to_string(), 5);
+    m.insert("easy".to_string(), 10);
+    m.insert("moderate".to_string(), 15);
+    m.insert("hard".to_string(), 20);
+    m.insert("very_hard".to_string(), 25);
+    m.insert("nearly_impossible".to_string(), 30);
+    m
+}
+
+pub fn default_dc_factors() -> BTreeMap<String, i64> {
+    let mut m = BTreeMap::new();
+    m.insert("rushed".to_string(), 2);
+    m.insert("improvised_tools".to_string(), 2);
+    m.insert("no_tools".to_string(), 3);
+    m.insert("poor_visibility".to_string(), 2);
+    m.insert("darkness".to_string(), 3);
+    m.insert("unfavorable_terrain".to_string(), 2);
+    m.insert("hostile_opposition".to_string(), 3);
+    m.insert("distracted".to_string(), 2);
+    m.insert("proper_tools".to_string(), -2);
+    m.insert("masterwork_tools".to_string(), -3);
+    m.insert("assisted".to_string(), -2);
+    m.insert("prepared".to_string(), -2);
+    m.insert("ideal_conditions".to_string(), -2);
     m
 }
 
@@ -103,12 +284,118 @@ pub fn default_condition_penalties() -> BTreeMap<String, i64> {
     m
 }
 
+pub fn default_currency_rates() -> BTreeMap<String, i64> {
+    let mut m = BTreeMap::new();
+    // Xianxia / East Asian bullion & cash family
+    m.insert("copper_cash".to_string(), 1);
+    m.insert("silver_mace".to_string(), 100);
+    m.insert("silver_tael".to_string(), 1000);
+    m.insert("gold_tael".to_string(), 100000);
+    m.insert("low_spirit_stone".to_string(), 100000);
+    m.insert("spirit_stone".to_string(), 100000);
+    m.insert("mid_spirit_stone".to_string(), 10000000);
+    m.insert("high_spirit_stone".to_string(), 1000000000);
+    // Classic Fantasy / D&D coinage family
+    m.insert("cp".to_string(), 1);
+    m.insert("copper".to_string(), 1);
+    m.insert("sp".to_string(), 10);
+    m.insert("silver".to_string(), 10);
+    m.insert("ep".to_string(), 50);
+    m.insert("gp".to_string(), 100);
+    m.insert("gold".to_string(), 100);
+    m.insert("pp".to_string(), 1000);
+    m.insert("platinum".to_string(), 1000);
+    // Sci-Fi / Modern credit family
+    m.insert("credit".to_string(), 1);
+    m.insert("credits".to_string(), 1);
+    m.insert("kilocredit".to_string(), 1000);
+    m
+}
+
+/// Groups currencies into non-interchangeable families so D&D `gp` never auto-converts into Xianxia `copper_cash`,
+/// while custom user-added currencies in `currency_rates` share the `"custom"` family.
+pub fn currency_family(curr: &str) -> &'static str {
+    match curr.trim().to_ascii_lowercase().as_str() {
+        "copper_cash"
+        | "silver_mace"
+        | "silver_tael"
+        | "gold_tael"
+        | "low_spirit_stone"
+        | "spirit_stone"
+        | "mid_spirit_stone"
+        | "high_spirit_stone" => "xianxia",
+        "cp" | "copper" | "sp" | "silver" | "ep" | "gp" | "gold" | "pp" | "platinum" => "fantasy",
+        "credit" | "credits" | "kilocredit" => "scifi",
+        _ => "custom",
+    }
+}
+
+impl RulesetProfile {
+    /// Builds a named ruleset preset ("dnd5e", "cultivation_d20", "pbta_2d6", "brp_d100").
+    pub fn from_preset(preset: &str, custom_id: Option<&str>) -> Result<Self> {
+        let mut base = Self::default();
+        match preset.trim().to_lowercase().as_str() {
+            "dnd5e" | "5e" | "d20" => {
+                base.id = custom_id.unwrap_or("default").to_string();
+                base.name = "D20 / D&D 5e Ability & Skill Progression".to_string();
+                base.description = "1d20 + ability modifier floor((score-10)/2) + growing skill proficiency vs grounded DC rubric (5/10/15/20/25/30); totals naturally exceed 20.".to_string();
+                base.stat_modifier_mode = "dnd5e".to_string();
+                base.auto_skill_xp = true;
+            }
+            "cultivation_d20" | "xianxia_d20" => {
+                base.id = custom_id.unwrap_or("default").to_string();
+                base.name = "Cultivation D20 (Mortal-to-Immortal)".to_string();
+                base.description = "1d20 + ability modifier + progressive skill proficiency + realm/technique modifiers vs grounded DC rubric.".to_string();
+                base.stat_modifier_mode = "auto_dnd5e".to_string();
+                base.auto_skill_xp = true;
+                for (name, stat, cat, desc) in [
+                    ("Qi Sense", "Wisdom", "Cultivation", "Perceiving spiritual qi, arrays, and aura fluctuations"),
+                    ("Alchemy", "Intelligence", "Craft", "Refining pills, elixirs, and spiritual herbs"),
+                    ("Formation Craft", "Intelligence", "Craft", "Designing, reading, and disrupting spiritual arrays"),
+                    ("Body Tempering", "Constitution", "Cultivation", "Enduring physical strain, toxins, and meridian tempering"),
+                ] {
+                    base.skill_table.insert(
+                        slugify(name),
+                        SkillDefinition {
+                            name: name.to_string(),
+                            governing_stat: stat.to_string(),
+                            category: cat.to_string(),
+                            description: desc.to_string(),
+                        },
+                    );
+                }
+            }
+            "pbta_2d6" | "pbta" => {
+                base.id = custom_id.unwrap_or("pbta-2d6").to_string();
+                base.name = "Powered by the Apocalypse (2d6)".to_string();
+                base.base_dice = "2d6".to_string();
+                base.advantage_dice = Some("3d6kh2".to_string());
+                base.disadvantage_dice = Some("3d6kl2".to_string());
+                base.pbta_full_success_at = Some(10);
+                base.pbta_partial_success_at = Some(7);
+                base.stat_modifier_mode = "direct".to_string();
+            }
+            "brp_d100" | "d100" => {
+                base.id = custom_id.unwrap_or("brp-d100").to_string();
+                base.name = "Percentile Roll-Under (1d100)".to_string();
+                base.resolution_mode = "roll_under".to_string();
+                base.base_dice = "1d100".to_string();
+                base.crit_success_natural = Some(1);
+                base.crit_failure_natural = Some(100);
+                base.stat_modifier_mode = "direct".to_string();
+            }
+            other => bail!("Unknown ruleset preset '{other}'. Supported: dnd5e, cultivation_d20, pbta_2d6, brp_d100"),
+        }
+        Ok(base)
+    }
+}
+
 impl Default for RulesetProfile {
     fn default() -> Self {
         Self {
             id: "default".to_string(),
             name: "Default System-Agnostic Check (1d20 Roll-Over)".to_string(),
-            description: "Built-in fallback profile: 1d20 + modifiers vs difficulty; natural 20/1 and +/-10 margin crits.".to_string(),
+            description: "1d20 + ability modifier + skill proficiency + situational modifiers vs grounded DC rubric (5/10/15/20/25/30); totals naturally exceed 20.".to_string(),
             resolution_mode: "roll_over".to_string(),
             base_dice: "1d20".to_string(),
             advantage_dice: Some("2d20kh1".to_string()),
@@ -122,6 +409,15 @@ impl Default for RulesetProfile {
             pool_success_threshold: None,
             rank_bonuses: default_rank_bonuses(),
             condition_penalties: default_condition_penalties(),
+            stat_modifier_mode: default_stat_modifier_mode(),
+            skill_table: default_dnd5e_skill_table(),
+            xp_curve: default_skill_xp_curve(),
+            dc_rubric: default_dc_rubric(),
+            dc_factors: default_dc_factors(),
+            auto_skill_xp: true,
+            auto_stat_and_job_xp: true,
+            auto_apply_stat_points: false,
+            currency_rates: default_currency_rates(),
             auto_hydrate: true,
             version: 1,
         }
@@ -151,9 +447,19 @@ pub struct CheckRequest {
     pub skill: Option<String>,
     #[serde(default)]
     pub technique: Option<String>,
+    /// Optional progression track ID/name (e.g. "qi-cultivation", "body-tempering", "character-level") whose modifier applies to this check.
+    #[serde(default)]
+    pub progression_track: Option<String>,
     #[serde(default)]
     pub equipment: Vec<String>,
+    #[serde(default)]
     pub difficulty: i64,
+    /// Optional grounded difficulty tier from RulesetProfile.dc_rubric (e.g. "trivial", "easy", "moderate", "hard", "very_hard", "nearly_impossible").
+    #[serde(default)]
+    pub dc_tier: Option<String>,
+    /// Optional situational DC factors (named keys like "rushed", "proper_tools" or custom { label, delta, reason }).
+    #[serde(default)]
+    pub dc_factors: Vec<DcFactorInput>,
     #[serde(default)]
     pub modifier: i64,
     #[serde(default)]
@@ -166,6 +472,9 @@ pub struct CheckRequest {
     pub dice_override: Option<String>,
     #[serde(default)]
     pub auto_hydrate: Option<bool>,
+    /// Override whether a live skill check awards difficulty-scaled Skill XP (defaults to profile.auto_skill_xp).
+    #[serde(default)]
+    pub award_skill_xp: Option<bool>,
     #[serde(default)]
     pub stakes: String,
     #[serde(default)]
@@ -213,8 +522,14 @@ pub struct CheckResolution {
     pub roll: i64,
     pub modifiers: Vec<ModifierSource>,
     pub modifier: i64,
+    #[serde(default)]
+    pub passive_score: i64,
+    #[serde(default)]
+    pub routine_auto_pass: bool,
     pub total: i64,
     pub difficulty: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dc_breakdown: Option<DcBreakdown>,
     pub margin: i64,
     pub outcome: String,
     pub degree: String,
@@ -224,6 +539,12 @@ pub struct CheckResolution {
     pub consequences: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_progression: Option<SkillProgressionOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stat_xp_gained: Option<(String, u64)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub job_xp_gained: Vec<(String, u64)>,
     pub dry_run: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub odds_preview: Option<OddsPreview>,
@@ -242,6 +563,9 @@ pub struct ContestParticipantInput {
     pub skill: Option<String>,
     #[serde(default)]
     pub technique: Option<String>,
+    /// Optional progression track ID/name (e.g. "qi-cultivation", "body-tempering", "character-level") whose modifier applies to this check.
+    #[serde(default)]
+    pub progression_track: Option<String>,
     #[serde(default)]
     pub equipment: Vec<String>,
     #[serde(default)]
@@ -323,7 +647,48 @@ pub struct ContestResolution {
     pub event_id: Option<i64>,
 }
 
+/// Checks whether a condition's optional `[scope: tok1, tok2, ...]` directive matches the active check haystack.
+/// Conditions without a `[scope: ...]` tag apply globally (backward-compatible with wounds/exhaustion).
+pub fn condition_matches_scope(notes: &str, check_haystack_lower: &str) -> bool {
+    let lower = notes.to_lowercase();
+    let Some(start) = lower.find("[scope:") else {
+        return true;
+    };
+    let rest = &lower[start + "[scope:".len()..];
+    let Some(end) = rest.find(']') else {
+        return true;
+    };
+    let inner = &rest[..end];
+    let tokens: Vec<&str> = inner
+        .split(|c| c == ',' || c == ';' || c == '|')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if tokens.is_empty() {
+        return true;
+    }
+    tokens.iter().any(|tok| check_haystack_lower.contains(tok))
+}
+
+#[cfg(test)]
+mod scoped_condition_tests {
+    use super::condition_matches_scope;
+
+    #[test]
+    fn test_scoped_condition_matching() {
+        assert!(condition_matches_scope("Broken ribs (-2)", "carpentry dexterity"));
+        let notes = "-2 [scope: strength, brawling, sprint, initiative] Heavy sluggish bursts";
+        assert!(condition_matches_scope(notes, "shove beam rough close-quarters brawling stat:strength"));
+        assert!(condition_matches_scope(notes, "sprint across courtyard"));
+        assert!(!condition_matches_scope(notes, "cut mortise joint carpentry stat:dexterity"));
+        assert_eq!(super::extract_signed_modifier("Chest +12 cm, Waist +14 cm"), None);
+        assert_eq!(super::extract_signed_modifier("-2 [scope: strength] Heavy bursts"), Some(-2));
+        assert_eq!(super::extract_signed_modifier("Weight -1.5 kg, +10 XP"), None);
+    }
+}
+
 /// Extracts a signed integer modifier like `+2`, `-3`, `+1 to climbing` from free-text fields.
+/// Ignores dice expressions (`+1d6`) and physical measurement units (`+12 cm`, `-1.5 kg`, `+20%`).
 pub fn extract_signed_modifier(text: &str) -> Option<i64> {
     let bytes = text.as_bytes();
     let mut i = 0;
@@ -336,8 +701,24 @@ pub fn extract_signed_modifier(text: &str) -> Option<i64> {
                 end += 1;
             }
             if end > start {
-                // Ensure not part of a dice expression like "+1d6"
-                if end < bytes.len() && (bytes[end] == b'd' || bytes[end] == b'D') {
+                // Ensure not part of a dice expression like "+1d6" or decimal measure like "-1.5"
+                if end < bytes.len()
+                    && (bytes[end] == b'd' || bytes[end] == b'D' || bytes[end] == b'.' || bytes[end] == b'%')
+                {
+                    i = end;
+                    continue;
+                }
+                // Skip physical measurement units immediately following the number (e.g. "+12 cm", "-2 kg")
+                let after = text[end..].trim_start();
+                let next_tok = after
+                    .split(|c: char| !c.is_ascii_alphabetic())
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if matches!(
+                    next_tok.as_str(),
+                    "cm" | "mm" | "km" | "m" | "kg" | "g" | "lb" | "lbs" | "in" | "ft" | "xp"
+                ) {
                     i = end;
                     continue;
                 }
@@ -360,16 +741,275 @@ pub struct HydrationOutcome {
     pub missing_refs: Vec<String>,
 }
 
+/// Converts a raw character stat score into a d20 modifier according to `stat_modifier_mode`:
+/// - `"dnd5e"`: always applies `floor((score - 10) / 2)`
+/// - `"direct"`: always uses raw score directly
+/// - `"auto_dnd5e"` (default): scores >= 6 use `floor((score - 10) / 2)`; small values (-5..=5) used directly
+pub fn compute_stat_modifier(mode: &str, raw: i64) -> (i64, String) {
+    match mode.trim().to_lowercase().as_str() {
+        "direct" => (raw, format!("raw {raw:+}")),
+        "dnd5e" | "5e" => {
+            let m = (raw - 10).div_euclid(2);
+            (m, format!("score {raw} -> {m:+} via floor((score-10)/2)"))
+        }
+        _ => {
+            if raw >= 6 {
+                let m = (raw - 10).div_euclid(2);
+                (m, format!("score {raw} -> {m:+} via floor((score-10)/2)"))
+            } else {
+                (raw, format!("direct {raw:+}"))
+            }
+        }
+    }
+}
+
+fn stat_aliases(target_lower: &str) -> &'static [&'static str] {
+    match target_lower {
+        "str" | "strength" => &["strength", "str", "might", "brawn"],
+        "dex" | "dexterity" | "agility" => &["dexterity", "dex", "agility", "agi"],
+        "con" | "constitution" => &["constitution", "con", "endurance", "vitality", "stamina"],
+        "int" | "intelligence" => &["intelligence", "int", "mind", "intellect"],
+        "wis" | "wisdom" => &["wisdom", "wis", "spirit", "perception", "will"],
+        "cha" | "charisma" => &["charisma", "cha", "presence", "charm"],
+        _ => &[],
+    }
+}
+
+/// Finds a character stat by exact name (case-insensitive) or standard ability alias (STR/DEX/CON/INT/WIS/CHA).
+pub fn find_character_stat<'a>(
+    stats: &'a BTreeMap<String, i64>,
+    target: &str,
+) -> Option<(&'a String, i64)> {
+    let t = target.trim().to_lowercase();
+    if let Some((k, v)) = stats.iter().find(|(k, _)| k.to_lowercase() == t) {
+        return Some((k, *v));
+    }
+    let aliases = stat_aliases(&t);
+    for a in aliases {
+        if let Some((k, v)) = stats.iter().find(|(k, _)| k.to_lowercase() == *a) {
+            return Some((k, *v));
+        }
+    }
+    None
+}
+
+/// Looks up a skill definition in the profile's skill_table by slug, exact name, or substring.
+pub fn lookup_skill_definition<'a>(
+    profile: &'a RulesetProfile,
+    skill_name: &str,
+) -> Option<&'a SkillDefinition> {
+    let slug = slugify(skill_name);
+    if let Some(d) = profile.skill_table.get(&slug) {
+        return Some(d);
+    }
+    let target = skill_name.trim().to_lowercase();
+    profile
+        .skill_table
+        .values()
+        .find(|d| d.name.to_lowercase() == target)
+}
+
+/// Resolves a grounded DC from an explicit integer, a rubric `dc_tier`, and/or `dc_factors`.
+pub fn resolve_dc(
+    profile: &RulesetProfile,
+    explicit_dc: Option<i64>,
+    dc_tier: Option<&str>,
+    factors: &[DcFactorInput],
+) -> Result<(i64, Option<DcBreakdown>)> {
+    let (base_tier, base_dc) = if let Some(tier_raw) = dc_tier.filter(|s| !s.trim().is_empty()) {
+        let key = tier_raw.trim().to_lowercase().replace([' ', '-'], "_");
+        let dc = profile.dc_rubric.get(&key).copied().ok_or_else(|| {
+            let valid: Vec<String> = profile
+                .dc_rubric
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect();
+            anyhow!(
+                "Unknown dc_tier '{tier_raw}'. Available rubric tiers in profile '{}': {}",
+                profile.id,
+                valid.join(", ")
+            )
+        })?;
+        (key, dc)
+    } else if let Some(dc) = explicit_dc {
+        if factors.is_empty() {
+            return Ok((dc, None));
+        }
+        ("explicit".to_string(), dc)
+    } else {
+        // Fallback to "moderate" (15) if neither difficulty nor dc_tier was provided
+        let dc = profile.dc_rubric.get("moderate").copied().unwrap_or(15);
+        ("moderate".to_string(), dc)
+    };
+
+    let mut applied = Vec::new();
+    let mut sum_delta = 0i64;
+    for f in factors {
+        match f {
+            DcFactorInput::Named(raw) => {
+                let key = raw.trim().to_lowercase().replace([' ', '-'], "_");
+                if let Some(&delta) = profile.dc_factors.get(&key) {
+                    sum_delta += delta;
+                    applied.push(DcFactorApplied {
+                        label: key.clone(),
+                        delta,
+                        reason: format!("Ruleset DC factor '{key}'"),
+                    });
+                } else {
+                    bail!(
+                        "Unknown dc_factor '{raw}'. Use a known factor ({}) or a custom object {{ \"label\": ..., \"delta\": ... }}.",
+                        profile.dc_factors.keys().cloned().collect::<Vec<_>>().join(", ")
+                    );
+                }
+            }
+            DcFactorInput::Custom {
+                label,
+                delta,
+                reason,
+            } => {
+                sum_delta += *delta;
+                applied.push(DcFactorApplied {
+                    label: label.clone(),
+                    delta: *delta,
+                    reason: reason.clone(),
+                });
+            }
+        }
+    }
+
+    let final_dc = (base_dc + sum_delta).max(1);
+    let factor_desc: Vec<String> = applied
+        .iter()
+        .map(|a| format!("{} ({:+})", a.label, a.delta))
+        .collect();
+    let rationale = if factor_desc.is_empty() {
+        format!("{base_tier} ({base_dc}) = DC {final_dc}")
+    } else {
+        format!(
+            "{base_tier} ({base_dc}) + {} = DC {final_dc}",
+            factor_desc.join(" + ")
+        )
+    };
+    Ok((
+        final_dc,
+        Some(DcBreakdown {
+            base_tier,
+            base_dc,
+            factors: applied,
+            final_dc,
+            rationale,
+        }),
+    ))
+}
+
+/// Evaluates which XP tier a skill currently belongs to and how much XP remains until the next rank.
+pub fn evaluate_xp_rank(
+    curve: &[SkillXpThreshold],
+    xp: u64,
+) -> (SkillXpThreshold, Option<(String, u64)>) {
+    let fallback = default_skill_xp_curve();
+    let mut sorted: Vec<SkillXpThreshold> = if curve.is_empty() {
+        fallback
+    } else {
+        curve.to_vec()
+    };
+    sorted.sort_by_key(|t| t.min_xp);
+
+    let mut current = sorted[0].clone();
+    let mut next_info: Option<(String, u64)> = None;
+    for (idx, tier) in sorted.iter().enumerate() {
+        if xp >= tier.min_xp {
+            current = tier.clone();
+            if let Some(nxt) = sorted.get(idx + 1) {
+                next_info = Some((nxt.rank.clone(), nxt.min_xp.saturating_sub(xp)));
+            } else {
+                next_info = None;
+            }
+        } else {
+            break;
+        }
+    }
+    (current, next_info)
+}
+
+/// Computes difficulty-scaled Skill XP earned from performing a live skill check (even failures teach!),
+/// automatically scaled to the active RulesetProfile's `xp_curve` range so both 0-100 curves (~1-3 XP/check)
+/// and 0-6000 curves (~15-40 XP/check) progress at a grounded, realistic pace.
+pub fn calculate_skill_xp_gain(outcome: &str, final_dc: i64, xp_curve: &[SkillXpThreshold]) -> u64 {
+    let dc_mult: f64 = if final_dc <= 7 {
+        0.35
+    } else if final_dc <= 12 {
+        0.75
+    } else if final_dc <= 17 {
+        1.0
+    } else if final_dc <= 22 {
+        1.4
+    } else if final_dc <= 27 {
+        1.85
+    } else {
+        2.4
+    };
+    let base: f64 = match outcome {
+        "critical_success" => 40.0,
+        "success" => 25.0,
+        "partial_success" => 20.0,
+        "failure" => 15.0,
+        "critical_failure" => 10.0,
+        _ => 0.0,
+    };
+    if base <= 0.0 {
+        return 0;
+    }
+    let curve_max = xp_curve.iter().map(|t| t.min_xp).max().unwrap_or(6000);
+    let curve_scale = (curve_max as f64 / 6000.0).clamp(0.05, 4.0);
+    ((base * dc_mult * curve_scale).round() as u64).max(1)
+}
+
+/// Extra optional live records (persistent injuries & encumbrance) passed into check hydration.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HydrationExtras<'a> {
+    pub injuries: &'a [crate::world_sim::InjuryRecord],
+    pub encumbrance: Option<&'a crate::world_sim::EncumbranceReport>,
+}
+
 /// Computes auto-hydrated modifiers from a character's live projection and their current place!
 pub fn collect_hydrated_modifiers(
     profile: &RulesetProfile,
     actor: Option<&CharacterProjection>,
+    actor_profile: Option<&crate::autonomy::CharacterProfileExt>,
     place: Option<&PlaceProjection>,
     stat: Option<&str>,
     skill: Option<&str>,
     technique: Option<&str>,
     equipment: &[String],
     action_text: &str,
+) -> HydrationOutcome {
+    collect_hydrated_modifiers_ext(
+        profile,
+        actor,
+        actor_profile,
+        place,
+        stat,
+        skill,
+        technique,
+        equipment,
+        action_text,
+        HydrationExtras::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn collect_hydrated_modifiers_ext(
+    profile: &RulesetProfile,
+    actor: Option<&CharacterProjection>,
+    actor_profile: Option<&crate::autonomy::CharacterProfileExt>,
+    place: Option<&PlaceProjection>,
+    stat: Option<&str>,
+    skill: Option<&str>,
+    technique: Option<&str>,
+    equipment: &[String],
+    action_text: &str,
+    extras: HydrationExtras<'_>,
 ) -> HydrationOutcome {
     let mut mods = Vec::new();
     let mut warnings = Vec::new();
@@ -401,21 +1041,19 @@ pub fn collect_hydrated_modifiers(
     }
 
     if let Some(ch) = actor {
-        // 1. Stat lookup (case-insensitive)
+        let mut stat_hydrated = false;
+
+        // 1. Explicit Stat lookup (case-insensitive + standard D&D aliases + ability modifier formula)
         if let Some(stat_name) = stat.filter(|s| !s.trim().is_empty()) {
-            let target = stat_name.trim().to_lowercase();
-            if let Some((k, v)) = ch
-                .current
-                .stats
-                .iter()
-                .find(|(k, _)| k.to_lowercase() == target)
-            {
+            if let Some((k, raw_v)) = find_character_stat(&ch.current.stats, stat_name) {
+                let (mod_v, formula_note) = compute_stat_modifier(&profile.stat_modifier_mode, raw_v);
                 mods.push(ModifierSource {
                     source: format!("stat:{k}"),
-                    value: *v,
+                    value: mod_v,
                     category: "stat".to_string(),
-                    notes: format!("Character stat '{k}' = {v}"),
+                    notes: format!("Character stat '{k}' ({formula_note})"),
                 });
+                stat_hydrated = true;
             } else {
                 let msg = format!(
                     "Unknown stat '{}' on character '{}' (not found; treated as +0).",
@@ -427,7 +1065,7 @@ pub fn collect_hydrated_modifiers(
             }
         }
 
-        // 2. Skill lookup (exact or substring match)
+        // 2. Skill lookup (character sheet + built-in/custom skill_table + auto governing-stat hydration)
         if let Some(skill_name) = skill.filter(|s| !s.trim().is_empty()) {
             let target = skill_name.trim().to_lowercase();
             let found = ch
@@ -441,14 +1079,54 @@ pub fn collect_hydrated_modifiers(
                         sn.contains(&target) || target.contains(&sn)
                     })
                 });
+            let table_def = lookup_skill_definition(profile, skill_name);
+
             if let Some(sk) = found {
+                // Auto-hydrate governing stat if caller didn't explicitly specify `stat`
+                if !stat_hydrated {
+                    let gov_stat = sk
+                        .governing_stat
+                        .as_deref()
+                        .filter(|s| !s.trim().is_empty())
+                        .or_else(|| table_def.map(|d| d.governing_stat.as_str()));
+                    if let Some(gs) = gov_stat {
+                        if let Some((k, raw_v)) = find_character_stat(&ch.current.stats, gs) {
+                            let (mod_v, formula_note) =
+                                compute_stat_modifier(&profile.stat_modifier_mode, raw_v);
+                            mods.push(ModifierSource {
+                                source: format!("stat:{k}"),
+                                value: mod_v,
+                                category: "stat".to_string(),
+                                notes: format!(
+                                    "Governing stat for '{}' ({formula_note})",
+                                    sk.name
+                                ),
+                            });
+                        }
+                    }
+                }
+
                 let explicit_mod = sk.modifier.as_deref().and_then(extract_signed_modifier);
+                let tier_mod = sk
+                    .proficiency_tier
+                    .as_deref()
+                    .and_then(|t| profile.rank_bonuses.get(&t.trim().to_lowercase()).copied());
                 let rank_mod = profile
                     .rank_bonuses
                     .get(&sk.rank.trim().to_lowercase())
                     .copied();
-                let val = explicit_mod.or(rank_mod).unwrap_or(0);
-                if explicit_mod.is_none() && rank_mod.is_none() && !sk.rank.trim().is_empty() {
+                let xp_mod = if sk.xp > 0 {
+                    Some(evaluate_xp_rank(&profile.xp_curve, sk.xp).0.bonus)
+                } else {
+                    None
+                };
+                let val = explicit_mod.or(tier_mod).or(rank_mod).or(xp_mod).unwrap_or(0);
+                if explicit_mod.is_none()
+                    && tier_mod.is_none()
+                    && rank_mod.is_none()
+                    && xp_mod.is_none()
+                    && !sk.rank.trim().is_empty()
+                {
                     warnings.push(format!(
                         "Skill '{}' on '{}' has rank '{}' with no explicit numeric modifier and no entry in ruleset profile '{}' rank_bonuses (treated as +0). Configure rank_bonuses via upsert_ruleset_profile or set skill.modifier.",
                         sk.name, ch.baseline.name, sk.rank, profile.id
@@ -459,12 +1137,50 @@ pub fn collect_hydrated_modifiers(
                     value: val,
                     category: "skill".to_string(),
                     notes: format!(
-                        "Rank: {}{}",
+                        "Rank: {}{}{}",
                         sk.rank,
+                        if sk.xp > 0 {
+                            format!(" [{} XP]", sk.xp)
+                        } else {
+                            String::new()
+                        },
                         sk.modifier
                             .as_deref()
                             .map(|m| format!(" ({m})"))
                             .unwrap_or_default()
+                    ),
+                });
+            } else if let Some(def) = table_def {
+                // Untrained check using a known skill from the ruleset's skill_table!
+                if !stat_hydrated {
+                    if let Some((k, raw_v)) =
+                        find_character_stat(&ch.current.stats, &def.governing_stat)
+                    {
+                        let (mod_v, formula_note) =
+                            compute_stat_modifier(&profile.stat_modifier_mode, raw_v);
+                        mods.push(ModifierSource {
+                            source: format!("stat:{k}"),
+                            value: mod_v,
+                            category: "stat".to_string(),
+                            notes: format!(
+                                "Governing stat for '{}' ({formula_note})",
+                                def.name
+                            ),
+                        });
+                    }
+                }
+                let untrained_bonus = profile
+                    .rank_bonuses
+                    .get("untrained")
+                    .copied()
+                    .unwrap_or(0);
+                mods.push(ModifierSource {
+                    source: format!("skill:{}", def.name),
+                    value: untrained_bonus,
+                    category: "skill".to_string(),
+                    notes: format!(
+                        "Untrained standard skill (governed by {}); proficiency {:+}",
+                        def.governing_stat, untrained_bonus
                     ),
                 });
             } else {
@@ -601,8 +1317,32 @@ pub fn collect_hydrated_modifiers(
             }
         }
 
-        // 5. Character live conditions & injuries
+        // 5. Character live conditions & injuries (supports optional `[scope: tok1, tok2]` filtering in notes)
+        let mut check_haystack = String::new();
+        check_haystack.push_str(&action_lower);
+        if let Some(s) = stat {
+            check_haystack.push(' ');
+            check_haystack.push_str(&s.to_lowercase());
+        }
+        if let Some(s) = skill {
+            check_haystack.push(' ');
+            check_haystack.push_str(&s.to_lowercase());
+        }
+        if let Some(t) = technique {
+            check_haystack.push(' ');
+            check_haystack.push_str(&t.to_lowercase());
+        }
+        for m in &mods {
+            if m.category == "stat" || m.category == "skill" {
+                check_haystack.push(' ');
+                check_haystack.push_str(&m.source.to_lowercase());
+            }
+        }
+
         for cond in &ch.current.conditions {
+            if !condition_matches_scope(&cond.notes, &check_haystack) {
+                continue;
+            }
             let kind_l = cond.kind.trim().to_lowercase();
             let sev_l = cond.severity.trim().to_lowercase();
             let explicit_val = extract_signed_modifier(&cond.notes)
@@ -647,6 +1387,260 @@ pub fn collect_hydrated_modifiers(
                         } else {
                             format!(" — {}", cond.notes)
                         }
+                    ),
+                });
+            }
+        }
+
+        // 5b. Equipped garment dimensional fit penalties (DEX ease-of-movement, STR binding/reach, CHA odd/baggy appearance)
+        if let Some(prof) = actor_profile {
+            let apparel = crate::autonomy::evaluate_equipped_apparel_fit(&ch.current.equipment, &prof.avatar);
+            if apparel.dex_penalty < 0
+                && (check_haystack.contains("stat:dexterity")
+                    || check_haystack.contains("dexterity")
+                    || check_haystack.contains("stealth")
+                    || check_haystack.contains("acrobat")
+                    || check_haystack.contains("dodge")
+                    || check_haystack.contains("sprint")
+                    || check_haystack.contains("climb")
+                    || check_haystack.contains("movement"))
+            {
+                mods.push(ModifierSource {
+                    source: "apparel:fit_movement".to_string(),
+                    value: apparel.dex_penalty,
+                    category: "apparel".to_string(),
+                    notes: format!("Ill-fitting equipped apparel impedes movement ({})", apparel.brief),
+                });
+            }
+            if apparel.str_penalty < 0
+                && (check_haystack.contains("stat:strength")
+                    || check_haystack.contains("strength")
+                    || check_haystack.contains("brawling")
+                    || check_haystack.contains("melee")
+                    || check_haystack.contains("lifting")
+                    || check_haystack.contains("climb")
+                    || check_haystack.contains("exertion"))
+            {
+                mods.push(ModifierSource {
+                    source: "apparel:fit_restriction".to_string(),
+                    value: apparel.str_penalty,
+                    category: "apparel".to_string(),
+                    notes: format!("Tight/outgrown equipped apparel restricts reach and leverage ({})", apparel.brief),
+                });
+            }
+            if apparel.cha_penalty < 0
+                && (check_haystack.contains("stat:charisma")
+                    || check_haystack.contains("charisma")
+                    || check_haystack.contains("persuasion")
+                    || check_haystack.contains("intimidation")
+                    || check_haystack.contains("deception")
+                    || check_haystack.contains("performance")
+                    || check_haystack.contains("serving")
+                    || check_haystack.contains("appearance"))
+            {
+                mods.push(ModifierSource {
+                    source: "apparel:fit_appearance".to_string(),
+                    value: apparel.cha_penalty,
+                    category: "apparel".to_string(),
+                    notes: format!("Ill-fitting/odd-tapered/baggy equipped apparel undermines presentation ({})", apparel.brief),
+                });
+            }
+
+            // 5c. Equipped Titles (`stat_modifiers` + scoped `mechanical_effect`)
+            let active_stat_names: Vec<String> = mods
+                .iter()
+                .filter(|m| m.category == "stat")
+                .map(|m| m.source.trim_start_matches("stat:").to_lowercase())
+                .collect();
+            for title in prof.titles.iter().filter(|t| t.equipped) {
+                for (tk, tv) in &title.stat_modifiers {
+                    if *tv == 0 {
+                        continue;
+                    }
+                    let tk_l = tk.trim().to_lowercase();
+                    let matches_stat = active_stat_names.iter().any(|as_l| {
+                        as_l == &tk_l || stat_aliases(&tk_l).contains(&as_l.as_str())
+                    });
+                    if matches_stat {
+                        mods.push(ModifierSource {
+                            source: format!("title:{}", title.name),
+                            value: *tv,
+                            category: "title".to_string(),
+                            notes: format!("Equipped title '{}' ({tk} {:+})", title.name, tv),
+                        });
+                    }
+                }
+                if title.stat_modifiers.is_empty() && !title.mechanical_effect.trim().is_empty() {
+                    if let Some(v) = extract_signed_modifier(&title.mechanical_effect) {
+                        if v != 0 && condition_matches_scope(&title.mechanical_effect, &check_haystack) {
+                            let eff_l = title.mechanical_effect.to_lowercase();
+                            let has_scope_tag = eff_l.contains("[scope:");
+                            let kw_match = has_scope_tag
+                                || skill
+                                    .filter(|s| !s.trim().is_empty())
+                                    .is_some_and(|s| eff_l.contains(&s.to_lowercase()))
+                                || active_stat_names.iter().any(|st| eff_l.contains(st));
+                            if kw_match {
+                                mods.push(ModifierSource {
+                                    source: format!("title:{}", title.name),
+                                    value: v,
+                                    category: "title".to_string(),
+                                    notes: title.mechanical_effect.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 5d. Innate / Constitutional Traits (`traits_and_perks`)
+            for tr in prof.traits_and_perks.iter().filter(|t| t.active) {
+                if let Some(v) = extract_signed_modifier(&tr.effect) {
+                    if v != 0 && condition_matches_scope(&tr.effect, &check_haystack) {
+                        let eff_l = tr.effect.to_lowercase();
+                        let has_scope_tag = eff_l.contains("[scope:");
+                        let kw_match = has_scope_tag
+                            || skill
+                                .filter(|s| !s.trim().is_empty())
+                                .is_some_and(|s| eff_l.contains(&s.to_lowercase()))
+                            || active_stat_names.iter().any(|st| eff_l.contains(st));
+                        if kw_match {
+                            mods.push(ModifierSource {
+                                source: format!("trait:{}", tr.name),
+                                value: v,
+                                category: "trait".to_string(),
+                                notes: tr.effect.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+
+            // 5e. Formal Proficiencies (tools, crafts, weapons, saves):
+            // - Explicit numeric `pf.bonus` (e.g. "+2") applies whenever the proficiency matches the check.
+            // - Implicit `rank_bonuses` fallback ONLY applies when NO `skill:*` modifier was already hydrated
+            //   on this check, preserving strict Skill vs. Formal Credential/Tool separation!
+            let any_skill_hydrated = mods.iter().any(|m| m.category == "skill");
+            for pf in &prof.proficiencies {
+                let pf_l = pf.name.trim().to_lowercase();
+                if pf_l.is_empty() {
+                    continue;
+                }
+                let already_skill = mods.iter().any(|m| {
+                    m.category == "skill"
+                        && m.source
+                            .trim_start_matches("skill:")
+                            .eq_ignore_ascii_case(&pf.name)
+                });
+                if already_skill {
+                    continue;
+                }
+                let matches_check = skill
+                    .filter(|s| !s.trim().is_empty())
+                    .is_some_and(|s| {
+                        let sl = s.trim().to_lowercase();
+                        sl == pf_l || sl.contains(&pf_l) || pf_l.contains(&sl)
+                    })
+                    || equipment.iter().any(|e| {
+                        let el = e.trim().to_lowercase();
+                        !el.is_empty() && (el == pf_l || el.contains(&pf_l) || pf_l.contains(&el))
+                    })
+                    || (pf_l.len() >= 4 && action_lower.contains(&pf_l));
+                if matches_check {
+                    let val = extract_signed_modifier(&pf.bonus)
+                        .or_else(|| {
+                            if !any_skill_hydrated {
+                                profile.rank_bonuses.get(&pf.rank.trim().to_lowercase()).copied()
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(0);
+                    if val != 0 {
+                        mods.push(ModifierSource {
+                            source: format!("proficiency:{}", pf.name),
+                            value: val,
+                            category: "proficiency".to_string(),
+                            notes: format!("{} ({})", pf.rank, pf.category),
+                        });
+                    }
+                }
+            }
+        }
+
+        // 5f. Persistent `injuries` table records (unless already represented by a same-named StatusCondition)
+        let is_physical_check = check_haystack.contains("stat:strength")
+            || check_haystack.contains("stat:dexterity")
+            || check_haystack.contains("stat:constitution")
+            || check_haystack.contains("athletics")
+            || check_haystack.contains("acrobat")
+            || check_haystack.contains("stealth")
+            || check_haystack.contains("brawling")
+            || check_haystack.contains("melee")
+            || check_haystack.contains("climb")
+            || check_haystack.contains("sprint")
+            || check_haystack.contains("swim")
+            || check_haystack.contains("dodge")
+            || check_haystack.contains("physical");
+
+        for inj in extras.injuries {
+            if inj.status.eq_ignore_ascii_case("healed") {
+                continue;
+            }
+            let dup_cond = ch
+                .current
+                .conditions
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(&inj.name));
+            if dup_cond {
+                continue;
+            }
+            let loc_l = inj.body_location.to_lowercase();
+            let affects_check = is_physical_check
+                || (!loc_l.is_empty() && check_haystack.contains(&loc_l))
+                || inj.severity.eq_ignore_ascii_case("critical");
+            if !affects_check {
+                continue;
+            }
+            let base_pen = match inj.severity.trim().to_lowercase().as_str() {
+                "minor" => -1,
+                "moderate" => -2,
+                "severe" => -3,
+                "critical" => -4,
+                _ => -1,
+            };
+            let eff_pen = if inj.treated && base_pen < -1 {
+                base_pen + 1
+            } else {
+                base_pen
+            };
+            mods.push(ModifierSource {
+                source: format!("injury:{}", inj.name),
+                value: eff_pen,
+                category: "injury".to_string(),
+                notes: format!(
+                    "{} injury on {}{}",
+                    inj.severity,
+                    if inj.body_location.is_empty() {
+                        "body"
+                    } else {
+                        inj.body_location.as_str()
+                    },
+                    if inj.treated { " (treated)" } else { " (untreated)" }
+                ),
+            });
+        }
+
+        // 5g. Live Encumbrance physical check penalty
+        if let Some(enc) = extras.encumbrance {
+            if enc.physical_check_penalty < 0 && is_physical_check {
+                mods.push(ModifierSource {
+                    source: format!("encumbrance:{}", enc.load_tier),
+                    value: enc.physical_check_penalty,
+                    category: "encumbrance".to_string(),
+                    notes: format!(
+                        "Carrying {:.1}/{:.1} kg ({})",
+                        enc.total_weight_kg, enc.carry_capacity_kg, enc.load_tier
                     ),
                 });
             }
@@ -857,6 +1851,9 @@ pub fn evaluate_check(
         None
     };
 
+    let passive_score = 10 + total_modifier;
+    let routine_auto_pass = passive_score >= req.difficulty;
+
     if req.dry_run {
         return Ok(CheckResolution {
             actor_id: req.actor_id.clone(),
@@ -871,15 +1868,25 @@ pub fn evaluate_check(
             roll: 0,
             modifiers: all_mods,
             modifier: total_modifier,
+            passive_score,
+            routine_auto_pass,
             total: total_modifier,
             difficulty: req.difficulty,
+            dc_breakdown: None,
             margin: 0,
             outcome: "preview".to_string(),
-            degree: "Dry-run preview (not rolled)".to_string(),
+            degree: if routine_auto_pass {
+                format!("Dry-run preview (not rolled; Passive {passive_score} >= DC {} — unpressured routine work auto-passes)", req.difficulty)
+            } else {
+                format!("Dry-run preview (not rolled; Passive {passive_score} < DC {} — active roll required)", req.difficulty)
+            },
             stakes: req.stakes.clone(),
             location_id,
             consequences: vec![],
             warnings,
+            skill_progression: None,
+            stat_xp_gained: None,
+            job_xp_gained: vec![],
             dry_run: true,
             odds_preview,
             event_id: None,
@@ -903,8 +1910,11 @@ pub fn evaluate_check(
         roll: roll_val,
         modifiers: all_mods,
         modifier: total_modifier,
+        passive_score,
+        routine_auto_pass,
         total,
         difficulty: req.difficulty,
+        dc_breakdown: None,
         margin,
         outcome,
         degree,
@@ -912,6 +1922,9 @@ pub fn evaluate_check(
         location_id,
         consequences: vec![],
         warnings,
+        skill_progression: None,
+        stat_xp_gained: None,
+        job_xp_gained: vec![],
         dry_run: false,
         odds_preview: None,
         event_id: None,

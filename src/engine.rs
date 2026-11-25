@@ -1,18 +1,21 @@
 use crate::autonomy::{
     ActorAutonomyBrief, ActorBelief, ActorKnowledgeBrief, AutonomyCommitRequest, AutonomyDossier,
-    CharacterProfileExt, FactionMember, FactionRecord, KnowledgeClaim, KnowledgeRecordView,
-    KnowledgeSearchFilter, StructuredGoal,
+    CharacterJob, CharacterOutfit, CharacterProficiency, CharacterProfileExt, CharacterTitle,
+    CharacterTrait, FactionMember, FactionRecord, KnowledgeClaim, KnowledgeRecordView,
+    KnowledgeSearchFilter, NpcEngagement, NpcTripState, PhysicalMarker, StatTrainingEntry,
+    StructuredGoal,
 };
 use crate::compiler::{compile_all_docs, prune_orphaned_docs, CompileReport};
 use crate::context::{assemble_scene_context, SceneContextPacket, SceneContextRequest};
 use crate::db::CampaignDb;
 use crate::dice::{roll_dice, DiceRollResult};
 use crate::mechanics::{
-    collect_hydrated_modifiers, evaluate_check, execute_table_draw, normalize_random_table,
-    CheckRequest, CheckResolution, ContestParticipantResult, ContestRequest, ContestResolution,
-    DrawTableOutcome, DrawTableRequest, EncounterLogEntry, EncounterParticipant, EncounterState,
-    EventCausalMeta, HydrationOutcome, RandomTable, RulesetProfile, StagedDiscovery,
-    StagedDiscoveryItem,
+    calculate_skill_xp_gain, collect_hydrated_modifiers_ext, currency_family, evaluate_check,
+    evaluate_xp_rank, execute_table_draw, lookup_skill_definition, normalize_random_table,
+    resolve_dc, CheckRequest, CheckResolution, ContestParticipantResult, ContestRequest,
+    ContestResolution, DrawTableOutcome, DrawTableRequest, EncounterLogEntry, EncounterParticipant,
+    EncounterState, EventCausalMeta, HydrationExtras, HydrationOutcome, ModifierSource,
+    RandomTable, RulesetProfile, SkillProgressionOutcome, StagedDiscovery, StagedDiscoveryItem,
 };
 use crate::models::{
     slugify, CampaignMeta, CatalogItem, CharacterBaseline, CharacterProjection, EntityHistoryEntry,
@@ -33,11 +36,12 @@ use crate::search::{
     TextSearchFilter,
 };
 use crate::world_sim::{
-    compute_encumbrance, compute_shortest_route, evaluate_market_prices, generate_seasonal_weather,
-    reputation_tier_label, synthesize_routes_from_places, travel_injury_factor, CraftingProject,
-    CrimeRecord, EncumbranceReport, InjuryRecord, ItemEconomics, JurisdictionRecord,
-    MarketPriceReport, PlaceSpatialExt, ReputationStanding, SettlementMarket, TravelPlan,
-    TravelRoute,
+    compute_encumbrance, compute_shortest_route, evaluate_market_prices,
+    format_grid_neighborhood_lines, generate_seasonal_weather, reputation_tier_label,
+    synthesize_routes_from_places, travel_injury_factor, CharacterProgressionTrack,
+    CraftingProject, CrimeRecord, EncumbranceReport, InjuryRecord, ItemEconomics,
+    JurisdictionRecord, MapGrid, MapGridCell, MarketPriceReport, PlaceSpatialExt,
+    ProgressionLadder, ReputationStanding, SettlementMarket, TravelPlan, TravelRoute,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
@@ -69,6 +73,8 @@ pub struct CampaignEngine {
     root_dir: PathBuf,
     db: CampaignDb,
     auto_compile: bool,
+    compile_defer_depth: std::cell::Cell<u32>,
+    compile_dirty: std::cell::Cell<bool>,
 }
 
 impl CampaignEngine {
@@ -79,6 +85,8 @@ impl CampaignEngine {
             root_dir: campaign_dir.to_path_buf(),
             db,
             auto_compile: true,
+            compile_defer_depth: std::cell::Cell::new(0),
+            compile_dirty: std::cell::Cell::new(false),
         })
     }
 
@@ -124,10 +132,32 @@ impl CampaignEngine {
     }
 
     pub(crate) fn maybe_compile(&self) -> Result<()> {
-        if self.auto_compile {
-            let _ = self.compile_docs()?;
+        if !self.auto_compile {
+            return Ok(());
         }
+        if self.compile_defer_depth.get() > 0 {
+            self.compile_dirty.set(true);
+            return Ok(());
+        }
+        self.compile_dirty.set(false);
+        let _ = self.compile_docs()?;
         Ok(())
+    }
+
+    /// Defers Markdown doc compilation until the outermost batch completes, avoiding redundant disk I/O
+    /// during multi-step operations (`commit_turn`, `advance_world`, stage rules, and routine ticks).
+    pub fn with_deferred_compile<T>(&self, f: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+        let prev = self.compile_defer_depth.get();
+        self.compile_defer_depth.set(prev + 1);
+        let res = f(self);
+        self.compile_defer_depth.set(prev);
+        if prev == 0 && self.compile_dirty.get() {
+            self.compile_dirty.set(false);
+            if self.auto_compile {
+                let _ = self.compile_docs()?;
+            }
+        }
+        res
     }
 
     // -------------------------------------------------------------------------
@@ -140,43 +170,87 @@ impl CampaignEngine {
         global_weather: Option<String>,
         reason: Option<String>,
     ) -> Result<(WorldClock, bool, WorldEvent)> {
-        let mut meta = self.db.get_campaign_meta()?;
-        let season_changed = meta.clock.advance(minutes);
-        if let Some(w) = global_weather {
-            if !w.trim().is_empty() {
-                meta.clock.global_weather = w;
-            }
-        }
-        self.db
-            .update_clock_and_session(&meta.clock, meta.current_session)?;
+        self.advance_time_internal(minutes, global_weather, reason, true)
+    }
 
-        let mut summary = format!(
-            "Advanced time by {} min -> {} ({})",
-            minutes,
-            meta.clock.format_short(),
-            meta.clock.time_of_day()
-        );
-        if season_changed {
-            summary.push_str(&format!(" [Season changed to {}!]", meta.clock.season));
-        }
-        if let Some(r) = reason {
-            if !r.trim().is_empty() {
-                summary.push_str(&format!(" — {r}"));
-            }
-        }
+    pub fn advance_time_no_npc_tick(
+        &self,
+        minutes: u64,
+        global_weather: Option<String>,
+        reason: Option<String>,
+    ) -> Result<(WorldClock, bool, WorldEvent)> {
+        self.advance_time_internal(minutes, global_weather, reason, false)
+    }
 
-        let ev = self.db.append_event(
-            None,
-            vec![],
-            summary,
-            EventPayload::TimeAdvanced {
+    fn advance_time_internal(
+        &self,
+        minutes: u64,
+        global_weather: Option<String>,
+        reason: Option<String>,
+        tick_npc: bool,
+    ) -> Result<(WorldClock, bool, WorldEvent)> {
+        self.with_deferred_compile(|_| {
+            let mut meta = self.db.get_campaign_meta()?;
+            let prev_total_hours = meta.clock.total_hours();
+            let season_changed = meta.clock.advance(minutes);
+            let new_total_hours = meta.clock.total_hours();
+            if let Some(w) = global_weather {
+                if !w.trim().is_empty() {
+                    meta.clock.global_weather = w;
+                }
+            }
+            self.db
+                .update_clock_and_session(&meta.clock, meta.current_session)?;
+
+            let now_str = meta.clock.format_short();
+            let mut summary = format!(
+                "Advanced time by {} min -> {} ({})",
                 minutes,
-                new_clock: meta.clock.clone(),
-                season_changed,
-            },
-        )?;
-        self.maybe_compile()?;
-        Ok((meta.clock, season_changed, ev))
+                now_str,
+                meta.clock.time_of_day()
+            );
+            if season_changed {
+                summary.push_str(&format!(" [Season changed to {}!]", meta.clock.season));
+            }
+            if let Some(r) = reason {
+                if !r.trim().is_empty() {
+                    summary.push_str(&format!(" — {r}"));
+                }
+            }
+
+            let ev = self.db.append_event(
+                None,
+                vec![],
+                summary,
+                EventPayload::TimeAdvanced {
+                    minutes,
+                    new_clock: meta.clock.clone(),
+                    season_changed,
+                },
+            )?;
+            // Auto-tick any time-cadence ProgressClocks & standing CharacterRoutines
+            if new_total_hours > prev_total_hours {
+                let _ = self.tick_auto_clocks(prev_total_hours, new_total_hours, &now_str);
+                let _ = self.tick_character_routines(prev_total_hours, new_total_hours, &now_str);
+            }
+            // Automatically advance any active/prominent NPC trips & visiting schedules when >= 4 hours pass
+            if tick_npc && minutes >= 240 {
+                let elapsed_h = (minutes / 60).max(1);
+                let seed = (new_total_hours.unsigned_abs()) ^ (ev.seq.unsigned_abs().wrapping_mul(0x9E37_79B9));
+                let _ = self.tick_npc_movements(elapsed_h, &[], false, seed);
+            }
+            // Prolonged wear of tight/outgrown garments across 4+ hours causes lingering chafing/soreness
+            if minutes >= 240 {
+                let elapsed_h = (minutes / 60).max(1);
+                if let Ok(all_chars) = self.db.list_character_baselines() {
+                    for ch_b in all_chars {
+                        let _ = self.sync_apparel_discomfort(&ch_b.id, elapsed_h);
+                    }
+                }
+            }
+            self.maybe_compile()?;
+            Ok((meta.clock, season_changed, ev))
+        })
     }
 
     pub fn start_new_session(&self, title: &str, summary: &str) -> Result<(u32, WorldEvent)> {
@@ -299,6 +373,455 @@ impl CampaignEngine {
         Ok((load_character_projection(&self.db, &cid, None)?, ev))
     }
 
+    /// Awards Skill XP to a character's skill (initializing it from the ruleset's skill_table if new),
+    /// automatically promotes rank/proficiency when XP crosses a threshold in `profile.xp_curve`,
+    /// and logs the update to the event ledger.
+    pub fn grant_skill_xp(
+        &self,
+        character_id: &str,
+        skill_name: &str,
+        xp_delta: u64,
+        profile_id: Option<&str>,
+        reason: &str,
+    ) -> Result<(SkillProgressionOutcome, WorldEvent)> {
+        let cid = resolve_character_id(&self.db, character_id)?;
+        let proj = load_character_projection(&self.db, &cid, None)?;
+        let profile = self.get_ruleset_profile_or_default(profile_id)?;
+        let target_l = skill_name.trim().to_lowercase();
+        let table_def = lookup_skill_definition(&profile, skill_name);
+
+        let existing = proj
+            .current
+            .skills
+            .iter()
+            .find(|s| s.name.to_lowercase() == target_l)
+            .or_else(|| {
+                proj.current.skills.iter().find(|s| {
+                    let sn = s.name.to_lowercase();
+                    sn.contains(&target_l) || target_l.contains(&sn)
+                })
+            })
+            .cloned();
+
+        let mut skill = if let Some(sk) = existing {
+            sk
+        } else if let Some(def) = table_def {
+            Skill {
+                name: def.name.clone(),
+                rank: "Untrained".to_string(),
+                category: def.category.clone(),
+                modifier: Some("+0".to_string()),
+                description: def.description.clone(),
+                governing_stat: Some(def.governing_stat.clone()),
+                xp: 0,
+                proficiency_tier: Some("untrained".to_string()),
+            }
+        } else {
+            Skill {
+                name: skill_name.trim().to_string(),
+                rank: "Untrained".to_string(),
+                category: String::new(),
+                modifier: Some("+0".to_string()),
+                description: String::new(),
+                governing_stat: None,
+                xp: 0,
+                proficiency_tier: Some("untrained".to_string()),
+            }
+        };
+
+        if skill.governing_stat.is_none() {
+            if let Some(def) = table_def {
+                skill.governing_stat = Some(def.governing_stat.clone());
+            }
+        }
+
+        let old_rank = skill.rank.clone();
+        let old_bonus = skill
+            .modifier
+            .as_deref()
+            .and_then(crate::mechanics::extract_signed_modifier)
+            .or_else(|| {
+                profile
+                    .rank_bonuses
+                    .get(&skill.rank.trim().to_lowercase())
+                    .copied()
+            })
+            .unwrap_or(0);
+
+        skill.xp = skill.xp.saturating_add(xp_delta);
+        let (xp_tier, next_info) = evaluate_xp_rank(&profile.xp_curve, skill.xp);
+
+        let mut leveled_up = false;
+        let mut new_bonus = old_bonus;
+        if xp_tier.bonus > old_bonus
+            || (old_rank.eq_ignore_ascii_case("untrained")
+                && !xp_tier.rank.eq_ignore_ascii_case("untrained"))
+        {
+            skill.rank = xp_tier.rank.clone();
+            skill.modifier = Some(format!("{:+}", xp_tier.bonus));
+            skill.proficiency_tier = Some(xp_tier.rank.to_lowercase());
+            new_bonus = xp_tier.bonus;
+            leveled_up = true;
+        }
+
+        let full_reason = if leveled_up {
+            format!(
+                "+{} XP ({} -> {}, {:+}){}",
+                xp_delta,
+                old_rank,
+                skill.rank,
+                new_bonus,
+                if reason.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {reason}")
+                }
+            )
+        } else {
+            format!(
+                "+{} XP (total {} XP){}",
+                xp_delta,
+                skill.xp,
+                if reason.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {reason}")
+                }
+            )
+        };
+
+        let skill_name_final = skill.name.clone();
+        let total_xp = skill.xp;
+        let new_rank = skill.rank.clone();
+        let (_, ev) = self.upsert_skill(&cid, skill, &full_reason)?;
+        let (next_rank, xp_to_next_rank) = match next_info {
+            Some((nr, rem)) => (Some(nr), Some(rem)),
+            None => (None, None),
+        };
+        Ok((
+            SkillProgressionOutcome {
+                character_id: cid,
+                skill_name: skill_name_final,
+                xp_gained: xp_delta,
+                total_xp,
+                xp_to_next_rank,
+                next_rank,
+                old_rank,
+                new_rank,
+                new_bonus,
+                leveled_up,
+            },
+            ev,
+        ))
+    }
+
+    /// Correct, revert (negative delta), set, or reset a character's skill XP.
+    /// When `recalc_rank` is true, recalculates rank/modifier/proficiency_tier BOTH upwards and downwards
+    /// along the active RulesetProfile's XP curve (so reverting or resetting XP cleanly undoes mistaken promotions).
+    #[allow(clippy::too_many_arguments)]
+    pub fn adjust_skill_xp(
+        &self,
+        character_id: &str,
+        skill_name: &str,
+        delta_xp: Option<i64>,
+        set_xp: Option<u64>,
+        recalc_rank: bool,
+        profile_id: Option<&str>,
+        reason: &str,
+    ) -> Result<(serde_json::Value, WorldEvent)> {
+        let cid = resolve_character_id(&self.db, character_id)?;
+        let proj = load_character_projection(&self.db, &cid, None)?;
+        let profile = self.get_ruleset_profile_or_default(profile_id)?;
+        let table_def = lookup_skill_definition(&profile, skill_name);
+
+        let mut skill = if let Some(existing) = proj
+            .current
+            .skills
+            .iter()
+            .find(|s| s.name.eq_ignore_ascii_case(skill_name))
+        {
+            existing.clone()
+        } else {
+            Skill {
+                name: table_def
+                    .map(|d| d.name.clone())
+                    .unwrap_or_else(|| skill_name.to_string()),
+                rank: "Untrained".to_string(),
+                category: String::new(),
+                modifier: Some("+0".to_string()),
+                description: String::new(),
+                governing_stat: table_def.map(|d| d.governing_stat.clone()),
+                xp: 0,
+                proficiency_tier: Some("untrained".to_string()),
+            }
+        };
+
+        let old_xp = skill.xp;
+        let old_rank = skill.rank.clone();
+        let old_mod = skill.modifier.clone().unwrap_or_else(|| "+0".to_string());
+
+        let new_xp = if let Some(v) = set_xp {
+            v
+        } else if let Some(d) = delta_xp {
+            if d >= 0 {
+                old_xp.saturating_add(d as u64)
+            } else {
+                old_xp.saturating_sub(d.unsigned_abs())
+            }
+        } else {
+            old_xp
+        };
+
+        skill.xp = new_xp;
+        let (xp_tier, next_info) = evaluate_xp_rank(&profile.xp_curve, skill.xp);
+        let mut rank_changed = false;
+        if recalc_rank {
+            let target_mod = format!("{:+}", xp_tier.bonus);
+            if !skill.rank.eq_ignore_ascii_case(&xp_tier.rank)
+                || skill.modifier.as_deref() != Some(target_mod.as_str())
+            {
+                rank_changed = true;
+            }
+            skill.rank = xp_tier.rank.clone();
+            skill.modifier = Some(target_mod);
+            skill.proficiency_tier = Some(xp_tier.rank.to_lowercase());
+        }
+
+        let effective_delta = new_xp as i64 - old_xp as i64;
+        let full_reason = format!(
+            "XP adjusted {} -> {} ({:+}){}{}",
+            old_xp,
+            new_xp,
+            effective_delta,
+            if rank_changed {
+                format!(", rank {} ({}) -> {} ({})", old_rank, old_mod, skill.rank, skill.modifier.as_deref().unwrap_or("+0"))
+            } else {
+                String::new()
+            },
+            if reason.is_empty() {
+                String::new()
+            } else {
+                format!(" — {reason}")
+            }
+        );
+
+        let skill_name_final = skill.name.clone();
+        let new_rank = skill.rank.clone();
+        let new_mod = skill.modifier.clone();
+        let (updated_proj, ev) = self.upsert_skill(&cid, skill, &full_reason)?;
+        let (next_rank, xp_to_next_rank) = match next_info {
+            Some((nr, rem)) => (Some(nr), Some(rem)),
+            None => (None, None),
+        };
+        Ok((
+            serde_json::json!({
+                "event_seq": ev.seq,
+                "summary": ev.summary,
+                "character_id": cid,
+                "skill_name": skill_name_final,
+                "old_xp": old_xp,
+                "new_xp": new_xp,
+                "delta_xp": effective_delta,
+                "old_rank": old_rank,
+                "new_rank": new_rank,
+                "new_modifier": new_mod,
+                "rank_changed": rank_changed,
+                "next_rank": next_rank,
+                "xp_to_next_rank": xp_to_next_rank,
+                "skills": updated_proj.current.skills
+            }),
+            ev,
+        ))
+    }
+
+    /// Reads any campaign attachment, story text, lore entry, or compiled doc verbatim in exact
+    /// UTF-8 character chunks (zero compression, zero summarization, strictly confined inside `<campaign>/`).
+    pub fn read_campaign_file_chunk(
+        &self,
+        target: &str,
+        offset_chars: usize,
+        chunk_chars: usize,
+        gm_override: bool,
+    ) -> Result<serde_json::Value> {
+        let t = target.trim();
+        let docs_root = self.docs_dir();
+
+        if t.is_empty() || t.eq_ignore_ascii_case("list") {
+            let atts: Vec<serde_json::Value> = self
+                .db
+                .list_attachments()?
+                .into_iter()
+                .map(|a| {
+                    serde_json::json!({
+                        "target": format!("attachment:{}", a.id),
+                        "title": a.title,
+                        "mime_type": a.mime_type,
+                        "relative_path": a.relative_path,
+                        "size_bytes": a.size_bytes
+                    })
+                })
+                .collect();
+            let texts: Vec<serde_json::Value> = self
+                .db
+                .list_texts()?
+                .into_iter()
+                .map(|tx| {
+                    serde_json::json!({
+                        "target": format!("text:{}", tx.id),
+                        "title": tx.title,
+                        "read_status": tx.read_status,
+                        "chars": tx.content.chars().count()
+                    })
+                })
+                .collect();
+            let mut doc_files = Vec::new();
+            fn collect_docs(base: &Path, dir: &Path, out: &mut Vec<String>) {
+                if let Ok(rd) = std::fs::read_dir(dir) {
+                    for entry in rd.flatten() {
+                        let p = entry.path();
+                        if p.is_dir() {
+                            collect_docs(base, &p, out);
+                        } else if let Ok(rel) = p.strip_prefix(base) {
+                            out.push(format!("doc:{}", rel.to_string_lossy().replace('\\', "/")));
+                        }
+                    }
+                }
+            }
+            collect_docs(&docs_root, &docs_root, &mut doc_files);
+            doc_files.sort();
+            return Ok(serde_json::json!({
+                "mode": "list",
+                "attachments": atts,
+                "texts": texts,
+                "docs": doc_files
+            }));
+        }
+
+        let effective_chunk = chunk_chars.clamp(500, 16000);
+        let (resolved_target, title, mime_type, full_text) = if let Some(att_id) =
+            t.strip_prefix("attachment:").or_else(|| t.strip_prefix("chronicle://attachments/"))
+        {
+            let att = self.get_attachment(att_id)?;
+            let abs_path = self.attachment_file_path(&att);
+            let raw = std::fs::read(&abs_path)
+                .with_context(|| format!("Attachment file missing: {}", abs_path.display()))?;
+            let text = String::from_utf8(raw).map_err(|_| {
+                anyhow!(
+                    "Attachment '{}' ({}) is binary and not UTF-8 text; inspect metadata via get_attachment.",
+                    att.id,
+                    att.mime_type
+                )
+            })?;
+            (
+                format!("attachment:{}", att.id),
+                att.title,
+                att.mime_type,
+                text,
+            )
+        } else if let Some(text_id) =
+            t.strip_prefix("text:").or_else(|| t.strip_prefix("chronicle://texts/"))
+        {
+            let tx = self.get_text(text_id)?;
+            if !gm_override
+                && matches!(
+                    tx.read_status.as_str(),
+                    "undiscovered" | "discovered_unread"
+                )
+            {
+                bail!(
+                    "Text '{}' has read_status '{}'. Record reading via `record_text_reading` first (or pass `gm_override: true` for GM-only inspection).",
+                    tx.id,
+                    tx.read_status
+                );
+            }
+            (
+                format!("text:{}", tx.id),
+                tx.title,
+                "text/markdown".to_string(),
+                tx.content,
+            )
+        } else if let Some(lore_id) =
+            t.strip_prefix("lore:").or_else(|| t.strip_prefix("chronicle://lore/"))
+        {
+            let l = self.get_lore(lore_id)?;
+            (
+                format!("lore:{}", l.id),
+                l.title,
+                "text/markdown".to_string(),
+                l.body,
+            )
+        } else {
+            // Campaign-relative docs path (`doc:...` or `docs/...` or bare relative path under docs/)
+            let rel_raw = t
+                .strip_prefix("doc:")
+                .or_else(|| t.strip_prefix("docs/"))
+                .or_else(|| t.strip_prefix("docs\\"))
+                .unwrap_or(t)
+                .replace('\\', "/");
+            if rel_raw.contains("..") || rel_raw.starts_with('/') || rel_raw.contains(':') {
+                bail!("Invalid doc path '{t}': path traversal or absolute paths are not permitted.");
+            }
+            let cand = docs_root.join(&rel_raw);
+            let canon_root = std::fs::canonicalize(&docs_root)
+                .with_context(|| format!("Campaign docs directory missing: {}", docs_root.display()))?;
+            let canon_file = std::fs::canonicalize(&cand)
+                .with_context(|| format!("Campaign doc not found: docs/{rel_raw}"))?;
+            if !canon_file.starts_with(&canon_root) {
+                bail!("Access denied: '{t}' resolves outside campaign docs directory.");
+            }
+            let raw = std::fs::read(&canon_file)?;
+            let text = String::from_utf8(raw).map_err(|_| {
+                anyhow!("File 'docs/{rel_raw}' is binary and cannot be read as UTF-8 text.")
+            })?;
+            (
+                format!("doc:{rel_raw}"),
+                rel_raw,
+                "text/markdown".to_string(),
+                text,
+            )
+        };
+
+        let total_chars = full_text.chars().count();
+        let total_chunks = if total_chars == 0 {
+            1
+        } else {
+            (total_chars + effective_chunk - 1) / effective_chunk
+        };
+        let safe_offset = offset_chars.min(total_chars);
+        let content: String = full_text
+            .chars()
+            .skip(safe_offset)
+            .take(effective_chunk)
+            .collect();
+        let returned_chars = content.chars().count();
+        let next_offset = safe_offset + returned_chars;
+        let has_more = next_offset < total_chars;
+        let chunk_index = (safe_offset / effective_chunk) + 1;
+
+        let mut out = serde_json::json!({
+            "verbatim": true,
+            "target": resolved_target,
+            "title": title,
+            "mime_type": mime_type,
+            "offset_chars": safe_offset,
+            "returned_chars": returned_chars,
+            "total_chars": total_chars,
+            "chunk_index": chunk_index,
+            "total_chunks": total_chunks,
+            "has_more": has_more,
+            "next_offset_chars": if has_more { serde_json::json!(next_offset) } else { serde_json::Value::Null },
+            "content": content
+        });
+        if has_more {
+            out["next_call"] = serde_json::json!({
+                "target": resolved_target,
+                "offset_chars": next_offset,
+                "chunk_chars": effective_chunk
+            });
+        }
+        Ok(out)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn modify_resource(
         &self,
@@ -349,6 +872,44 @@ impl CampaignEngine {
                 set_current,
                 set_max,
                 unit,
+                remove: false,
+                reason: reason.to_string(),
+            },
+        )?;
+        self.maybe_compile()?;
+        Ok((load_character_projection(&self.db, &cid, None)?, ev))
+    }
+
+    pub fn remove_resource(
+        &self,
+        character_id: &str,
+        resource: &str,
+        reason: &str,
+    ) -> Result<(CharacterProjection, WorldEvent)> {
+        let cid = resolve_character_id(&self.db, character_id)?;
+        let proj = load_character_projection(&self.db, &cid, None)?;
+        let summary = format!(
+            "{}: removed resource '{}'{}",
+            proj.baseline.name,
+            resource,
+            if reason.is_empty() {
+                String::new()
+            } else {
+                format!(" — {reason}")
+            }
+        );
+        let ev = self.db.append_event(
+            proj.current.current_location.clone(),
+            vec![cid.clone()],
+            summary,
+            EventPayload::ResourceChanged {
+                character_id: cid.clone(),
+                resource: resource.to_string(),
+                delta: None,
+                set_current: None,
+                set_max: None,
+                unit: None,
+                remove: true,
                 reason: reason.to_string(),
             },
         )?;
@@ -499,22 +1060,66 @@ impl CampaignEngine {
     pub fn add_item(
         &self,
         character_id: &str,
-        item: Item,
+        mut item: Item,
         reason: &str,
     ) -> Result<(CharacterProjection, WorldEvent)> {
         let cid = resolve_character_id(&self.db, character_id)?;
         let proj = load_character_projection(&self.db, &cid, None)?;
+        // Canonicalize any garment measurement keys
+        if !item.garment_measurements.is_empty() {
+            let mut norm = std::collections::BTreeMap::new();
+            for (k, v) in item.garment_measurements {
+                let nk = crate::autonomy::normalize_measurement_key(&k);
+                if !nk.is_empty() && !v.trim().is_empty() {
+                    norm.insert(nk, v.trim().to_string());
+                }
+            }
+            item.garment_measurements = norm;
+        }
+        // Normalize explicit tags and auto-infer primary category tags when acquiring a new item
+        item.tags = crate::models::normalize_item_tags(&item.tags);
+        if item.quantity > 0 && !crate::models::has_primary_item_category_tag(&item.tags) {
+            let inferred = crate::models::infer_item_tags(
+                &item.name,
+                item.slot.as_deref(),
+                None,
+                &item.description,
+                !item.garment_measurements.is_empty(),
+            );
+            for t in inferred {
+                if !item.tags.iter().any(|e| e == &t) {
+                    item.tags.push(t);
+                }
+            }
+        }
+        // Hard guard: refuse equipping a garment whose dimensions are too small for the character's current body
+        if item.equipped && !item.garment_measurements.is_empty() {
+            if let Ok(Some(prof)) = self.db.get_character_profile(&cid) {
+                if let Some(rep) = crate::autonomy::evaluate_garment_fit(&item, &prof.avatar) {
+                    if !rep.can_equip {
+                        bail!(
+                            "Cannot equip '{}' on {} — garment is too small to fit: {}. Acquire it unequipped (`equipped: false`) or tailor its dimensions first.",
+                            item.name,
+                            proj.baseline.name,
+                            rep.blocking_reasons.join("; ")
+                        );
+                    }
+                }
+            }
+        }
         let summary = format!(
-            "{} acquired {} x{}{}",
+            "{} {} {} x{}{}",
             proj.baseline.name,
+            if item.quantity == 0 { "updated/tailored" } else { "acquired" },
             item.name,
-            item.quantity,
+            if item.quantity == 0 { 1 } else { item.quantity },
             if reason.is_empty() {
                 String::new()
             } else {
                 format!(" — {reason}")
             }
         );
+        let sync_item = item.clone();
         let ev = self.db.append_event(
             proj.current.current_location.clone(),
             vec![cid.clone()],
@@ -524,6 +1129,43 @@ impl CampaignEngine {
                 item,
             },
         )?;
+        // Mirror garment sizing/cut/taper/tags onto any matching CatalogItem held by this character
+        if !sync_item.garment_measurements.is_empty()
+            || !sync_item.garment_cut.is_empty()
+            || !sync_item.garment_taper.is_empty()
+            || !sync_item.tags.is_empty()
+        {
+            if let Ok(cat_items) = self.db.list_catalog_items() {
+                for mut ci in cat_items {
+                    if ci.current_holder_id.as_deref() == Some(cid.as_str())
+                        && ci.name.eq_ignore_ascii_case(&sync_item.name)
+                    {
+                        if !sync_item.garment_measurements.is_empty() {
+                            ci.garment_measurements = sync_item.garment_measurements.clone();
+                        }
+                        if !sync_item.garment_cut.is_empty() {
+                            ci.garment_cut = sync_item.garment_cut.clone();
+                        }
+                        if !sync_item.garment_taper.is_empty() {
+                            ci.garment_taper = sync_item.garment_taper.clone();
+                        }
+                        if sync_item.slot.is_some() {
+                            ci.slot = sync_item.slot.clone();
+                        }
+                        if !sync_item.tags.is_empty() {
+                            for t in &sync_item.tags {
+                                if !ci.tags.iter().any(|e| e.eq_ignore_ascii_case(t)) {
+                                    ci.tags.push(t.clone());
+                                }
+                            }
+                            ci.tags = crate::models::normalize_item_tags(&ci.tags);
+                        }
+                        let _ = self.db.upsert_catalog_item(&ci);
+                    }
+                }
+            }
+        }
+        let _ = self.sync_apparel_discomfort(&cid, 0);
         self.maybe_compile()?;
         Ok((load_character_projection(&self.db, &cid, None)?, ev))
     }
@@ -572,6 +1214,31 @@ impl CampaignEngine {
     ) -> Result<(CharacterProjection, WorldEvent)> {
         let cid = resolve_character_id(&self.db, character_id)?;
         let proj = load_character_projection(&self.db, &cid, None)?;
+        if equipped {
+            if let Some(existing) = proj
+                .current
+                .equipment
+                .iter()
+                .find(|i| i.name.eq_ignore_ascii_case(item_name))
+            {
+                if !existing.garment_measurements.is_empty() {
+                    if let Ok(Some(prof)) = self.db.get_character_profile(&cid) {
+                        if let Some(rep) =
+                            crate::autonomy::evaluate_garment_fit(existing, &prof.avatar)
+                        {
+                            if !rep.can_equip {
+                                bail!(
+                                    "Cannot equip '{}' on {} — garment is too small to fit: {}. It must be tailored/altered or replaced before it can be worn.",
+                                    existing.name,
+                                    proj.baseline.name,
+                                    rep.blocking_reasons.join("; ")
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let verb = if equipped { "equipped" } else { "unequipped" };
         let summary = format!("{} {} '{}'", proj.baseline.name, verb, item_name);
         let ev = self.db.append_event(
@@ -585,8 +1252,384 @@ impl CampaignEngine {
                 equipped,
             },
         )?;
+        let _ = self.sync_apparel_discomfort(&cid, 0);
         self.maybe_compile()?;
         Ok((load_character_projection(&self.db, &cid, None)?, ev))
+    }
+
+    /// Adds, removes, or replaces tags on an existing item in a character's inventory and mirrors to any matching held CatalogItem.
+    pub fn update_item_tags(
+        &self,
+        character_id: &str,
+        item_name: &str,
+        add_tags: Vec<String>,
+        remove_tags: Vec<String>,
+        replace_tags: Option<Vec<String>>,
+        reason: &str,
+    ) -> Result<(CharacterProjection, WorldEvent)> {
+        let cid = resolve_character_id(&self.db, character_id)?;
+        let proj = load_character_projection(&self.db, &cid, None)?;
+        let matched = proj
+            .current
+            .equipment
+            .iter()
+            .find(|i| i.name.eq_ignore_ascii_case(item_name))
+            .ok_or_else(|| {
+                anyhow!(
+                    "Item '{}' not found in {}'s inventory.",
+                    item_name,
+                    proj.baseline.name
+                )
+            })?;
+        let canonical_name = matched.name.clone();
+        let add_norm = crate::models::normalize_item_tags(&add_tags);
+        let rem_norm = crate::models::normalize_item_tags(&remove_tags);
+        let rep_norm = replace_tags.map(|v| crate::models::normalize_item_tags(&v));
+
+        let mut detail_parts = Vec::new();
+        if let Some(ref rep) = rep_norm {
+            detail_parts.push(format!("set=[{}]", rep.join(", ")));
+        }
+        if !add_norm.is_empty() {
+            detail_parts.push(format!("+{}", add_norm.join(", +")));
+        }
+        if !rem_norm.is_empty() {
+            detail_parts.push(format!("-{}", rem_norm.join(", -")));
+        }
+        let summary = format!(
+            "{} updated tags on '{}' ({}){}",
+            proj.baseline.name,
+            canonical_name,
+            detail_parts.join(" "),
+            if reason.is_empty() {
+                String::new()
+            } else {
+                format!(" — {reason}")
+            }
+        );
+        let ev = self.db.append_event(
+            proj.current.current_location.clone(),
+            vec![cid.clone()],
+            summary,
+            EventPayload::ItemTagsUpdated {
+                character_id: cid.clone(),
+                item_name: canonical_name.clone(),
+                add_tags: add_norm,
+                remove_tags: rem_norm,
+                replace_tags: rep_norm,
+                reason: reason.to_string(),
+            },
+        )?;
+        let updated_proj = load_character_projection(&self.db, &cid, None)?;
+        if let Some(updated_item) = updated_proj
+            .current
+            .equipment
+            .iter()
+            .find(|i| i.name.eq_ignore_ascii_case(&canonical_name))
+        {
+            if let Ok(cat_items) = self.db.list_catalog_items() {
+                for mut ci in cat_items {
+                    if ci.current_holder_id.as_deref() == Some(cid.as_str())
+                        && ci.name.eq_ignore_ascii_case(&canonical_name)
+                    {
+                        ci.tags = updated_item.tags.clone();
+                        let _ = self.db.upsert_catalog_item(&ci);
+                    }
+                }
+            }
+        }
+        self.maybe_compile()?;
+        Ok((updated_proj, ev))
+    }
+
+    /// Deterministically normalizes existing tags and infers missing primary category tags across a character's inventory.
+    pub fn auto_tag_character_inventory(
+        &self,
+        character_id: &str,
+        reason: &str,
+    ) -> Result<serde_json::Value> {
+        let cid = resolve_character_id(&self.db, character_id)?;
+        let proj = load_character_projection(&self.db, &cid, None)?;
+        let mut updates: Vec<(String, Vec<String>)> = Vec::new();
+        for item in &proj.current.equipment {
+            let mut desired = crate::models::normalize_item_tags(&item.tags);
+            if !crate::models::has_primary_item_category_tag(&desired) {
+                let inferred = crate::models::infer_item_tags(
+                    &item.name,
+                    item.slot.as_deref(),
+                    None,
+                    &item.description,
+                    !item.garment_measurements.is_empty(),
+                );
+                for t in inferred {
+                    if !desired.iter().any(|e| e == &t) {
+                        desired.push(t);
+                    }
+                }
+            }
+            if desired != item.tags {
+                updates.push((item.name.clone(), desired));
+            }
+        }
+        let reason_txt = if reason.is_empty() {
+            "Auto-classified inventory tags"
+        } else {
+            reason
+        };
+        let updated_count = updates.len();
+        let mut tagged_items = Vec::new();
+        if !updates.is_empty() {
+            self.with_deferred_compile(|eng| -> Result<()> {
+                for (iname, new_tags) in updates {
+                    let _ = eng.update_item_tags(
+                        &cid,
+                        &iname,
+                        vec![],
+                        vec![],
+                        Some(new_tags.clone()),
+                        reason_txt,
+                    )?;
+                    tagged_items.push(serde_json::json!({ "name": iname, "tags": new_tags }));
+                }
+                Ok(())
+            })?;
+        }
+        let inv = self.search_inventory(&crate::search::InventorySearchFilter {
+            character_id: Some(cid.clone()),
+            ..Default::default()
+        })?;
+        Ok(serde_json::json!({
+            "character_id": cid,
+            "updated_count": updated_count,
+            "tagged_items": tagged_items,
+            "tag_facets": inv.tag_facets,
+            "total_items": inv.total_inventory_count
+        }))
+    }
+
+    /// Updates tags directly on a CatalogItem and mirrors the change into the holder's character inventory if held by a character.
+    pub fn update_catalog_item_tags(
+        &self,
+        item_id: &str,
+        add_tags: Vec<String>,
+        remove_tags: Vec<String>,
+        replace_tags: Option<Vec<String>>,
+        reason: &str,
+    ) -> Result<(CatalogItem, WorldEvent)> {
+        let mut item = self.get_catalog_item(item_id)?;
+        let meta = self.db.get_campaign_meta()?;
+        item.updated_at_world_time = meta.clock.format_short();
+        if let Some(rep) = replace_tags {
+            item.tags = crate::models::normalize_item_tags(&rep);
+        } else {
+            item.tags = crate::models::normalize_item_tags(&item.tags);
+        }
+        let rem_norm = crate::models::normalize_item_tags(&remove_tags);
+        if !rem_norm.is_empty() {
+            item.tags.retain(|t| !rem_norm.iter().any(|r| r == t));
+        }
+        for t in crate::models::normalize_item_tags(&add_tags) {
+            if !item.tags.iter().any(|e| e == &t) {
+                item.tags.push(t);
+            }
+        }
+        self.db.upsert_catalog_item(&item)?;
+        if let Some(ref holder) = item.current_holder_id {
+            if self.db.get_character_baseline(holder)?.is_some() {
+                let _ = self.update_item_tags(
+                    holder,
+                    &item.name,
+                    vec![],
+                    vec![],
+                    Some(item.tags.clone()),
+                    if reason.is_empty() {
+                        "Synced tags from catalog item"
+                    } else {
+                        reason
+                    },
+                );
+            }
+        }
+        let ev = self.db.append_event(
+            item.current_holder_id.clone(),
+            vec![item.id.clone()],
+            format!(
+                "Updated tags on catalog item '{}': [{}]{}",
+                item.name,
+                item.tags.join(", "),
+                if reason.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {reason}")
+                }
+            ),
+            EventPayload::ItemCataloged {
+                item_id: item.id.clone(),
+                action: "tagged".to_string(),
+                holder_id: item.current_holder_id.clone(),
+                notes: reason.to_string(),
+            },
+        )?;
+        self.maybe_compile()?;
+        Ok((item, ev))
+    }
+
+    pub fn search_inventory(
+        &self,
+        filter: &crate::search::InventorySearchFilter,
+    ) -> Result<crate::search::InventorySearchResult> {
+        crate::search::search_character_inventory(&self.db, filter)
+    }
+
+    /// Idempotently synchronizes persistent apparel discomfort status conditions from a character's
+    /// live equipped garment fit (`odd_taper`/`baggy` -> awkward drape condition; `tight_restrictive`/
+    /// `cannot_fit_too_small` -> binding & chafing debuff; 4+ hours of tight/outgrown wear -> lingering
+    /// `Chafed & Sore` recovery condition until rested). Automatically clears active garment discomfort
+    /// once well-fitted clothes are worn.
+    pub fn sync_apparel_discomfort(&self, character_id: &str, prolonged_hours: u64) -> Result<()> {
+        const COND_AWKWARD: &str = "Apparel Discomfort: Awkward Drape & Hitching";
+        const COND_BINDING: &str = "Apparel Discomfort: Binding & Chafing";
+        const COND_CHAFED: &str = "Chafed & Sore (Prolonged Tight Garments)";
+
+        let cid = resolve_character_id(&self.db, character_id)?;
+        let proj = load_character_projection(&self.db, &cid, None)?;
+        let has_sized_equipped = proj
+            .current
+            .equipment
+            .iter()
+            .any(|i| i.equipped && !i.garment_measurements.is_empty());
+        let has_active_apparel_cond = proj.current.conditions.iter().any(|c| {
+            c.name.eq_ignore_ascii_case(COND_AWKWARD) || c.name.eq_ignore_ascii_case(COND_BINDING)
+        });
+        if !has_sized_equipped && !has_active_apparel_cond {
+            return Ok(());
+        }
+
+        let Some(prof) = self.db.get_character_profile(&cid)? else {
+            return Ok(());
+        };
+        let app = crate::autonomy::evaluate_equipped_apparel_fit(&proj.current.equipment, &prof.avatar);
+
+        let existing_awk = proj
+            .current
+            .conditions
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(COND_AWKWARD));
+        let existing_bind = proj
+            .current
+            .conditions
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(COND_BINDING));
+        let existing_chafed = proj
+            .current
+            .conditions
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case(COND_CHAFED));
+
+        match app.discomfort_tier.as_str() {
+            "awkward_drape" => {
+                if existing_bind.is_some() {
+                    let _ = self.remove_condition(
+                        &cid,
+                        COND_BINDING,
+                        "Switched out of tight/outgrown garments",
+                    );
+                }
+                let ill_names: Vec<String> = app
+                    .reports
+                    .iter()
+                    .filter(|r| {
+                        matches!(
+                            r.fit_status.as_str(),
+                            "odd_taper" | "baggy" | "baggy_odd_taper"
+                        )
+                    })
+                    .map(|r| format!("{} ({})", r.item_name, r.fit_status))
+                    .collect();
+                let desired_notes = format!(
+                    "Nagging tugging, bunching, and constant adjustment from ill-cut or baggy garments ({}). Live appearance/movement penalties are auto-applied by apparel fit.",
+                    ill_names.join(", ")
+                );
+                let needs_upsert = existing_awk
+                    .map(|c| c.notes != desired_notes)
+                    .unwrap_or(true);
+                if needs_upsert {
+                    let _ = self.add_condition(
+                        &cid,
+                        StatusCondition {
+                            name: COND_AWKWARD.to_string(),
+                            kind: "condition".to_string(),
+                            severity: "ongoing".to_string(),
+                            duration: "While wearing ill-fitting clothes".to_string(),
+                            source: "Equipped Apparel Fit".to_string(),
+                            notes: desired_notes,
+                        },
+                    );
+                }
+            }
+            "binding_chafing" | "painful_outgrown" => {
+                if existing_awk.is_some() {
+                    let _ = self.remove_condition(
+                        &cid,
+                        COND_AWKWARD,
+                        "Escalated to tight/binding garment discomfort",
+                    );
+                }
+                let is_outgrown = app.discomfort_tier == "painful_outgrown";
+                let pen = if is_outgrown { -2 } else { -1 };
+                let sev = if is_outgrown { "moderate" } else { "minor" };
+                let desired_notes = format!(
+                    "{pen} [scope: concentration, meditation, wisdom, stealth, sleep, rest] Pinching seams and tight binding irritate skin, distract focus, and disturb breathing/rest: {}",
+                    app.brief
+                );
+                let needs_upsert = existing_bind
+                    .map(|c| c.notes != desired_notes || c.severity != sev)
+                    .unwrap_or(true);
+                if needs_upsert {
+                    let _ = self.add_condition(
+                        &cid,
+                        StatusCondition {
+                            name: COND_BINDING.to_string(),
+                            kind: "debuff".to_string(),
+                            severity: sev.to_string(),
+                            duration: "While wearing tight/outgrown clothes".to_string(),
+                            source: "Equipped Apparel Fit".to_string(),
+                            notes: desired_notes,
+                        },
+                    );
+                }
+                if prolonged_hours >= 4 && !existing_chafed {
+                    let _ = self.add_condition(
+                        &cid,
+                        StatusCondition {
+                            name: COND_CHAFED.to_string(),
+                            kind: "condition".to_string(),
+                            severity: "minor".to_string(),
+                            duration: "Until rested".to_string(),
+                            source: "Prolonged Tight Garment Wear".to_string(),
+                            notes: "-1 [scope: concentration, meditation, wisdom, stealth, sleep, rest] Lingering red welt lines and chafed soreness from hours spent in tight or outgrown clothes; persists after unequipping until rested.".to_string(),
+                        },
+                    );
+                }
+            }
+            _ => {
+                if existing_awk.is_some() {
+                    let _ = self.remove_condition(
+                        &cid,
+                        COND_AWKWARD,
+                        "Apparel now fits cleanly or was unequipped",
+                    );
+                }
+                if existing_bind.is_some() {
+                    let _ = self.remove_condition(
+                        &cid,
+                        COND_BINDING,
+                        "Tight/outgrown garments removed or tailored",
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn upsert_skill(
@@ -624,13 +1667,47 @@ impl CampaignEngine {
     pub fn upsert_technique(
         &self,
         character_id: &str,
-        technique: Technique,
+        mut technique: Technique,
         reason: &str,
     ) -> Result<(CharacterProjection, WorldEvent)> {
         let cid = resolve_character_id(&self.db, character_id)?;
         let proj = load_character_projection(&self.db, &cid, None)?;
+        self.resolve_manual_link(
+            &mut technique.source_text_id,
+            &mut technique.source_item_id,
+            &mut technique.manual_title,
+        );
+        if let Some(ref tid) = technique.progression_track_id {
+            let trimmed = tid.trim();
+            technique.progression_track_id = if trimmed.is_empty() {
+                None
+            } else {
+                Some(slugify(trimmed))
+            };
+        }
+        let mut involved = vec![cid.clone()];
+        if let Some(ref st) = technique.source_text_id {
+            involved.push(st.clone());
+        }
+        if let Some(ref si) = technique.source_item_id {
+            if !involved.contains(si) {
+                involved.push(si.clone());
+            }
+        }
+        if let Some(ref pt) = technique.progression_track_id {
+            if !involved.contains(pt) {
+                involved.push(pt.clone());
+            }
+        }
+        let manual_tag = if !technique.manual_title.is_empty() {
+            format!(" [Manual: {}]", technique.manual_title)
+        } else if let Some(ref st) = technique.source_text_id {
+            format!(" [Manual: {st}]")
+        } else {
+            String::new()
+        };
         let summary = format!(
-            "{} learned/updated technique '{}' ({}){}",
+            "{} learned/updated technique '{}' ({}){}{}",
             proj.baseline.name,
             technique.name,
             if technique.mastery.is_empty() {
@@ -638,6 +1715,7 @@ impl CampaignEngine {
             } else {
                 &technique.mastery
             },
+            manual_tag,
             if reason.is_empty() {
                 String::new()
             } else {
@@ -646,7 +1724,7 @@ impl CampaignEngine {
         );
         let ev = self.db.append_event(
             proj.current.current_location.clone(),
-            vec![cid.clone()],
+            involved,
             summary,
             EventPayload::TechniqueUpdated {
                 character_id: cid.clone(),
@@ -1471,6 +2549,21 @@ impl CampaignEngine {
             }
         }
         item.related_ids = item.related_ids.into_iter().map(|s| slugify(&s)).collect();
+        item.tags = crate::models::normalize_item_tags(&item.tags);
+        if !crate::models::has_primary_item_category_tag(&item.tags) {
+            let inferred = crate::models::infer_item_tags(
+                &item.name,
+                item.slot.as_deref(),
+                Some(&item.item_type),
+                &item.description,
+                !item.garment_measurements.is_empty(),
+            );
+            for t in inferred {
+                if !item.tags.iter().any(|e| e == &t) {
+                    item.tags.push(t);
+                }
+            }
+        }
 
         let meta = self.db.get_campaign_meta()?;
         let now_world = meta.clock.format_short();
@@ -1752,7 +2845,7 @@ impl CampaignEngine {
                     .equipment
                     .iter()
                     .any(|i| i.name.eq_ignore_ascii_case(&item.name));
-                if !already_has {
+                if !already_has || !item.garment_measurements.is_empty() || !item.garment_cut.is_empty() || !item.garment_taper.is_empty() {
                     let mut tags = item.tags.clone();
                     if !tags.iter().any(|t| t.eq_ignore_ascii_case(&item.item_type)) {
                         tags.push(item.item_type.clone());
@@ -1760,7 +2853,7 @@ impl CampaignEngine {
                     let inv_item = Item {
                         name: item.name.clone(),
                         slot: item.slot.clone(),
-                        quantity: item.quantity,
+                        quantity: if already_has { 0 } else { item.quantity },
                         equipped: item.equipped,
                         durability: Some(item.condition_or_durability.clone()),
                         tags,
@@ -1769,16 +2862,26 @@ impl CampaignEngine {
                         } else {
                             item.description.clone()
                         },
+                        garment_measurements: item.garment_measurements.clone(),
+                        garment_cut: item.garment_cut.clone(),
+                        garment_taper: item.garment_taper.clone(),
                     };
                     let _ = self.db.append_event(
                         proj.current.current_location.clone(),
                         vec![cur_h.clone(), item.id.clone()],
-                        format!("{} carries '{}' [{}]", proj.baseline.name, item.name, item.item_type),
+                        format!(
+                            "{} {} '{}' [{}]",
+                            proj.baseline.name,
+                            if already_has { "updated sizing for" } else { "carries" },
+                            item.name,
+                            item.item_type
+                        ),
                         EventPayload::ItemAcquired {
                             character_id: cur_h.clone(),
                             item: inv_item,
                         },
                     )?;
+                    let _ = self.sync_apparel_discomfort(cur_h, 0);
                 }
             }
         }
@@ -1814,6 +2917,7 @@ impl CampaignEngine {
             related_ids: text.related_ids.clone(),
             created_at_world_time: text.created_at_world_time.clone(),
             updated_at_world_time: text.updated_at_world_time.clone(),
+            ..Default::default()
         });
 
         item.name = text.title.clone();
@@ -1930,6 +3034,11 @@ impl CampaignEngine {
         clock.segments = clock.segments.max(1);
         clock.filled = clock.filled.clamp(0, clock.segments);
         clock.related_ids = clock.related_ids.into_iter().map(|s| slugify(&s)).collect();
+        if clock.cadence_hours.is_some() && clock.last_tick_total_hours.is_none() {
+            if let Ok(meta) = self.db.get_campaign_meta() {
+                clock.last_tick_total_hours = Some(meta.clock.total_hours());
+            }
+        }
 
         self.db.upsert_clock(&clock)?;
         let summary = format!(
@@ -2195,6 +3304,9 @@ impl CampaignEngine {
             durability: existing.durability,
             tags: existing.tags,
             description: existing.description,
+            garment_measurements: existing.garment_measurements,
+            garment_cut: existing.garment_cut,
+            garment_taper: existing.garment_taper,
         };
         let (_, ev_add) = self.add_item(&to_id, transferred_item, &reason_to)?;
         Ok((ev_rem, ev_add))
@@ -2277,6 +3389,36 @@ impl CampaignEngine {
                         &cid,
                         cond_name,
                         &format!("Cleared during {rest_type} rest"),
+                    )?;
+                    summaries.push(ev.summary);
+                }
+            }
+            // Auto-clear lingering garment chafing during rest unless still sleeping in tight/outgrown clothes
+            if proj
+                .current
+                .conditions
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case("Chafed & Sore (Prolonged Tight Garments)"))
+            {
+                let still_tight = self
+                    .db
+                    .get_character_profile(&cid)
+                    .ok()
+                    .flatten()
+                    .map(|prof| {
+                        let tier = crate::autonomy::evaluate_equipped_apparel_fit(
+                            &proj.current.equipment,
+                            &prof.avatar,
+                        )
+                        .discomfort_tier;
+                        tier == "binding_chafing" || tier == "painful_outgrown"
+                    })
+                    .unwrap_or(false);
+                if !still_tight {
+                    let (_, ev) = self.remove_condition(
+                        &cid,
+                        "Chafed & Sore (Prolonged Tight Garments)",
+                        &format!("Skin chafing recovered during {rest_type} rest"),
                     )?;
                     summaries.push(ev.summary);
                 }
@@ -2431,20 +3573,91 @@ impl CampaignEngine {
         };
         let location_id = place_proj.as_ref().map(|p| p.baseline.id.clone());
 
-        let hydrated = if hydrate {
-            collect_hydrated_modifiers(
+        let actor_prof = resolved_actor_id
+            .as_deref()
+            .and_then(|cid| self.db.get_character_profile(cid).ok().flatten());
+        let active_injuries = resolved_actor_id
+            .as_deref()
+            .and_then(|cid| self.db.list_injuries(Some(cid), false).ok())
+            .unwrap_or_default();
+        let actor_encumbrance = actor_proj.as_ref().map(|ch| {
+            let econ_map = self.db.list_item_economics_map().unwrap_or_default();
+            compute_encumbrance(ch, &econ_map)
+        });
+        let mut hydrated = if hydrate {
+            collect_hydrated_modifiers_ext(
                 &profile,
                 actor_proj.as_ref(),
+                actor_prof.as_ref(),
                 place_proj.as_ref(),
                 req.stat.as_deref(),
                 req.skill.as_deref(),
                 req.technique.as_deref(),
                 &req.equipment,
                 &req.action,
+                HydrationExtras {
+                    injuries: &active_injuries,
+                    encumbrance: actor_encumbrance.as_ref(),
+                },
             )
         } else {
             HydrationOutcome::default()
         };
+
+        // Hydrate active stateful progression track modifier (explicit `progression_track` or tag match)
+        if hydrate {
+            if let Some(ref cid) = resolved_actor_id {
+                if let Ok(tracks) = self.db.list_character_progressions(cid) {
+                    let skill_l = req.skill.as_deref().unwrap_or("").trim().to_lowercase();
+                    let action_l = req.action.to_lowercase();
+                    let explicit_tr = req
+                        .progression_track
+                        .as_deref()
+                        .map(|s| s.trim().to_lowercase())
+                        .filter(|s| !s.is_empty());
+                    let mut matched_explicit = false;
+                    for tr in &tracks {
+                        if matches!(tr.status.as_str(), "halted" | "crippled") {
+                            continue;
+                        }
+                        let is_explicit = explicit_tr.as_ref().is_some_and(|e| {
+                            tr.track_id.to_lowercase() == *e
+                                || tr.name.to_lowercase() == *e
+                                || tr.name.to_lowercase().contains(e)
+                        });
+                        if is_explicit {
+                            matched_explicit = true;
+                        }
+                        let tag_match = tr.check_tags.iter().any(|tag| {
+                            let tl = tag.trim().to_lowercase();
+                            !tl.is_empty()
+                                && ((!skill_l.is_empty()
+                                    && (skill_l.contains(&tl)
+                                        || slugify(&skill_l) == slugify(&tl)))
+                                    || (tl.len() >= 4 && action_l.contains(&tl)))
+                        });
+                        if (is_explicit || tag_match) && tr.check_modifier != 0 {
+                            hydrated.modifiers.push(ModifierSource {
+                                source: format!("progression:{}", tr.track_id),
+                                value: tr.check_modifier,
+                                category: "progression".to_string(),
+                                notes: format!("{} — {}", tr.name, tr.format_stage()),
+                            });
+                        }
+                    }
+                    if let Some(ref exp_name) = explicit_tr {
+                        if !matched_explicit {
+                            let msg = format!(
+                                "Unknown progression track '{}' on '{}' (not enrolled; treated as +0).",
+                                exp_name, cid
+                            );
+                            hydrated.warnings.push(msg.clone());
+                            hydrated.missing_refs.push(msg);
+                        }
+                    }
+                }
+            }
+        }
 
         if req.strict_validation && !hydrated.missing_refs.is_empty() {
             bail!(
@@ -2454,6 +3667,18 @@ impl CampaignEngine {
             );
         }
 
+        let (final_dc, dc_breakdown) = resolve_dc(
+            &profile,
+            if req.dc_tier.is_some() && req.difficulty == 0 {
+                None
+            } else {
+                Some(req.difficulty)
+            },
+            req.dc_tier.as_deref(),
+            &req.dc_factors,
+        )?;
+        req.difficulty = final_dc;
+
         let mut res = evaluate_check(
             &profile,
             &req,
@@ -2461,6 +3686,7 @@ impl CampaignEngine {
             hydrated.warnings,
             location_id.clone(),
         )?;
+        res.dc_breakdown = dc_breakdown;
 
         if !req.dry_run && req.log_to_ledger {
             let mut affected = Vec::new();
@@ -2503,12 +3729,87 @@ impl CampaignEngine {
                     modifiers_json: serde_json::to_value(&res.modifiers).unwrap_or_default(),
                 },
                 EventCausalMeta {
-                    actor_id: resolved_actor_id,
+                    actor_id: resolved_actor_id.clone(),
                     causal_event_ids: req.causal_event_ids,
                     visibility: req.visibility,
                 },
             )?;
             res.event_id = Some(ev.seq);
+
+            // Automatic difficulty-scaled Skill XP progression on live skill checks!
+            let should_award_xp = req.award_skill_xp.unwrap_or(profile.auto_skill_xp);
+            if should_award_xp {
+                if let (Some(ref cid), Some(ref sk_name)) =
+                    (&resolved_actor_id, req.skill.as_deref().filter(|s| !s.trim().is_empty()))
+                {
+                    let has_skill_or_standard = actor_proj.as_ref().is_some_and(|ch| {
+                        let tl = sk_name.trim().to_lowercase();
+                        ch.current.skills.iter().any(|s| {
+                            let sn = s.name.to_lowercase();
+                            sn == tl || sn.contains(&tl) || tl.contains(&sn)
+                        })
+                    }) || lookup_skill_definition(&profile, sk_name).is_some();
+
+                    if has_skill_or_standard {
+                        let xp_gain =
+                            calculate_skill_xp_gain(&res.outcome, res.difficulty, &profile.xp_curve);
+                        if xp_gain > 0 {
+                            if let Ok((prog, _)) = self.grant_skill_xp(
+                                cid,
+                                sk_name,
+                                xp_gain,
+                                Some(&profile.id),
+                                &format!("Check '{}' ({})", res.action, res.outcome),
+                            ) {
+                                if prog.leveled_up {
+                                    let _ = self.emit_signal(crate::signals::EngineSignal {
+                                        id: String::new(),
+                                        dedup_key: format!("skill_rank_up:{cid}:{}:{}", slugify(&prog.skill_name), prog.new_rank),
+                                        code: "SKILL_RANK_UP".to_string(),
+                                        severity: "info".to_string(),
+                                        category: "progression".to_string(),
+                                        title: format!("Skill Rank Up: '{}' -> {}", prog.skill_name, prog.new_rank),
+                                        summary: format!(
+                                            "{} advanced '{}' from {} to {} (proficiency {:+}).",
+                                            actor_proj.as_ref().map(|c| c.baseline.name.as_str()).unwrap_or(cid),
+                                            prog.skill_name,
+                                            prog.old_rank,
+                                            prog.new_rank,
+                                            prog.new_bonus
+                                        ),
+                                        entity_ids: vec![cid.clone()],
+                                        location_id: res.location_id.clone(),
+                                        suggested_actions: vec![],
+                                        visibility: "player".to_string(),
+                                        status: "active".to_string(),
+                                        source_event_seq: res.event_id,
+                                        created_at_world_time: String::new(),
+                                        updated_at_world_time: String::new(),
+                                    });
+                                }
+                                res.skill_progression = Some(prog);
+                            }
+
+                            // Coupled Activity XP: trickle into governing Stat Training XP & matching active Jobs!
+                            if profile.auto_stat_and_job_xp {
+                                let (st_gained, jb_gained) = self
+                                    .award_coupled_activity_xp(
+                                        cid,
+                                        sk_name,
+                                        req.stat.as_deref(),
+                                        xp_gain,
+                                        &profile,
+                                        res.event_id,
+                                    )
+                                    .unwrap_or((None, Vec::new()));
+                                res.stat_xp_gained = st_gained;
+                                res.job_xp_gained = jb_gained;
+                            }
+                        }
+                    }
+                }
+            }
+
             self.maybe_compile()?;
         }
 
@@ -2549,17 +3850,26 @@ impl CampaignEngine {
             }
             affected.push(cid.clone());
 
+            let actor_prof = self.db.get_character_profile(&cid).ok().flatten();
+            let p_injuries = self.db.list_injuries(Some(&cid), false).unwrap_or_default();
+            let econ_map = self.db.list_item_economics_map().unwrap_or_default();
+            let p_enc = compute_encumbrance(&proj, &econ_map);
             let hydrate = p.auto_hydrate.unwrap_or(profile.auto_hydrate);
             let hydrated = if hydrate {
-                collect_hydrated_modifiers(
+                collect_hydrated_modifiers_ext(
                     &profile,
                     Some(&proj),
+                    actor_prof.as_ref(),
                     place.as_ref(),
                     p.stat.as_deref(),
                     p.skill.as_deref(),
                     p.technique.as_deref(),
                     &p.equipment,
                     &req.action,
+                    HydrationExtras {
+                        injuries: &p_injuries,
+                        encumbrance: Some(&p_enc),
+                    },
                 )
             } else {
                 HydrationOutcome::default()
@@ -2583,13 +3893,17 @@ impl CampaignEngine {
                 stat: p.stat.clone(),
                 skill: p.skill.clone(),
                 technique: p.technique.clone(),
+                progression_track: p.progression_track.clone(),
                 equipment: p.equipment.clone(),
                 difficulty: 0,
+                dc_tier: None,
+                dc_factors: vec![],
                 modifier: p.modifier,
                 situational_modifiers: p.situational_modifiers.clone(),
                 advantage: p.advantage.clone(),
                 dice_override: p.dice_override.clone(),
                 auto_hydrate: Some(hydrate),
+                award_skill_xp: Some(false),
                 stakes: req.stakes.clone(),
                 seed: Some(sub_seed),
                 dry_run: false,
@@ -3048,6 +4362,7 @@ impl CampaignEngine {
                         related_ids: disc.location_id.clone().into_iter().collect(),
                         created_at_world_time: String::new(),
                         updated_at_world_time: String::new(),
+                        ..Default::default()
                     };
                     let _ = self.upsert_catalog_item(cat, &format!("Claimed from {}", disc.id))?;
                 } else {
@@ -3059,6 +4374,7 @@ impl CampaignEngine {
                         durability: Some(item.condition_or_durability.clone()),
                         tags: item.tags.clone(),
                         description: item.description.clone(),
+                        ..Default::default()
                     };
                     let _ = self.add_item(
                         &cid,
@@ -3421,11 +4737,21 @@ impl CampaignEngine {
             existing.reaction_available = participant.reaction_available;
         } else {
             let mut new_p = participant;
-            new_p.entity_id = pid;
+            new_p.entity_id = pid.clone();
             enc.participants.push(new_p);
             enc.sort_initiative();
         }
         self.db.upsert_encounter(&enc)?;
+        let _ = self.db.append_event(
+            enc.location_id.clone(),
+            vec![eid.clone(), pid.clone()],
+            format!("Encounter '{}' participant updated: {}", enc.title, pid),
+            EventPayload::NarrativeEvent {
+                title: format!("Encounter Participant Updated: {pid}"),
+                details: format!("Updated participant '{pid}' in encounter '{}'", enc.title),
+                tags: vec!["encounter".to_string(), "participant".to_string()],
+            },
+        )?;
         self.maybe_compile()?;
         Ok(enc)
     }
@@ -3519,18 +4845,246 @@ impl CampaignEngine {
             .as_object_mut()
             .and_then(|m| m.remove("upsert_goal"));
 
+        // Deep-merge nested `avatar` object AND support flat avatar/measurement convenience keys
+        const AVATAR_FLAT_KEYS: &[&str] = &[
+            "avatar_summary",
+            "appearance_stage",
+            "height",
+            "weight",
+            "baseline_height",
+            "baseline_weight",
+            "chronological_age",
+            "apparent_age",
+            "lifespan_years",
+            "body_type_or_build",
+            "silhouette",
+            "posture_and_gait",
+            "proportions_summary",
+            "clothing_fit",
+            "perceived_change_note",
+            "transformation_trajectory",
+            "face_shape_and_features",
+            "eyes",
+            "skin_tone_and_texture",
+            "hair",
+            "facial_hair",
+            "voice_and_speech",
+            "scent_or_aura",
+            "gender",
+            "species",
+            "portrait_attachment_id",
+            "visual_prompt_anchor",
+            "active_outfit",
+        ];
+        let replace_measurements = patch
+            .get("replace_measurements")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let replace_baseline_measurements = patch
+            .get("replace_baseline_measurements")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let record_checkpoint_val = patch
+            .as_object_mut()
+            .and_then(|m| m.remove("record_checkpoint"));
+
+        let merge_meas_map =
+            |avatar_obj: &mut serde_json::Map<String, serde_json::Value>,
+             field_name: &str,
+             incoming: &serde_json::Map<String, serde_json::Value>,
+             replace: bool| {
+                let mut cur_m = if replace {
+                    serde_json::Map::new()
+                } else {
+                    avatar_obj
+                        .get(field_name)
+                        .and_then(|x| x.as_object())
+                        .cloned()
+                        .unwrap_or_default()
+                };
+                for (mk, mv) in incoming {
+                    let norm_k = crate::autonomy::normalize_measurement_key(mk);
+                    if norm_k.is_empty() {
+                        continue;
+                    }
+                    let s = mv.as_str().map(str::trim).unwrap_or("");
+                    if s.is_empty() && mv.is_string() {
+                        cur_m.remove(mk);
+                        cur_m.remove(&norm_k);
+                    } else {
+                        if mk != &norm_k {
+                            cur_m.remove(mk);
+                        }
+                        let val = if let Some(st) = mv.as_str() {
+                            serde_json::Value::String(st.trim().to_string())
+                        } else {
+                            mv.clone()
+                        };
+                        cur_m.insert(norm_k, val);
+                    }
+                }
+                avatar_obj.insert(field_name.to_string(), serde_json::Value::Object(cur_m));
+            };
+
         if let (Some(dst), Some(src)) = (merged_val.as_object_mut(), patch.as_object()) {
+            let mut avatar_obj = dst
+                .get("avatar")
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default();
+            let mut avatar_touched = false;
+
+            if let Some(nested_av) = src.get("avatar").and_then(|v| v.as_object()) {
+                for (ak, av) in nested_av {
+                    if av.is_null() {
+                        continue;
+                    }
+                    if ak == "measurements" {
+                        if let Some(new_m) = av.as_object() {
+                            merge_meas_map(&mut avatar_obj, "measurements", new_m, replace_measurements);
+                            avatar_touched = true;
+                            fields_updated.push("avatar.measurements".to_string());
+                        }
+                    } else if ak == "baseline_measurements" {
+                        if let Some(new_m) = av.as_object() {
+                            merge_meas_map(
+                                &mut avatar_obj,
+                                "baseline_measurements",
+                                new_m,
+                                replace_baseline_measurements,
+                            );
+                            avatar_touched = true;
+                            fields_updated.push("avatar.baseline_measurements".to_string());
+                        }
+                    } else {
+                        avatar_obj.insert(ak.clone(), av.clone());
+                        avatar_touched = true;
+                        fields_updated.push(format!("avatar.{ak}"));
+                    }
+                }
+            }
+
+            if let Some(top_m) = src.get("measurements").and_then(|v| v.as_object()) {
+                merge_meas_map(&mut avatar_obj, "measurements", top_m, replace_measurements);
+                avatar_touched = true;
+                fields_updated.push("avatar.measurements".to_string());
+            }
+            if let Some(top_bm) = src.get("baseline_measurements").and_then(|v| v.as_object()) {
+                merge_meas_map(
+                    &mut avatar_obj,
+                    "baseline_measurements",
+                    top_bm,
+                    replace_baseline_measurements,
+                );
+                avatar_touched = true;
+                fields_updated.push("avatar.baseline_measurements".to_string());
+            }
+
             for (k, v) in src {
-                if k == "character_id" || v.is_null() {
+                if k == "character_id"
+                    || k == "avatar"
+                    || k == "measurements"
+                    || k == "replace_measurements"
+                    || k == "baseline_measurements"
+                    || k == "replace_baseline_measurements"
+                    || v.is_null()
+                {
                     continue;
                 }
-                dst.insert(k.clone(), v.clone());
-                fields_updated.push(k.clone());
+                if AVATAR_FLAT_KEYS.contains(&k.as_str()) {
+                    avatar_obj.insert(k.clone(), v.clone());
+                    avatar_touched = true;
+                    fields_updated.push(format!("avatar.{k}"));
+                } else {
+                    dst.insert(k.clone(), v.clone());
+                    fields_updated.push(k.clone());
+                }
+            }
+
+            if avatar_touched {
+                dst.insert("avatar".to_string(), serde_json::Value::Object(avatar_obj));
             }
         }
 
         let mut profile: CharacterProfileExt = serde_json::from_value(merged_val)?;
         profile.character_id = cid.clone();
+        if let Some(cp_val) = record_checkpoint_val {
+            let now_str = self.db.get_campaign_meta()?.clock.format_short();
+            let stage = cp_val
+                .get("stage")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    if !profile.avatar.appearance_stage.is_empty() {
+                        profile.avatar.appearance_stage.clone()
+                    } else {
+                        "Checkpoint".to_string()
+                    }
+                });
+            let world_time = cp_val
+                .get("world_time")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or(now_str);
+            let summary = cp_val
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .unwrap_or("")
+                .to_string();
+            let height = cp_val
+                .get("height")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| profile.avatar.height.clone());
+            let weight = cp_val
+                .get("weight")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| profile.avatar.weight.clone());
+            let meas = if let Some(obj) = cp_val.get("measurements").and_then(|v| v.as_object()) {
+                obj.iter()
+                    .filter_map(|(k, v)| {
+                        let nk = crate::autonomy::normalize_measurement_key(k);
+                        let vs = v.as_str().map(str::trim).unwrap_or("").to_string();
+                        if nk.is_empty() || vs.is_empty() {
+                            None
+                        } else {
+                            Some((nk, vs))
+                        }
+                    })
+                    .collect()
+            } else {
+                profile.avatar.measurements.clone()
+            };
+            let cp = crate::autonomy::AppearanceCheckpoint {
+                stage: stage.clone(),
+                world_time,
+                summary,
+                height,
+                weight,
+                measurements: meas,
+            };
+            if let Some(ex) = profile
+                .avatar
+                .transformation_log
+                .iter_mut()
+                .find(|x| x.stage.eq_ignore_ascii_case(&stage))
+            {
+                *ex = cp;
+            } else {
+                profile.avatar.transformation_log.push(cp);
+            }
+            fields_updated.push("avatar.transformation_log".to_string());
+        }
 
         if let Some(gv) = upsert_goal_val {
             let mut g: StructuredGoal = serde_json::from_value(gv)?;
@@ -3567,10 +5121,11 @@ impl CampaignEngine {
                 }
             ),
             EventPayload::CharacterProfileUpdated {
-                character_id: cid,
+                character_id: cid.clone(),
                 fields_updated,
             },
         )?;
+        let _ = self.sync_apparel_discomfort(&cid, 0);
         self.maybe_compile()?;
         Ok((profile, ev))
     }
@@ -4566,6 +6121,19 @@ impl CampaignEngine {
         sp.place_id = resolve_place_id(&self.db, &sp.place_id)?;
         sp.updated_at_world_time = self.db.get_campaign_meta()?.clock.format_short();
         self.db.upsert_place_spatial(&sp)?;
+        let _ = self.db.append_event(
+            Some(sp.place_id.clone()),
+            vec![sp.place_id.clone()],
+            format!("Spatial data updated for place '{}'", sp.place_id),
+            EventPayload::NarrativeEvent {
+                title: format!("Place Spatial Updated: {}", sp.place_id),
+                details: format!(
+                    "Updated spatial/coordinate metadata for '{}'",
+                    sp.place_id
+                ),
+                tags: vec!["spatial".to_string(), "place".to_string()],
+            },
+        )?;
         self.maybe_compile()?;
         Ok(sp)
     }
@@ -4899,13 +6467,17 @@ impl CampaignEngine {
                 stat: None,
                 skill: skill.map(|s| s.to_string()),
                 technique: None,
+                progression_track: None,
                 equipment: vec![],
                 difficulty: dc,
+                dc_tier: None,
+                dc_factors: vec![],
                 modifier: 0,
                 situational_modifiers: vec![],
                 advantage: "none".to_string(),
                 dice_override: None,
                 auto_hydrate: Some(true),
+                award_skill_xp: None,
                 stakes: format!("Discovery quality while {mode}ing {}", place.baseline.name),
                 seed,
                 dry_run: false,
@@ -5010,6 +6582,22 @@ impl CampaignEngine {
     pub fn set_item_economics(&self, mut econ: ItemEconomics) -> Result<ItemEconomics> {
         econ.item_key = slugify(&econ.item_key);
         self.db.upsert_item_economics(&econ)?;
+        let _ = self.db.append_event(
+            None,
+            vec![econ.item_key.clone()],
+            format!(
+                "Item economics set for '{}' (weight {:.2} kg, unit value {:.2} {})",
+                econ.item_key, econ.weight_kg, econ.unit_value, econ.currency
+            ),
+            EventPayload::NarrativeEvent {
+                title: format!("Item Economics Set: {}", econ.item_key),
+                details: format!(
+                    "Weight {:.2} kg, volume {:.2} L, unit value {:.2} {}",
+                    econ.weight_kg, econ.volume_liters, econ.unit_value, econ.currency
+                ),
+                tags: vec!["economy".to_string(), "item-economics".to_string()],
+            },
+        )?;
         Ok(econ)
     }
 
@@ -5070,14 +6658,21 @@ impl CampaignEngine {
             bail!("Cannot transfer currency from '{from}' to itself");
         }
         let curr = normalize_currency_key(currency);
-        let from_bal = self.db.get_currency_balance(&from, &curr)?;
+        let now = self.db.get_campaign_meta()?.clock.format_short();
+        let mut from_bal = self.db.get_currency_balance(&from, &curr)?;
+        let mut conversion_note = String::new();
+        if from_bal < amount {
+            if let Some(note) = self.try_make_currency_change(&from, &curr, amount, &now)? {
+                from_bal = self.db.get_currency_balance(&from, &curr)?;
+                conversion_note = format!(" [{note}]");
+            }
+        }
         if from_bal < amount {
             bail!(
                 "Insufficient {curr} funds for '{from}': has {from_bal}, attempted to transfer {amount}"
             );
         }
         let to_bal = self.db.get_currency_balance(&to, &curr)?;
-        let now = self.db.get_campaign_meta()?.clock.format_short();
         let new_from = from_bal - amount;
         let new_to = to_bal + amount;
         self.db.set_currency_balance(&from, &curr, new_from, &now)?;
@@ -5087,7 +6682,7 @@ impl CampaignEngine {
             None,
             vec![from.clone(), to.clone()],
             format!(
-                "Transferred {amount} {curr}: {from} ({new_from} left) -> {to} ({new_to} total){}",
+                "Transferred {amount} {curr}: {from} ({new_from} left) -> {to} ({new_to} total){conversion_note}{}",
                 if reason.is_empty() {
                     String::new()
                 } else {
@@ -5134,8 +6729,18 @@ impl CampaignEngine {
             0
         };
         let total_buyer_cost = amount + tax_amt;
+        let now = self.db.get_campaign_meta()?.clock.format_short();
 
-        let buyer_bal = self.db.get_currency_balance(&buyer, &curr)?;
+        let mut buyer_bal = self.db.get_currency_balance(&buyer, &curr)?;
+        let mut conversion_note: Option<String> = None;
+        if buyer_bal < total_buyer_cost {
+            if let Some(note) =
+                self.try_make_currency_change(&buyer, &curr, total_buyer_cost, &now)?
+            {
+                buyer_bal = self.db.get_currency_balance(&buyer, &curr)?;
+                conversion_note = Some(note);
+            }
+        }
         if buyer_bal < total_buyer_cost {
             bail!(
                 "Transaction rejected (atomic guard): '{buyer}' has {buyer_bal} {curr}, needs {total_buyer_cost} ({amount} + {tax_amt} tax). No money or items were modified."
@@ -5143,7 +6748,6 @@ impl CampaignEngine {
         }
 
         // Perform atomic balance updates
-        let now = self.db.get_campaign_meta()?.clock.format_short();
         let seller_bal = self.db.get_currency_balance(&seller, &curr)?;
         self.db
             .set_currency_balance(&buyer, &curr, buyer_bal - total_buyer_cost, &now)?;
@@ -5178,17 +6782,22 @@ impl CampaignEngine {
                         durability: Some("New".to_string()),
                         tags: vec!["purchased".to_string()],
                         description: format!("Purchased from {seller} for {amount} {curr}"),
+                        ..Default::default()
                     },
                     notes,
                 )?;
             }
         }
 
+        let conv_suffix = conversion_note
+            .as_ref()
+            .map(|n| format!(" [{n}]"))
+            .unwrap_or_default();
         let ev = self.db.append_event(
             None,
             vec![buyer.clone(), seller.clone()],
             format!(
-                "Transaction [{kind}]: {buyer} paid {amount} {curr} (+{tax_amt} tax) to {seller}{}",
+                "Transaction [{kind}]: {buyer} paid {amount} {curr} (+{tax_amt} tax) to {seller}{}{conv_suffix}",
                 item_name
                     .map(|n| format!(" for {n} x{}", item_quantity.max(1)))
                     .unwrap_or_default()
@@ -5204,13 +6813,16 @@ impl CampaignEngine {
             },
         )?;
         self.maybe_compile()?;
+        let all_buyer_balances = self.db.list_currency_balances(&buyer).unwrap_or_default();
         Ok((
             serde_json::json!({
                 "event_seq": ev.seq,
                 "buyer_balance": buyer_bal - total_buyer_cost,
+                "buyer_all_balances": all_buyer_balances,
                 "seller_balance": seller_bal + amount,
                 "tax_paid": tax_amt,
-                "currency": curr
+                "currency": curr,
+                "currency_conversion": conversion_note,
             }),
             ev,
         ))
@@ -5637,13 +7249,17 @@ impl CampaignEngine {
                     Some(proj.skill_name.clone())
                 },
                 technique: None,
+                progression_track: None,
                 equipment: vec![],
                 difficulty: proj.difficulty,
+                dc_tier: None,
+                dc_factors: vec![],
                 modifier: 0,
                 situational_modifiers: vec![],
                 advantage: "none".to_string(),
                 dice_override: None,
                 auto_hydrate: Some(true),
+                award_skill_xp: None,
                 stakes: "Crafted item quality or wasted materials".to_string(),
                 seed,
                 dry_run: false,
@@ -5683,6 +7299,7 @@ impl CampaignEngine {
                     related_ids: vec![proj.crafter_id.clone()],
                     created_at_world_time: String::new(),
                     updated_at_world_time: String::new(),
+                    ..Default::default()
                 };
                 let _ = self.upsert_catalog_item(item, "Completed crafting project")?;
             }
@@ -5728,7 +7345,8 @@ impl CampaignEngine {
     }
 
     /// Bounded-scope world advancement orchestrator: advances clock, regional weather, injury recovery,
-    /// market production/consumption drift, routine faction upkeep, and optional leak-proof autonomy dossiers!
+    /// market production/consumption drift, routine faction upkeep, prominent NPC business/networking travel,
+    /// and optional leak-proof autonomy dossiers!
     #[allow(clippy::too_many_arguments)]
     pub fn advance_world(
         &self,
@@ -5741,149 +7359,5717 @@ impl CampaignEngine {
         tick_markets: bool,
         tick_upkeep: bool,
         prepare_dossiers: bool,
+        tick_npc_movements: bool,
         seed: Option<u64>,
     ) -> Result<serde_json::Value> {
         use rand::Rng;
         if duration_hours == 0 {
             bail!("advance_world requires duration_hours > 0");
         }
-        let base_seed = seed.unwrap_or_else(|| rand::thread_rng().gen::<u64>());
-        let days = ((duration_hours as f64) / 24.0).ceil().max(1.0) as i64;
-        let mut sub_events = Vec::new();
+        self.with_deferred_compile(|_| {
+            let base_seed = seed.unwrap_or_else(|| rand::thread_rng().gen::<u64>());
+            let days = ((duration_hours as f64) / 24.0).ceil().max(1.0) as i64;
+            let mut sub_events = Vec::new();
 
-        // 1. Advance World Clock
-        let (new_clock, season_changed, clock_ev) = self.advance_time(
-            duration_hours * 60,
+            // 1. Advance World Clock (without premature NPC tick; Step 6 orchestrates NPC movements once)
+            let (new_clock, season_changed, clock_ev) = self.advance_time_no_npc_tick(
+                duration_hours * 60,
+                None,
+                Some(format!("Bounded world tick ({duration_hours}h / ~{days}d)")),
+            )?;
+            sub_events.push(clock_ev.seq);
+
+            // 2. Scoped Regional Weather
+            let mut weather_updates = std::collections::BTreeMap::new();
+            if tick_weather {
+                for (idx, pid) in place_ids.iter().enumerate() {
+                    if let Ok((w, wev)) = self.advance_place_weather(
+                        pid,
+                        Some(base_seed.wrapping_add((idx as u64).wrapping_mul(0x9E37))),
+                    ) {
+                        weather_updates.insert(slugify(pid), w);
+                        sub_events.push(wev.seq);
+                    }
+                }
+            }
+
+            // 3. Scoped Injury Recovery
+            let mut recovery_updates = std::collections::BTreeMap::new();
+            if tick_recovery {
+                for cid in character_ids {
+                    if let Ok(injs) = self.advance_injury_recovery(cid, days) {
+                        if !injs.is_empty() {
+                            recovery_updates.insert(slugify(cid), injs);
+                        }
+                    }
+                }
+            }
+
+            // 4. Scoped Market Production/Consumption Drift
+            let mut market_reports = Vec::new();
+            if tick_markets {
+                for pid in place_ids {
+                    let rpid = resolve_place_id(&self.db, pid).unwrap_or_else(|_| slugify(pid));
+                    if let Some(mut mkt) = self.db.get_market(&rpid)? {
+                        for c in &mut mkt.commodities {
+                            let net = (c.daily_production - c.daily_consumption) * days;
+                            c.supply = (c.supply + net).max(0);
+                        }
+                        mkt.updated_at_world_time = new_clock.format_short();
+                        self.db.upsert_market(&mkt)?;
+                        if let Ok(rep) = self.get_market_prices(&rpid) {
+                            market_reports.push(rep);
+                        }
+                    }
+                }
+            }
+
+            // 5. Scoped Faction Upkeep & Optional Autonomy Dossiers
+            let mut dossiers = Vec::new();
+            let mut upkeep_applied = Vec::new();
+            for fid in faction_ids {
+                if let Ok(fac) = self.get_faction(fid) {
+                    if tick_upkeep && !fac.members.is_empty() {
+                        let drain = (fac.members.len() as i64) * days;
+                        for key in ["rations", "grain", "food", "supplies"] {
+                            if fac.resources.contains_key(key) {
+                                let cur = fac.resources[key];
+                                let actual = drain.min(cur);
+                                if actual > 0 {
+                                    let _ = self.modify_faction_resource(
+                                        &fac.id,
+                                        key,
+                                        -actual,
+                                        false,
+                                        &format!("Routine upkeep ({days}d)"),
+                                    );
+                                    upkeep_applied.push(format!("{}: -{actual} {key}", fac.id));
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    if prepare_dossiers {
+                        if let Ok(d) = self.prepare_autonomy_dossier(
+                            "faction",
+                            Some(&fac.id),
+                            &[],
+                            duration_hours,
+                            fac.territory.first().map(|s| s.as_str()),
+                        ) {
+                            dossiers.push(d);
+                        }
+                    }
+                }
+            }
+
+            // 6. Prominent Figure Business Travel, Circuits & Networking Simulation
+            let npc_movements = if tick_npc_movements {
+                self.tick_npc_movements(duration_hours, character_ids, true, base_seed)
+                    .unwrap_or_else(|e| serde_json::json!({ "error": e.to_string() }))
+            } else {
+                serde_json::json!({ "skipped": true })
+            };
+            let moved_count = npc_movements
+                .get("events_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+
+            let summary = format!(
+                "World advanced {duration_hours}h -> {} (season_changed={season_changed}, weather={}, recoveries={}, markets={}, upkeep={}, npc_movements={moved_count})",
+                new_clock.format_short(),
+                weather_updates.len(),
+                recovery_updates.len(),
+                market_reports.len(),
+                upkeep_applied.len()
+            );
+            let master_ev = self.db.append_event_causal(
+                place_ids.first().map(|s| slugify(s)),
+                place_ids
+                    .iter()
+                    .chain(faction_ids.iter())
+                    .chain(character_ids.iter())
+                    .map(|s| slugify(s))
+                    .collect(),
+                summary.clone(),
+                EventPayload::WorldAdvanced {
+                    duration_hours,
+                    scoped_places: place_ids.iter().map(|s| slugify(s)).collect(),
+                    scoped_factions: faction_ids.iter().map(|s| slugify(s)).collect(),
+                    scoped_characters: character_ids.iter().map(|s| slugify(s)).collect(),
+                    summary,
+                },
+                EventCausalMeta {
+                    actor_id: None,
+                    causal_event_ids: sub_events,
+                    visibility: "public".to_string(),
+                },
+            )?;
+            self.maybe_compile()?;
+            let active_signals = self
+                .list_active_signals(Some("gm"), place_ids.first().map(String::as_str), character_ids, true)
+                .unwrap_or_default();
+            Ok(serde_json::json!({
+                "event_seq": master_ev.seq,
+                "world_clock": new_clock,
+                "season_changed": season_changed,
+                "weather_updates": weather_updates,
+                "recovery_updates": recovery_updates,
+                "market_reports": market_reports,
+                "upkeep_applied": upkeep_applied,
+                "npc_movements": npc_movements,
+                "autonomy_dossiers": dossiers,
+                "signals": active_signals
+            }))
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // Stateful Progression Engine (Xianxia Realms 1-9, Parallel Manuals,
+    // Sci-Fi Tiers, D&D Levels, Bottlenecks & Breakthroughs)
+    // -------------------------------------------------------------------------
+
+    /// Resolves and cross-links cultivation manual references (`source_text_id`, `source_item_id`, `manual_title`)
+    /// against existing StoryTexts (Books & Scrolls) and CatalogItems so links always resolve cleanly by slug or title.
+    fn resolve_manual_link(
+        &self,
+        source_text_id: &mut Option<String>,
+        source_item_id: &mut Option<String>,
+        manual_title: &mut String,
+    ) {
+        if let Some(ref s) = source_text_id {
+            if s.trim().is_empty() {
+                *source_text_id = None;
+            }
+        }
+        if let Some(ref s) = source_item_id {
+            if s.trim().is_empty() {
+                *source_item_id = None;
+            }
+        }
+
+        if let Some(raw) = source_text_id.clone() {
+            let trimmed = raw.trim();
+            let slug = slugify(trimmed);
+            let found_text = self
+                .db
+                .get_text(trimmed)
+                .ok()
+                .flatten()
+                .or_else(|| self.db.get_text(&slug).ok().flatten())
+                .or_else(|| {
+                    self.db.list_texts().ok().and_then(|list| {
+                        list.into_iter().find(|t| t.title.eq_ignore_ascii_case(trimmed))
+                    })
+                });
+            if let Some(tx) = found_text {
+                *source_text_id = Some(tx.id.clone());
+                if manual_title.trim().is_empty() {
+                    *manual_title = tx.title.clone();
+                }
+                if source_item_id.is_none() {
+                    if let Ok(items) = self.db.list_catalog_items() {
+                        if let Some(it) = items
+                            .into_iter()
+                            .find(|i| i.linked_text_id.as_deref() == Some(tx.id.as_str()))
+                        {
+                            *source_item_id = Some(it.id);
+                        }
+                    }
+                }
+            } else {
+                *source_text_id = Some(slug);
+            }
+        } else if let Some(raw_item) = source_item_id.clone() {
+            let trimmed = raw_item.trim();
+            let slug = slugify(trimmed);
+            let found_item = self
+                .db
+                .get_catalog_item(trimmed)
+                .ok()
+                .flatten()
+                .or_else(|| self.db.get_catalog_item(&slug).ok().flatten())
+                .or_else(|| {
+                    self.db.list_catalog_items().ok().and_then(|list| {
+                        list.into_iter().find(|i| i.name.eq_ignore_ascii_case(trimmed))
+                    })
+                });
+            if let Some(it) = found_item {
+                *source_item_id = Some(it.id.clone());
+                if manual_title.trim().is_empty() {
+                    *manual_title = it.name.clone();
+                }
+                if source_text_id.is_none() {
+                    *source_text_id = it.linked_text_id.clone();
+                }
+            } else {
+                *source_item_id = Some(slug);
+            }
+        }
+    }
+
+    pub fn define_progression_ladder(
+        &self,
+        mut ladder: ProgressionLadder,
+    ) -> Result<(ProgressionLadder, WorldEvent)> {
+        if ladder.name.trim().is_empty() {
+            bail!("Progression ladder `name` cannot be empty");
+        }
+        if ladder.stages.is_empty() {
+            bail!("Progression ladder must define at least one stage");
+        }
+        if ladder.id.trim().is_empty() {
+            ladder.id = slugify(&ladder.name);
+        } else {
+            ladder.id = slugify(&ladder.id);
+        }
+        self.resolve_manual_link(
+            &mut ladder.source_text_id,
+            &mut ladder.source_item_id,
+            &mut ladder.manual_title,
+        );
+        ladder.updated_at_world_time = self.db.get_campaign_meta()?.clock.format_short();
+        self.db.upsert_progression_ladder(&ladder)?;
+        let summary = format!(
+            "Progression ladder '{}' [{}] defined ({} major stage(s))",
+            ladder.name,
+            ladder.kind,
+            ladder.stages.len()
+        );
+        let mut involved = vec![ladder.id.clone()];
+        if let Some(ref st) = ladder.source_text_id {
+            involved.push(st.clone());
+        }
+        let ev = self.db.append_event(
             None,
-            Some(format!("Bounded world tick ({duration_hours}h / ~{days}d)")),
+            involved,
+            summary,
+            EventPayload::NarrativeEvent {
+                title: format!("Progression Ladder Defined: {}", ladder.name),
+                details: format!(
+                    "Ladder '{}' ({}) with {} major stages.",
+                    ladder.id,
+                    ladder.kind,
+                    ladder.stages.len()
+                ),
+                tags: vec!["progression".into(), "ladder".into()],
+            },
         )?;
-        sub_events.push(clock_ev.seq);
+        self.maybe_compile()?;
+        Ok((ladder, ev))
+    }
 
-        // 2. Scoped Regional Weather
-        let mut weather_updates = std::collections::BTreeMap::new();
-        if tick_weather {
-            for (idx, pid) in place_ids.iter().enumerate() {
-                if let Ok((w, wev)) = self.advance_place_weather(
-                    pid,
-                    Some(base_seed.wrapping_add((idx as u64).wrapping_mul(0x9E37))),
-                ) {
-                    weather_updates.insert(slugify(pid), w);
-                    sub_events.push(wev.seq);
+    pub fn list_progression_ladders(&self) -> Result<Vec<ProgressionLadder>> {
+        self.db.list_progression_ladders()
+    }
+
+    pub fn list_character_progressions(
+        &self,
+        character_id: &str,
+    ) -> Result<Vec<CharacterProgressionTrack>> {
+        let cid = resolve_character_id(&self.db, character_id)?;
+        self.db.list_character_progressions(&cid)
+    }
+
+    pub fn enroll_progression_track(
+        &self,
+        mut track: CharacterProgressionTrack,
+        reason: &str,
+    ) -> Result<(CharacterProgressionTrack, WorldEvent)> {
+        let cid = resolve_character_id(&self.db, &track.character_id)?;
+        track.character_id = cid.clone();
+        if track.track_id.trim().is_empty() {
+            track.track_id = slugify(&track.name);
+        } else {
+            track.track_id = slugify(&track.track_id);
+        }
+        if track.name.trim().is_empty() {
+            track.name = track.track_id.clone();
+        }
+        if track.status.trim().is_empty() {
+            track.status = "active".to_string();
+        }
+
+        // Hydrate stage defaults from ladder if `ladder_id` is linked
+        if let Some(ref lid) = track.ladder_id {
+            let lid_slug = slugify(lid);
+            if let Some(ladder) = self.db.get_progression_ladder(&lid_slug)? {
+                track.ladder_id = Some(ladder.id.clone());
+                let st_idx = (track.major_stage_index as usize).min(ladder.stages.len().saturating_sub(1));
+                if let Some(st) = ladder.stages.get(st_idx) {
+                    if track.major_stage_name.trim().is_empty() {
+                        track.major_stage_name = st.name.clone();
+                    }
+                    track.sub_stage_max = st.sub_stages.max(1);
+                    track.sub_stage = track.sub_stage.clamp(1, track.sub_stage_max);
+                    track.sub_stage_label = st.format_sub_stage(track.sub_stage);
+                    if track.xp_to_next == 0 || track.xp_to_next == 100 {
+                        track.xp_to_next = st.xp_for_sub_stage(track.sub_stage);
+                    }
+                    if track.check_modifier == 0 {
+                        track.check_modifier = st.passive_modifier;
+                    }
+                    if track.active_properties.is_empty() {
+                        track.active_properties = st.properties.clone();
+                    }
+                    if track.halt_conditions.is_empty() {
+                        track.halt_conditions = st.halt_conditions.clone();
+                    }
+                    if track.check_tags.is_empty() {
+                        track.check_tags = ladder.default_check_tags.clone();
+                    }
+                    if track.source_text_id.is_none() {
+                        track.source_text_id = ladder.source_text_id.clone();
+                    }
+                    if track.source_item_id.is_none() {
+                        track.source_item_id = ladder.source_item_id.clone();
+                    }
+                    if track.manual_title.trim().is_empty() && !ladder.manual_title.is_empty() {
+                        track.manual_title = ladder.manual_title.clone();
+                    }
+                    if track.manual_notes.trim().is_empty() && !ladder.manual_notes.is_empty() {
+                        track.manual_notes = ladder.manual_notes.clone();
+                    }
+                }
+            }
+        } else if track.sub_stage_label.is_empty() && track.sub_stage_max > 1 {
+            track.sub_stage_label = format!("Layer {}/{}", track.sub_stage, track.sub_stage_max);
+        }
+
+        self.resolve_manual_link(
+            &mut track.source_text_id,
+            &mut track.source_item_id,
+            &mut track.manual_title,
+        );
+
+        track.updated_at_world_time = self.db.get_campaign_meta()?.clock.format_short();
+        self.db.upsert_character_progression(&track)?;
+        let proj = load_character_projection(&self.db, &cid, None)?;
+        let manual_tag = if !track.manual_title.is_empty() {
+            format!(" (Manual: {})", track.manual_title)
+        } else if let Some(ref st) = track.source_text_id {
+            format!(" (Manual: {st})")
+        } else {
+            String::new()
+        };
+        let summary = format!(
+            "{} enrolled progression track '{}' [{}] at {}{}{}",
+            proj.baseline.name,
+            track.name,
+            track.track_kind,
+            track.format_stage(),
+            manual_tag,
+            if reason.is_empty() {
+                String::new()
+            } else {
+                format!(" — {reason}")
+            }
+        );
+        let mut involved = vec![cid.clone(), track.track_id.clone()];
+        if let Some(ref st) = track.source_text_id {
+            involved.push(st.clone());
+        }
+        let ev = self.db.append_event_causal(
+            proj.current.current_location.clone(),
+            involved,
+            summary,
+            EventPayload::ProgressionResolved {
+                actor_id: cid,
+                progression_kind: format!("enroll:{}", track.track_id),
+                outcome: track.format_stage(),
+                notes: reason.to_string(),
+            },
+            EventCausalMeta {
+                actor_id: Some(track.character_id.clone()),
+                causal_event_ids: vec![],
+                visibility: "public".to_string(),
+            },
+        )?;
+        self.maybe_compile()?;
+        Ok((track, ev))
+    }
+
+    pub fn advance_progression_xp(
+        &self,
+        character_id: &str,
+        track_id: &str,
+        xp_delta: u64,
+        reason: &str,
+    ) -> Result<(serde_json::Value, WorldEvent)> {
+        let cid = resolve_character_id(&self.db, character_id)?;
+        let tid = slugify(track_id);
+        let mut track = self
+            .db
+            .get_character_progression(&cid, &tid)?
+            .ok_or_else(|| {
+                anyhow!(
+                    "Progression track '{tid}' not enrolled on character '{cid}'. Enroll it first via manage_progression(action: 'enroll_track')."
+                )
+            })?;
+        if track.status.eq_ignore_ascii_case("halted") || track.status.eq_ignore_ascii_case("crippled") {
+            bail!(
+                "Progression track '{}' on '{}' is currently '{}' (halt conditions: {:?}). Clear the halt condition via update_track before advancing XP.",
+                track.name,
+                cid,
+                track.status,
+                track.halt_conditions
+            );
+        }
+
+        let ladder = match track.ladder_id.as_deref() {
+            Some(lid) => self.db.get_progression_ladder(lid)?,
+            None => None,
+        };
+        let old_stage_str = track.format_stage();
+        track.cumulative_xp = track.cumulative_xp.saturating_add(xp_delta);
+        track.current_xp = track.current_xp.saturating_add(xp_delta);
+
+        let mut stages_advanced: u32 = 0;
+        let mut major_promoted = false;
+        let mut hit_bottleneck_now = false;
+        let mut entered_stages: Vec<(u32, u32, String)> = Vec::new();
+
+        loop {
+            let need = track.xp_to_next.max(1);
+            if track.current_xp < need {
+                break;
+            }
+            if track.sub_stage < track.sub_stage_max {
+                track.current_xp -= need;
+                track.sub_stage += 1;
+                stages_advanced += 1;
+                if let Some(ref lad) = ladder {
+                    if let Some(st) = lad.stages.get(track.major_stage_index as usize) {
+                        track.sub_stage_label = st.format_sub_stage(track.sub_stage);
+                        track.xp_to_next = st.xp_for_sub_stage(track.sub_stage);
+                    }
+                } else if track.sub_stage_max > 1 {
+                    track.sub_stage_label = format!("Layer {}/{}", track.sub_stage, track.sub_stage_max);
+                }
+                entered_stages.push((track.major_stage_index, track.sub_stage, track.format_stage()));
+            } else {
+                // Reached peak sub-stage of current major stage!
+                let requires_bt = ladder
+                    .as_ref()
+                    .and_then(|l| l.stages.get(track.major_stage_index as usize))
+                    .map(|s| s.breakthrough_required_at_peak)
+                    .unwrap_or(true);
+                let has_next_major = ladder
+                    .as_ref()
+                    .map(|l| ((track.major_stage_index + 1) as usize) < l.stages.len())
+                    .unwrap_or(false);
+
+                if requires_bt || !has_next_major {
+                    if !track.at_bottleneck && has_next_major {
+                        hit_bottleneck_now = true;
+                    }
+                    if has_next_major {
+                        track.at_bottleneck = true;
+                        let next_name = ladder
+                            .as_ref()
+                            .and_then(|l| l.stages.get((track.major_stage_index + 1) as usize))
+                            .map(|s| s.name.clone())
+                            .unwrap_or_else(|| "Next Major Realm".to_string());
+                        if track.bottleneck_reason.is_empty() {
+                            track.bottleneck_reason =
+                                format!("Peak reached — breakthrough check required to enter {next_name}");
+                        }
+                    } else {
+                        track.status = "completed".to_string();
+                    }
+                    break;
+                } else if let Some(ref lad) = ladder {
+                    // Auto-promote across flat levels (e.g., D&D Level 1 -> Level 2 -> ...)
+                    track.current_xp -= need;
+                    track.major_stage_index += 1;
+                    let next_st = &lad.stages[track.major_stage_index as usize];
+                    track.major_stage_name = next_st.name.clone();
+                    track.sub_stage_max = next_st.sub_stages.max(1);
+                    track.sub_stage = 1;
+                    track.sub_stage_label = next_st.format_sub_stage(1);
+                    track.xp_to_next = next_st.xp_for_sub_stage(1);
+                    track.check_modifier = next_st.passive_modifier;
+                    for prop in &next_st.properties {
+                        if !track.active_properties.contains(prop) {
+                            track.active_properties.push(prop.clone());
+                        }
+                    }
+                    stages_advanced += 1;
+                    major_promoted = true;
+                    entered_stages.push((track.major_stage_index, track.sub_stage, track.format_stage()));
                 }
             }
         }
 
-        // 3. Scoped Injury Recovery
-        let mut recovery_updates = std::collections::BTreeMap::new();
-        if tick_recovery {
-            for cid in character_ids {
-                if let Ok(injs) = self.advance_injury_recovery(cid, days) {
-                    if !injs.is_empty() {
-                        recovery_updates.insert(slugify(cid), injs);
+        self.with_deferred_compile(|_| {
+            track.updated_at_world_time = self.db.get_campaign_meta()?.clock.format_short();
+            self.db.upsert_character_progression(&track)?;
+            let proj = load_character_projection(&self.db, &cid, None)?;
+            let new_stage_str = track.format_stage();
+            let summary = format!(
+                "{} '{}' +{} XP (total {}): {} -> {}{}{}",
+                proj.baseline.name,
+                track.name,
+                xp_delta,
+                track.cumulative_xp,
+                old_stage_str,
+                new_stage_str,
+                if track.at_bottleneck { " [AT BOTTLENECK]" } else { "" },
+                if reason.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {reason}")
+                }
+            );
+            let ev = self.db.append_event_causal(
+                proj.current.current_location.clone(),
+                vec![cid.clone(), track.track_id.clone()],
+                summary.clone(),
+                EventPayload::ProgressionResolved {
+                    actor_id: cid.clone(),
+                    progression_kind: format!("xp:{}", track.track_id),
+                    outcome: new_stage_str.clone(),
+                    notes: summary.clone(),
+                },
+                EventCausalMeta {
+                    actor_id: Some(cid.clone()),
+                    causal_event_ids: vec![],
+                    visibility: "public".to_string(),
+                },
+            )?;
+
+            // Execute declarative StageTransitionRules for every newly entered stage/sub-stage!
+            let mut applied_rules = Vec::new();
+            for (m_idx, s_stg, stg_label) in &entered_stages {
+                if let Some(rule) = Self::lookup_stage_rule(&track, ladder.as_ref(), *m_idx, *s_stg) {
+                    if let Ok(rep) = self.apply_stage_transition_rule(&cid, &track.name, stg_label, &rule, Some(ev.seq)) {
+                        applied_rules.push(rep);
+                    }
+                }
+            }
+
+            let sync_notice: Option<String> = if stages_advanced > 0 && applied_rules.is_empty() {
+                self.db.get_character_profile(&cid).ok().flatten().and_then(|prof| {
+                    let traj = prof.avatar.transformation_trajectory.trim();
+                    let stg = prof.avatar.appearance_stage.trim();
+                    if !traj.is_empty() {
+                        let msg = format!(
+                            "STAGE ADVANCED ({old_stage_str} -> {new_stage_str}) on a transforming character! Immediately update ALL axes in the same turn via manage_player_character(action='update_avatar'), modify_character_stat, and update_character_condition (or attach declarative `stage_rules` on the track). Active Trajectory: {traj}"
+                        );
+                        let _ = self.emit_signal(crate::signals::EngineSignal {
+                            id: String::new(),
+                            dedup_key: format!("appearance_sync_due:{cid}:{}:{}", track.track_id, new_stage_str),
+                            code: "APPEARANCE_SYNC_DUE".to_string(),
+                            severity: "critical".to_string(),
+                            category: "appearance".to_string(),
+                            title: format!("{} — Stage Transition Requires Appearance/Stat Sync ({new_stage_str})", proj.baseline.name),
+                            summary: msg.clone(),
+                            entity_ids: vec![cid.clone(), track.track_id.clone()],
+                            location_id: proj.current.current_location.clone(),
+                            suggested_actions: vec![format!("character(action='pc_sheet', sub_action='update_avatar', character_id='{cid}')")],
+                            visibility: "gm_secret".to_string(),
+                            status: "active".to_string(),
+                            source_event_seq: Some(ev.seq),
+                            created_at_world_time: String::new(),
+                            updated_at_world_time: String::new(),
+                        });
+                        Some(msg)
+                    } else if !stg.is_empty() {
+                        Some(format!(
+                            "STAGE ADVANCED ({old_stage_str} -> {new_stage_str}) on a character with appearance_stage '{stg}'. Check whether avatar measurements, qualitative traits, clothing fit, stats, and conditions need to advance now."
+                        ))
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            };
+
+            self.maybe_compile()?;
+            let mut resp = serde_json::json!({
+                "event_seq": ev.seq,
+                "summary": summary,
+                "xp_gained": xp_delta,
+                "stages_advanced": stages_advanced,
+                "major_promoted": major_promoted,
+                "hit_bottleneck": hit_bottleneck_now,
+                "at_bottleneck": track.at_bottleneck,
+                "track": track
+            });
+            if !applied_rules.is_empty() {
+                resp["stage_rules_applied"] = serde_json::json!(applied_rules);
+            }
+            if let Some(notice) = sync_notice {
+                resp["appearance_sync_required"] = serde_json::json!(true);
+                resp["appearance_sync_notice"] = serde_json::json!(notice);
+            }
+            Ok((resp, ev))
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn attempt_progression_breakthrough(
+        &self,
+        character_id: &str,
+        track_id: &str,
+        profile_id: Option<&str>,
+        stat: Option<String>,
+        skill: Option<String>,
+        explicit_dc: Option<i64>,
+        dc_tier: Option<String>,
+        dc_factors: Vec<crate::mechanics::DcFactorInput>,
+        modifier: i64,
+        advantage: String,
+        stakes: String,
+        seed: Option<u64>,
+        next_stage_name_override: Option<String>,
+    ) -> Result<(serde_json::Value, WorldEvent)> {
+        let cid = resolve_character_id(&self.db, character_id)?;
+        let tid = slugify(track_id);
+        let mut track = self
+            .db
+            .get_character_progression(&cid, &tid)?
+            .ok_or_else(|| anyhow!("Progression track '{tid}' not enrolled on '{cid}'"))?;
+        if track.status.eq_ignore_ascii_case("halted") || track.status.eq_ignore_ascii_case("crippled") {
+            bail!(
+                "Cannot attempt breakthrough while track '{}' is '{}' (halt conditions: {:?}).",
+                track.name,
+                track.status,
+                track.halt_conditions
+            );
+        }
+
+        let ladder = match track.ladder_id.as_deref() {
+            Some(lid) => self.db.get_progression_ladder(lid)?,
+            None => None,
+        };
+        let cur_stage_def = ladder
+            .as_ref()
+            .and_then(|l| l.stages.get(track.major_stage_index as usize))
+            .cloned();
+        let next_stage_def = ladder
+            .as_ref()
+            .and_then(|l| l.stages.get((track.major_stage_index + 1) as usize))
+            .cloned();
+
+        let resolved_dc_opt = explicit_dc.or_else(|| cur_stage_def.as_ref().and_then(|s| s.breakthrough_dc));
+        let resolved_tier = dc_tier.or_else(|| {
+            if resolved_dc_opt.is_none() {
+                cur_stage_def
+                    .as_ref()
+                    .and_then(|s| s.breakthrough_dc_tier.clone())
+                    .or_else(|| Some("hard".to_string()))
+            } else {
+                None
+            }
+        });
+
+        let target_label = next_stage_name_override
+            .clone()
+            .or_else(|| next_stage_def.as_ref().map(|s| s.name.clone()))
+            .unwrap_or_else(|| format!("Next Stage ({})", track.major_stage_index + 2));
+
+        let check = self.resolve_check(CheckRequest {
+            actor_id: Some(cid.clone()),
+            action: format!("Breakthrough '{}' -> {}", track.name, target_label),
+            profile: profile_id.map(|s| s.to_string()),
+            stat,
+            skill,
+            technique: None,
+            progression_track: Some(track.track_id.clone()),
+            equipment: vec![],
+            difficulty: resolved_dc_opt.unwrap_or(0),
+            dc_tier: resolved_tier,
+            dc_factors,
+            modifier,
+            situational_modifiers: vec![],
+            advantage,
+            dice_override: None,
+            auto_hydrate: Some(true),
+            award_skill_xp: None,
+            stakes: if stakes.is_empty() {
+                format!("Advance into {target_label} vs stalled bottleneck / backlash")
+            } else {
+                stakes
+            },
+            seed,
+            dry_run: false,
+            strict_validation: false,
+            log_to_ledger: true,
+            causal_event_ids: vec![],
+            visibility: "public".to_string(),
+        })?;
+
+        let old_stage = track.format_stage();
+        let succeeded = matches!(check.outcome.as_str(), "success" | "critical_success");
+        if succeeded {
+            track.major_stage_index += 1;
+            track.at_bottleneck = false;
+            track.bottleneck_reason.clear();
+            let carried_overflow = track.current_xp.saturating_sub(track.xp_to_next);
+            track.current_xp = carried_overflow;
+            if let Some(ns) = next_stage_def {
+                track.major_stage_name = next_stage_name_override.unwrap_or(ns.name.clone());
+                track.sub_stage_max = ns.sub_stages.max(1);
+                track.sub_stage = 1;
+                track.sub_stage_label = ns.format_sub_stage(1);
+                track.xp_to_next = ns.xp_for_sub_stage(1);
+                track.check_modifier = ns.passive_modifier;
+                for prop in &ns.properties {
+                    if !track.active_properties.contains(prop) {
+                        track.active_properties.push(prop.clone());
+                    }
+                }
+                track.halt_conditions = ns.halt_conditions;
+            } else {
+                track.major_stage_name = target_label.clone();
+                track.sub_stage = 1;
+                track.sub_stage_label = if track.sub_stage_max > 1 {
+                    format!("Layer 1/{}", track.sub_stage_max)
+                } else {
+                    String::new()
+                };
+                track.check_modifier += 1;
+            }
+        } else {
+            track.at_bottleneck = true;
+            if track.bottleneck_reason.is_empty() {
+                track.bottleneck_reason =
+                    format!("Breakthrough into {target_label} failed ({})", check.outcome);
+            }
+        }
+
+        track.updated_at_world_time = self.db.get_campaign_meta()?.clock.format_short();
+        self.db.upsert_character_progression(&track)?;
+        let summary = if succeeded {
+            format!(
+                "BREAKTHROUGH SUCCEEDED ({}) — '{}' advanced from {} to {}",
+                check.outcome,
+                track.name,
+                old_stage,
+                track.format_stage()
+            )
+        } else {
+            format!(
+                "Breakthrough failed ({}) — '{}' remains at {} (bottleneck active)",
+                check.outcome,
+                track.name,
+                track.format_stage()
+            )
+        };
+        let causal = check.event_id.into_iter().collect();
+        let sync_notice: Option<String> = if succeeded {
+            self.db.get_character_profile(&cid).ok().flatten().and_then(|prof| {
+                let traj = prof.avatar.transformation_trajectory.trim();
+                let stg = prof.avatar.appearance_stage.trim();
+                if !traj.is_empty() {
+                    Some(format!(
+                        "BREAKTHROUGH SUCCEEDED ({old_stage} -> {}) on a transforming character! Immediately update ALL axes via manage_player_character(action='update_avatar'), modify_character_stat, and update_character_condition. Active Trajectory: {traj}",
+                        track.format_stage()
+                    ))
+                } else if !stg.is_empty() {
+                    Some(format!(
+                        "BREAKTHROUGH SUCCEEDED ({old_stage} -> {}) on a character with appearance_stage '{stg}'. Check whether avatar measurements, qualitative traits, clothing fit, stats, and conditions need to advance now.",
+                        track.format_stage()
+                    ))
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+        let ev = self.db.append_event_causal(
+            check.location_id.clone(),
+            vec![cid.clone(), track.track_id.clone()],
+            summary.clone(),
+            EventPayload::ProgressionResolved {
+                actor_id: cid.clone(),
+                progression_kind: format!("breakthrough:{}", track.track_id),
+                outcome: if succeeded { "breakthrough_success" } else { "breakthrough_failed" }.to_string(),
+                notes: summary.clone(),
+            },
+            EventCausalMeta {
+                actor_id: Some(cid.clone()),
+                causal_event_ids: causal,
+                visibility: "public".to_string(),
+            },
+        )?;
+        let mut applied_rules = Vec::new();
+        if succeeded {
+            // Clear any stale bottleneck signal on this track
+            let _ = self.update_signal(
+                &format!("prog_bottleneck:{cid}:{}", track.track_id),
+                "resolved",
+            );
+            if let Some(rule) = Self::lookup_stage_rule(&track, ladder.as_ref(), track.major_stage_index, track.sub_stage) {
+                if let Ok(rep) = self.apply_stage_transition_rule(&cid, &track.name, &track.format_stage(), &rule, Some(ev.seq)) {
+                    applied_rules.push(rep);
+                }
+            }
+        }
+        self.maybe_compile()?;
+        let mut resp = serde_json::json!({
+            "event_seq": ev.seq,
+            "succeeded": succeeded,
+            "summary": summary,
+            "check": check,
+            "track": track
+        });
+        if !applied_rules.is_empty() {
+            resp["stage_rules_applied"] = serde_json::json!(applied_rules);
+        } else if let Some(notice) = sync_notice {
+            resp["appearance_sync_required"] = serde_json::json!(true);
+            resp["appearance_sync_notice"] = serde_json::json!(notice);
+        }
+        Ok((resp, ev))
+    }
+
+    pub fn update_progression_track(
+        &self,
+        character_id: &str,
+        track_id: &str,
+        patch: &serde_json::Value,
+        reason: &str,
+    ) -> Result<(CharacterProgressionTrack, WorldEvent)> {
+        let cid = resolve_character_id(&self.db, character_id)?;
+        let tid = slugify(track_id);
+        let mut track = self
+            .db
+            .get_character_progression(&cid, &tid)?
+            .ok_or_else(|| anyhow!("Progression track '{tid}' not enrolled on '{cid}'"))?;
+
+        if let Some(s) = patch.get("status").and_then(|v| v.as_str()) {
+            track.status = s.to_string();
+        }
+        if let Some(b) = patch.get("at_bottleneck").and_then(|v| v.as_bool()) {
+            track.at_bottleneck = b;
+        }
+        if let Some(s) = patch.get("bottleneck_reason").and_then(|v| v.as_str()) {
+            track.bottleneck_reason = s.to_string();
+        }
+        if let Some(m) = patch.get("check_modifier").and_then(|v| v.as_i64()) {
+            track.check_modifier = m;
+        }
+        if let Some(s) = patch.get("notes").and_then(|v| v.as_str()) {
+            track.notes = s.to_string();
+        }
+        if let Some(s) = patch.get("gm_notes").and_then(|v| v.as_str()) {
+            track.gm_notes = s.to_string();
+        }
+        if let Some(s) = patch.get("manual_notes").and_then(|v| v.as_str()) {
+            track.manual_notes = s.to_string();
+        }
+        if let Some(s) = patch.get("manual_title").and_then(|v| v.as_str()) {
+            track.manual_title = s.to_string();
+        }
+        let mut manual_link_changed = false;
+        if let Some(v) = patch.get("source_text_id") {
+            manual_link_changed = true;
+            if v.is_null() {
+                track.source_text_id = None;
+                if patch.get("manual_title").is_none() {
+                    track.manual_title.clear();
+                }
+            } else if let Some(s) = v.as_str() {
+                if s.trim().is_empty() {
+                    track.source_text_id = None;
+                    if patch.get("manual_title").is_none() {
+                        track.manual_title.clear();
+                    }
+                } else {
+                    track.source_text_id = Some(s.to_string());
+                    if patch.get("manual_title").is_none() {
+                        track.manual_title.clear();
                     }
                 }
             }
         }
-
-        // 4. Scoped Market Production/Consumption Drift
-        let mut market_reports = Vec::new();
-        if tick_markets {
-            for pid in place_ids {
-                let rpid = resolve_place_id(&self.db, pid).unwrap_or_else(|_| slugify(pid));
-                if let Some(mut mkt) = self.db.get_market(&rpid)? {
-                    for c in &mut mkt.commodities {
-                        let net = (c.daily_production - c.daily_consumption) * days;
-                        c.supply = (c.supply + net).max(0);
-                    }
-                    mkt.updated_at_world_time = new_clock.format_short();
-                    self.db.upsert_market(&mkt)?;
-                    if let Ok(rep) = self.get_market_prices(&rpid) {
-                        market_reports.push(rep);
+        if let Some(v) = patch.get("source_item_id") {
+            manual_link_changed = true;
+            if v.is_null() {
+                track.source_item_id = None;
+            } else if let Some(s) = v.as_str() {
+                track.source_item_id = if s.trim().is_empty() {
+                    None
+                } else {
+                    Some(s.to_string())
+                };
+            }
+        }
+        if manual_link_changed {
+            self.resolve_manual_link(
+                &mut track.source_text_id,
+                &mut track.source_item_id,
+                &mut track.manual_title,
+            );
+        }
+        if let Some(arr) = patch.get("active_properties").and_then(|v| v.as_array()) {
+            track.active_properties = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+        }
+        if let Some(arr) = patch.get("add_properties").and_then(|v| v.as_array()) {
+            for p in arr.iter().filter_map(|v| v.as_str()) {
+                if !track.active_properties.iter().any(|x| x == p) {
+                    track.active_properties.push(p.to_string());
+                }
+            }
+        }
+        if let Some(arr) = patch.get("halt_conditions").and_then(|v| v.as_array()) {
+            track.halt_conditions = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+        }
+        if let Some(sr) = patch.get("stage_rules") {
+            if let Ok(parsed) = serde_json::from_value::<
+                std::collections::BTreeMap<String, crate::routines::StageTransitionRule>,
+            >(sr.clone())
+            {
+                if patch
+                    .get("replace_stage_rules")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    track.stage_rules = parsed;
+                } else {
+                    for (k, v) in parsed {
+                        track.stage_rules.insert(k, v);
                     }
                 }
             }
         }
+        if let Some(arr) = patch.get("check_tags").and_then(|v| v.as_array()) {
+            track.check_tags = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+        }
+        let mut stage_changed = false;
+        if let Some(idx) = patch.get("major_stage_index").and_then(|v| v.as_u64()) {
+            track.major_stage_index = idx as u32;
+            stage_changed = true;
+        }
+        if let Some(sub) = patch.get("sub_stage").and_then(|v| v.as_u64()) {
+            track.sub_stage = (sub as u32).max(1);
+            stage_changed = true;
+        }
+        if stage_changed {
+            if let Some(ref lid) = track.ladder_id {
+                if let Some(ladder) = self.db.get_progression_ladder(lid)? {
+                    if let Some(st) = ladder.stages.get(track.major_stage_index as usize) {
+                        track.major_stage_name = st.name.clone();
+                        track.sub_stage_max = st.sub_stages.max(1);
+                        track.sub_stage = track.sub_stage.clamp(1, track.sub_stage_max);
+                        track.sub_stage_label = st.format_sub_stage(track.sub_stage);
+                        track.xp_to_next = st.xp_for_sub_stage(track.sub_stage);
+                        if patch.get("check_modifier").is_none() {
+                            track.check_modifier = st.passive_modifier;
+                        }
+                        if patch.get("halt_conditions").is_none() {
+                            track.halt_conditions = st.halt_conditions.clone();
+                        }
+                    }
+                }
+            } else {
+                track.sub_stage = track.sub_stage.clamp(1, track.sub_stage_max.max(1));
+                track.sub_stage_label = if track.sub_stage_max > 1 {
+                    format!("Layer {}/{}", track.sub_stage, track.sub_stage_max)
+                } else {
+                    String::new()
+                };
+            }
+        }
+        if let Some(s) = patch.get("major_stage_name").and_then(|v| v.as_str()) {
+            track.major_stage_name = s.to_string();
+        }
+        if let Some(m) = patch.get("sub_stage_max").and_then(|v| v.as_u64()) {
+            track.sub_stage_max = (m as u32).max(1);
+            track.sub_stage = track.sub_stage.clamp(1, track.sub_stage_max);
+        }
+        if let Some(s) = patch.get("sub_stage_label").and_then(|v| v.as_str()) {
+            track.sub_stage_label = s.to_string();
+        }
+        if let Some(v) = patch.get("current_xp").and_then(|v| v.as_u64()) {
+            track.current_xp = v;
+            if patch.get("at_bottleneck").is_none() && track.current_xp < track.xp_to_next {
+                track.at_bottleneck = false;
+                track.bottleneck_reason.clear();
+            }
+        }
+        if let Some(v) = patch.get("cumulative_xp").and_then(|v| v.as_u64()) {
+            track.cumulative_xp = v;
+        }
+        if let Some(v) = patch.get("xp_to_next").and_then(|v| v.as_u64()) {
+            track.xp_to_next = v.max(1);
+        }
 
-        // 5. Scoped Faction Upkeep & Optional Autonomy Dossiers
-        let mut dossiers = Vec::new();
-        let mut upkeep_applied = Vec::new();
-        for fid in faction_ids {
-            if let Ok(fac) = self.get_faction(fid) {
-                if tick_upkeep && !fac.members.is_empty() {
-                    let drain = (fac.members.len() as i64) * days;
-                    for key in ["rations", "grain", "food", "supplies"] {
-                        if fac.resources.contains_key(key) {
-                            let cur = fac.resources[key];
-                            let actual = drain.min(cur);
-                            if actual > 0 {
-                                let _ = self.modify_faction_resource(
-                                    &fac.id,
-                                    key,
-                                    -actual,
-                                    false,
-                                    &format!("Routine upkeep ({days}d)"),
-                                );
-                                upkeep_applied.push(format!("{}: -{actual} {key}", fac.id));
+        track.updated_at_world_time = self.db.get_campaign_meta()?.clock.format_short();
+        self.db.upsert_character_progression(&track)?;
+        let summary = format!(
+            "Updated progression track '{}' on '{}' [status={}, stage={}]{}",
+            track.name,
+            cid,
+            track.status,
+            track.format_stage(),
+            if reason.is_empty() {
+                String::new()
+            } else {
+                format!(" — {reason}")
+            }
+        );
+        let ev = self.db.append_event_causal(
+            None,
+            vec![cid.clone(), track.track_id.clone()],
+            summary.clone(),
+            EventPayload::ProgressionResolved {
+                actor_id: cid.clone(),
+                progression_kind: format!("update:{}", track.track_id),
+                outcome: track.status.clone(),
+                notes: summary,
+            },
+            EventCausalMeta {
+                actor_id: Some(cid),
+                causal_event_ids: vec![],
+                visibility: if patch.get("gm_notes").is_some() {
+                    "gm_secret".to_string()
+                } else {
+                    "public".to_string()
+                },
+            },
+        )?;
+        self.maybe_compile()?;
+        Ok((track, ev))
+    }
+
+    /// Correct, revert (negative delta with optional automatic stage demotion), set, or reset XP
+    /// on a CharacterProgressionTrack, logging an audited event to the hash-chained ledger.
+    #[allow(clippy::too_many_arguments)]
+    pub fn adjust_progression_xp(
+        &self,
+        character_id: &str,
+        track_id: &str,
+        delta_xp: Option<i64>,
+        set_current_xp: Option<u64>,
+        set_cumulative_xp: Option<u64>,
+        reset_stage_xp: bool,
+        reset_track: bool,
+        allow_demote: bool,
+        reason: &str,
+    ) -> Result<(serde_json::Value, WorldEvent)> {
+        if let Some(d) = delta_xp {
+            if d > 0 && set_current_xp.is_none() && set_cumulative_xp.is_none() && !reset_stage_xp && !reset_track {
+                return self.advance_progression_xp(character_id, track_id, d as u64, reason);
+            }
+        }
+
+        let cid = resolve_character_id(&self.db, character_id)?;
+        let tid = slugify(track_id);
+        let mut track = self
+            .db
+            .get_character_progression(&cid, &tid)?
+            .ok_or_else(|| anyhow!("Progression track '{tid}' not enrolled on '{cid}'"))?;
+
+        let ladder = match track.ladder_id.as_deref() {
+            Some(lid) => self.db.get_progression_ladder(lid)?,
+            None => None,
+        };
+
+        let old_stage_str = track.format_stage();
+        let old_current_xp = track.current_xp;
+        let old_cumulative_xp = track.cumulative_xp;
+        let mut stages_demoted: u32 = 0;
+        let mut major_demoted = false;
+        let action_label: &str;
+
+        if reset_track {
+            action_label = "reset_track";
+            track.major_stage_index = 0;
+            track.sub_stage = 1;
+            track.current_xp = 0;
+            track.cumulative_xp = 0;
+            track.at_bottleneck = false;
+            track.bottleneck_reason.clear();
+            track.status = "active".to_string();
+            if let Some(ref lad) = ladder {
+                if let Some(st0) = lad.stages.first() {
+                    track.major_stage_name = st0.name.clone();
+                    track.sub_stage_max = st0.sub_stages.max(1);
+                    track.sub_stage_label = st0.format_sub_stage(1);
+                    track.xp_to_next = st0.xp_for_sub_stage(1);
+                    track.check_modifier = st0.passive_modifier;
+                    track.active_properties = st0.properties.clone();
+                    track.halt_conditions = st0.halt_conditions.clone();
+                }
+            } else {
+                track.sub_stage_label = if track.sub_stage_max > 1 {
+                    format!("Layer 1/{}", track.sub_stage_max)
+                } else {
+                    String::new()
+                };
+            }
+        } else if reset_stage_xp {
+            action_label = "reset_stage_xp";
+            track.cumulative_xp = track.cumulative_xp.saturating_sub(track.current_xp);
+            track.current_xp = 0;
+            track.at_bottleneck = false;
+            track.bottleneck_reason.clear();
+            if track.status == "completed" {
+                track.status = "active".to_string();
+            }
+        } else {
+            action_label = "adjust_xp";
+            if let Some(d) = delta_xp {
+                if d < 0 {
+                    let mut rem = d.unsigned_abs();
+                    track.cumulative_xp = track.cumulative_xp.saturating_sub(rem);
+                    if rem <= track.current_xp {
+                        track.current_xp -= rem;
+                        rem = 0;
+                    } else if !allow_demote {
+                        track.current_xp = 0;
+                        rem = 0;
+                    } else {
+                        rem -= track.current_xp;
+                        track.current_xp = 0;
+                        while rem > 0 {
+                            if track.sub_stage > 1 {
+                                track.sub_stage -= 1;
+                                let prev_need = ladder
+                                    .as_ref()
+                                    .and_then(|l| l.stages.get(track.major_stage_index as usize))
+                                    .map(|s| {
+                                        track.sub_stage_label = s.format_sub_stage(track.sub_stage);
+                                        s.xp_for_sub_stage(track.sub_stage)
+                                    })
+                                    .unwrap_or_else(|| {
+                                        track.sub_stage_label = if track.sub_stage_max > 1 {
+                                            format!("Layer {}/{}", track.sub_stage, track.sub_stage_max)
+                                        } else {
+                                            String::new()
+                                        };
+                                        track.xp_to_next.max(1)
+                                    });
+                                track.xp_to_next = prev_need;
+                                stages_demoted += 1;
+                                if rem < prev_need {
+                                    track.current_xp = prev_need - rem;
+                                    rem = 0;
+                                } else {
+                                    rem -= prev_need;
+                                }
+                            } else if track.major_stage_index > 0 {
+                                track.major_stage_index -= 1;
+                                major_demoted = true;
+                                stages_demoted += 1;
+                                if let Some(ref lad) = ladder {
+                                    if let Some(prev_st) = lad.stages.get(track.major_stage_index as usize) {
+                                        track.major_stage_name = prev_st.name.clone();
+                                        track.sub_stage_max = prev_st.sub_stages.max(1);
+                                        track.sub_stage = track.sub_stage_max;
+                                        track.sub_stage_label = prev_st.format_sub_stage(track.sub_stage);
+                                        track.xp_to_next = prev_st.xp_for_sub_stage(track.sub_stage);
+                                        track.check_modifier = prev_st.passive_modifier;
+                                        track.halt_conditions = prev_st.halt_conditions.clone();
+                                        // Recompute cumulative properties up to this major stage
+                                        let mut props = Vec::new();
+                                        for st_i in &lad.stages[..=(track.major_stage_index as usize)] {
+                                            for p in &st_i.properties {
+                                                if !props.contains(p) {
+                                                    props.push(p.clone());
+                                                }
+                                            }
+                                        }
+                                        track.active_properties = props;
+                                    }
+                                } else {
+                                    track.sub_stage = track.sub_stage_max.max(1);
+                                }
+                                let prev_need = track.xp_to_next.max(1);
+                                if rem < prev_need {
+                                    track.current_xp = prev_need - rem;
+                                    rem = 0;
+                                } else {
+                                    rem -= prev_need;
+                                }
+                            } else {
+                                track.current_xp = 0;
+                                rem = 0;
+                            }
+                        }
+                    }
+                    let _ = rem;
+                }
+            }
+            if let Some(v) = set_current_xp {
+                track.current_xp = v;
+            }
+            if let Some(v) = set_cumulative_xp {
+                track.cumulative_xp = v;
+            }
+            if track.current_xp < track.xp_to_next {
+                track.at_bottleneck = false;
+                track.bottleneck_reason.clear();
+                if track.status == "completed" {
+                    track.status = "active".to_string();
+                }
+            }
+        }
+
+        track.updated_at_world_time = self.db.get_campaign_meta()?.clock.format_short();
+        self.db.upsert_character_progression(&track)?;
+        let proj = load_character_projection(&self.db, &cid, None)?;
+        let new_stage_str = track.format_stage();
+        let summary = format!(
+            "{} '{}' [{}] {} ({} XP, total {}) -> {} ({} XP, total {}){}",
+            proj.baseline.name,
+            track.name,
+            action_label,
+            old_stage_str,
+            old_current_xp,
+            old_cumulative_xp,
+            new_stage_str,
+            track.current_xp,
+            track.cumulative_xp,
+            if reason.is_empty() {
+                String::new()
+            } else {
+                format!(" — {reason}")
+            }
+        );
+        let ev = self.db.append_event_causal(
+            proj.current.current_location.clone(),
+            vec![cid.clone(), track.track_id.clone()],
+            summary.clone(),
+            EventPayload::ProgressionResolved {
+                actor_id: cid.clone(),
+                progression_kind: format!("{action_label}:{}", track.track_id),
+                outcome: new_stage_str.clone(),
+                notes: summary.clone(),
+            },
+            EventCausalMeta {
+                actor_id: Some(cid),
+                causal_event_ids: vec![],
+                visibility: "public".to_string(),
+            },
+        )?;
+        self.maybe_compile()?;
+        Ok((
+            serde_json::json!({
+                "event_seq": ev.seq,
+                "action": action_label,
+                "summary": summary,
+                "old_current_xp": old_current_xp,
+                "old_cumulative_xp": old_cumulative_xp,
+                "stages_demoted": stages_demoted,
+                "major_demoted": major_demoted,
+                "track": track
+            }),
+            ev,
+        ))
+    }
+
+    /// Removes a progression track from a character (e.g., mistakenly enrolled track) with full audit logging.
+    pub fn remove_progression_track(
+        &self,
+        character_id: &str,
+        track_id: &str,
+        reason: &str,
+    ) -> Result<WorldEvent> {
+        let cid = resolve_character_id(&self.db, character_id)?;
+        let tid = slugify(track_id);
+        let existing = self
+            .db
+            .get_character_progression(&cid, &tid)?
+            .ok_or_else(|| anyhow!("Progression track '{tid}' not enrolled on '{cid}'"))?;
+        self.db.delete_character_progression(&cid, &tid)?;
+        let summary = format!(
+            "Removed progression track '{}' ({}) from '{}'{}",
+            existing.name,
+            existing.format_stage(),
+            cid,
+            if reason.is_empty() {
+                String::new()
+            } else {
+                format!(" — {reason}")
+            }
+        );
+        let ev = self.db.append_event_causal(
+            None,
+            vec![cid.clone(), tid.clone()],
+            summary.clone(),
+            EventPayload::ProgressionResolved {
+                actor_id: cid.clone(),
+                progression_kind: format!("remove:{tid}"),
+                outcome: "removed".to_string(),
+                notes: summary,
+            },
+            EventCausalMeta {
+                actor_id: Some(cid),
+                causal_event_ids: vec![],
+                visibility: "public".to_string(),
+            },
+        )?;
+        self.maybe_compile()?;
+        Ok(ev)
+    }
+
+    // -------------------------------------------------------------------------
+    // Dedicated Player Character Sheet (Avatar/Body/Measurements, Outfits,
+    // Titles, Segregated Stat/Job/Proficiency XP, and Innate Traits)
+    // -------------------------------------------------------------------------
+
+    pub fn resolve_primary_pc_id(&self, character_id: Option<&str>) -> Result<String> {
+        if let Some(raw) = character_id.map(str::trim).filter(|s| !s.is_empty()) {
+            return resolve_character_id(&self.db, raw);
+        }
+        let all = self.db.list_character_baselines()?;
+        if let Some(pc) = all.iter().find(|c| c.kind.eq_ignore_ascii_case("pc")) {
+            return Ok(pc.id.clone());
+        }
+        if let Some(first) = all.first() {
+            return Ok(first.id.clone());
+        }
+        bail!("No characters exist in this campaign yet. Create a PC first.")
+    }
+
+    pub fn get_player_character_sheet(
+        &self,
+        character_id: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let cid = self.resolve_primary_pc_id(character_id)?;
+        let proj = load_character_projection(&self.db, &cid, None)?;
+        let profile = self.get_character_profile(&cid)?;
+        let visual_prompt = profile
+            .avatar
+            .synthesize_visual_prompt(&proj.baseline.name, &proj.baseline.archetype);
+        let progression_tracks = self.db.list_character_progressions(&cid)?;
+        let progression_ladders = self.db.list_progression_ladders()?;
+        let rels = self.db.list_relations_for_entity(&cid)?;
+        let injuries = self.db.list_injuries(Some(&cid), false)?;
+        let currency_balances = self.db.list_currency_balances(&cid)?;
+        let catalog_items: Vec<CatalogItem> = self
+            .db
+            .list_catalog_items()?
+            .into_iter()
+            .filter(|i| {
+                i.current_holder_id
+                    .as_deref()
+                    .map(|h| h.eq_ignore_ascii_case(&cid))
+                    .unwrap_or(false)
+            })
+            .collect();
+        let manuals: Vec<serde_json::Value> = self
+            .db
+            .list_texts()?
+            .into_iter()
+            .map(|t| {
+                serde_json::json!({
+                    "id": t.id,
+                    "title": t.title,
+                    "medium": t.medium,
+                    "subject": t.subject,
+                    "read_status": t.read_status
+                })
+            })
+            .collect();
+        let images: Vec<serde_json::Value> = self
+            .db
+            .list_attachments()?
+            .into_iter()
+            .filter(|a| a.mime_type.starts_with("image/"))
+            .map(|a| {
+                serde_json::json!({
+                    "id": a.id,
+                    "title": a.title,
+                    "mime_type": a.mime_type,
+                    "relative_path": a.relative_path
+                })
+            })
+            .collect();
+        let all_baselines = self.db.list_character_baselines()?;
+        let all_pcs: Vec<serde_json::Value> = all_baselines
+            .iter()
+            .filter(|b| b.kind.eq_ignore_ascii_case("pc"))
+            .map(|b| {
+                serde_json::json!({
+                    "id": b.id,
+                    "name": b.name,
+                    "title": b.title,
+                    "archetype": b.archetype,
+                    "kind": b.kind
+                })
+            })
+            .collect();
+        let all_characters: Vec<serde_json::Value> = all_baselines
+            .iter()
+            .map(|b| {
+                serde_json::json!({
+                    "id": b.id,
+                    "name": b.name,
+                    "title": b.title,
+                    "archetype": b.archetype,
+                    "kind": b.kind
+                })
+            })
+            .collect();
+
+        let mut equipment_fit: std::collections::BTreeMap<String, crate::autonomy::GarmentFitReport> =
+            std::collections::BTreeMap::new();
+        for it in &proj.current.equipment {
+            if let Some(rep) = crate::autonomy::evaluate_garment_fit(it, &profile.avatar) {
+                equipment_fit.insert(it.name.clone(), rep);
+            }
+        }
+        let apparel_summary = crate::autonomy::evaluate_equipped_apparel_fit(
+            &proj.current.equipment,
+            &profile.avatar,
+        );
+
+        let routines = self.db.list_routines(Some(&cid)).unwrap_or_default();
+        let active_signals = self
+            .list_active_signals(
+                Some("gm"),
+                proj.current.current_location.as_deref(),
+                std::slice::from_ref(&cid),
+                true,
+            )
+            .unwrap_or_default();
+
+        Ok(serde_json::json!({
+            "character_id": cid,
+            "character": proj,
+            "profile": profile,
+            "equipment_fit": equipment_fit,
+            "apparel_summary": apparel_summary,
+            "visual_prompt": visual_prompt,
+            "progression_tracks": progression_tracks,
+            "progression_ladders": progression_ladders,
+            "routines": routines,
+            "active_signals": active_signals,
+            "manuals": manuals,
+            "images": images,
+            "catalog_items": catalog_items,
+            "currency_balances": currency_balances,
+            "injuries": injuries,
+            "relations": rels,
+            "all_pcs": all_pcs,
+            "all_characters": all_characters
+        }))
+    }
+
+    pub fn manage_player_character_action(
+        &self,
+        character_id: Option<&str>,
+        action: &str,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let act = action.trim().to_lowercase();
+        if act == "get_sheet" || act == "get" {
+            return self.get_player_character_sheet(character_id);
+        }
+
+        let cid = self.resolve_primary_pc_id(character_id)?;
+        let proj = load_character_projection(&self.db, &cid, None)?;
+        let mut profile = self.get_character_profile(&cid)?;
+        let reason = args
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let now = self.db.get_campaign_meta()?.clock.format_short();
+
+        let (summary, fields_updated, extra_payload) = match act.as_str() {
+            "update_avatar" => {
+                let mut updated = Vec::new();
+                macro_rules! set_av_str {
+                    ($key:expr, $field:expr) => {
+                        if let Some(s) = args.get($key).and_then(|v| v.as_str()) {
+                            $field = s.to_string();
+                            updated.push($key.to_string());
+                        }
+                    };
+                }
+                set_av_str!("avatar_summary", profile.avatar.avatar_summary);
+                set_av_str!("appearance_stage", profile.avatar.appearance_stage);
+                set_av_str!("height", profile.avatar.height);
+                set_av_str!("weight", profile.avatar.weight);
+                set_av_str!("baseline_height", profile.avatar.baseline_height);
+                set_av_str!("baseline_weight", profile.avatar.baseline_weight);
+                set_av_str!("chronological_age", profile.avatar.chronological_age);
+                set_av_str!("apparent_age", profile.avatar.apparent_age);
+                set_av_str!("body_type_or_build", profile.avatar.body_type_or_build);
+                set_av_str!("silhouette", profile.avatar.silhouette);
+                set_av_str!("posture_and_gait", profile.avatar.posture_and_gait);
+                set_av_str!("proportions_summary", profile.avatar.proportions_summary);
+                set_av_str!("clothing_fit", profile.avatar.clothing_fit);
+                set_av_str!("perceived_change_note", profile.avatar.perceived_change_note);
+                set_av_str!("transformation_trajectory", profile.avatar.transformation_trajectory);
+                set_av_str!("face_shape_and_features", profile.avatar.face_shape_and_features);
+                set_av_str!("eyes", profile.avatar.eyes);
+                set_av_str!("skin_tone_and_texture", profile.avatar.skin_tone_and_texture);
+                set_av_str!("hair", profile.avatar.hair);
+                set_av_str!("facial_hair", profile.avatar.facial_hair);
+                set_av_str!("voice_and_speech", profile.avatar.voice_and_speech);
+                set_av_str!("scent_or_aura", profile.avatar.scent_or_aura);
+                set_av_str!("visual_prompt_anchor", profile.avatar.visual_prompt_anchor);
+                set_av_str!("active_outfit", profile.avatar.active_outfit);
+                // Also allow syncing common identity/body fields cleanly in the same call
+                set_av_str!("gender", profile.gender);
+                set_av_str!("species", profile.species);
+                set_av_str!("age_or_birthdate", profile.age_or_birthdate);
+                set_av_str!("body_constitution", profile.body_constitution);
+                set_av_str!("body_tempering", profile.body_tempering);
+
+                if let Some(v) = args.get("lifespan_years") {
+                    if v.is_null() {
+                        profile.avatar.lifespan_years = None;
+                    } else if let Some(n) = v.as_u64() {
+                        profile.avatar.lifespan_years = if n == 0 { None } else { Some(n as u32) };
+                    }
+                    updated.push("lifespan_years".to_string());
+                }
+                if let Some(v) = args.get("portrait_attachment_id") {
+                    if v.is_null() {
+                        profile.avatar.portrait_attachment_id = None;
+                    } else if let Some(s) = v.as_str() {
+                        profile.avatar.portrait_attachment_id = if s.trim().is_empty() {
+                            None
+                        } else {
+                            Some(s.trim().to_string())
+                        };
+                    }
+                    updated.push("portrait_attachment_id".to_string());
+                }
+                if let Some(obj) = args.get("measurements").and_then(|v| v.as_object()) {
+                    let replace = args
+                        .get("replace_measurements")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if replace {
+                        profile.avatar.measurements.clear();
+                    }
+                    for (mk, mv) in obj {
+                        let norm_k = crate::autonomy::normalize_measurement_key(mk);
+                        if norm_k.is_empty() {
+                            continue;
+                        }
+                        let val_s = mv
+                            .as_str()
+                            .map(|s| s.trim().to_string())
+                            .unwrap_or_else(|| mv.to_string());
+                        if val_s.is_empty() {
+                            profile.avatar.measurements.remove(mk.trim());
+                            profile.avatar.measurements.remove(&norm_k);
+                        } else {
+                            if mk.trim() != norm_k {
+                                profile.avatar.measurements.remove(mk.trim());
+                            }
+                            profile.avatar.measurements.insert(norm_k, val_s);
+                        }
+                    }
+                    updated.push("measurements".to_string());
+                }
+                if let Some(obj) = args.get("baseline_measurements").and_then(|v| v.as_object()) {
+                    let replace = args
+                        .get("replace_baseline_measurements")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if replace {
+                        profile.avatar.baseline_measurements.clear();
+                    }
+                    for (mk, mv) in obj {
+                        let norm_k = crate::autonomy::normalize_measurement_key(mk);
+                        if norm_k.is_empty() {
+                            continue;
+                        }
+                        let val_s = mv
+                            .as_str()
+                            .map(|s| s.trim().to_string())
+                            .unwrap_or_else(|| mv.to_string());
+                        if val_s.is_empty() {
+                            profile.avatar.baseline_measurements.remove(mk.trim());
+                            profile.avatar.baseline_measurements.remove(&norm_k);
+                        } else {
+                            if mk.trim() != norm_k {
+                                profile.avatar.baseline_measurements.remove(mk.trim());
+                            }
+                            profile.avatar.baseline_measurements.insert(norm_k, val_s);
+                        }
+                    }
+                    updated.push("baseline_measurements".to_string());
+                }
+                if let Some(sm) = args.get("set_measurement").and_then(|v| v.as_object()) {
+                    if let (Some(k), Some(v)) = (
+                        sm.get("key").and_then(|x| x.as_str()),
+                        sm.get("value").and_then(|x| x.as_str()),
+                    ) {
+                        let norm_k = crate::autonomy::normalize_measurement_key(k);
+                        if !norm_k.is_empty() {
+                            if v.trim().is_empty() {
+                                profile.avatar.measurements.remove(k.trim());
+                                profile.avatar.measurements.remove(&norm_k);
+                            } else {
+                                if k.trim() != norm_k {
+                                    profile.avatar.measurements.remove(k.trim());
+                                }
+                                profile
+                                    .avatar
+                                    .measurements
+                                    .insert(norm_k, v.trim().to_string());
+                            }
+                            updated.push("measurements".to_string());
+                        }
+                    }
+                }
+                if let Some(sm) = args
+                    .get("set_baseline_measurement")
+                    .and_then(|v| v.as_object())
+                {
+                    if let (Some(k), Some(v)) = (
+                        sm.get("key").and_then(|x| x.as_str()),
+                        sm.get("value").and_then(|x| x.as_str()),
+                    ) {
+                        let norm_k = crate::autonomy::normalize_measurement_key(k);
+                        if !norm_k.is_empty() {
+                            if v.trim().is_empty() {
+                                profile.avatar.baseline_measurements.remove(k.trim());
+                                profile.avatar.baseline_measurements.remove(&norm_k);
+                            } else {
+                                if k.trim() != norm_k {
+                                    profile.avatar.baseline_measurements.remove(k.trim());
+                                }
+                                profile
+                                    .avatar
+                                    .baseline_measurements
+                                    .insert(norm_k, v.trim().to_string());
+                            }
+                            updated.push("baseline_measurements".to_string());
+                        }
+                    }
+                }
+                if let Some(rm) = args.get("remove_measurement").and_then(|v| v.as_str()) {
+                    let norm_k = crate::autonomy::normalize_measurement_key(rm);
+                    profile.avatar.measurements.remove(rm.trim());
+                    profile.avatar.measurements.remove(&norm_k);
+                    updated.push("measurements".to_string());
+                }
+                if let Some(rm) = args
+                    .get("remove_baseline_measurement")
+                    .and_then(|v| v.as_str())
+                {
+                    let norm_k = crate::autonomy::normalize_measurement_key(rm);
+                    profile.avatar.baseline_measurements.remove(rm.trim());
+                    profile.avatar.baseline_measurements.remove(&norm_k);
+                    updated.push("baseline_measurements".to_string());
+                }
+                if args
+                    .get("clear_checkpoints")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    profile.avatar.transformation_log.clear();
+                    updated.push("transformation_log".to_string());
+                }
+                if let Some(arr) = args.get("transformation_log").and_then(|v| v.as_array()) {
+                    let mut parsed = Vec::new();
+                    for item in arr {
+                        if let Ok(mut cp) =
+                            serde_json::from_value::<crate::autonomy::AppearanceCheckpoint>(
+                                item.clone(),
+                            )
+                        {
+                            let mut norm_m = std::collections::BTreeMap::new();
+                            for (k, v) in cp.measurements {
+                                let nk = crate::autonomy::normalize_measurement_key(&k);
+                                if !nk.is_empty() && !v.trim().is_empty() {
+                                    norm_m.insert(nk, v.trim().to_string());
+                                }
+                            }
+                            cp.measurements = norm_m;
+                            parsed.push(cp);
+                        }
+                    }
+                    profile.avatar.transformation_log = parsed;
+                    updated.push("transformation_log".to_string());
+                }
+                if let Some(cp_val) = args.get("record_checkpoint").and_then(|v| v.as_object()) {
+                    let stage = cp_val
+                        .get("stage")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| {
+                            if !profile.avatar.appearance_stage.is_empty() {
+                                profile.avatar.appearance_stage.clone()
+                            } else {
+                                "Checkpoint".to_string()
+                            }
+                        });
+                    let world_time = cp_val
+                        .get("world_time")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| now.clone());
+                    let summary = cp_val
+                        .get("summary")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .unwrap_or("")
+                        .to_string();
+                    let height = cp_val
+                        .get("height")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| profile.avatar.height.clone());
+                    let weight = cp_val
+                        .get("weight")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| profile.avatar.weight.clone());
+                    let meas = if let Some(obj) =
+                        cp_val.get("measurements").and_then(|v| v.as_object())
+                    {
+                        obj.iter()
+                            .filter_map(|(k, v)| {
+                                let nk = crate::autonomy::normalize_measurement_key(k);
+                                let vs = v.as_str().map(str::trim).unwrap_or("").to_string();
+                                if nk.is_empty() || vs.is_empty() {
+                                    None
+                                } else {
+                                    Some((nk, vs))
+                                }
+                            })
+                            .collect()
+                    } else {
+                        profile.avatar.measurements.clone()
+                    };
+                    let cp = crate::autonomy::AppearanceCheckpoint {
+                        stage: stage.clone(),
+                        world_time,
+                        summary,
+                        height,
+                        weight,
+                        measurements: meas,
+                    };
+                    if let Some(ex) = profile
+                        .avatar
+                        .transformation_log
+                        .iter_mut()
+                        .find(|x| x.stage.eq_ignore_ascii_case(&stage))
+                    {
+                        *ex = cp;
+                    } else {
+                        profile.avatar.transformation_log.push(cp);
+                    }
+                    updated.push("transformation_log".to_string());
+                }
+                // Keep legacy height_and_build synced for backward compatibility
+                if !profile.avatar.height.is_empty() || !profile.avatar.body_type_or_build.is_empty() {
+                    profile.height_and_build = [
+                        profile.avatar.height.as_str(),
+                        profile.avatar.weight.as_str(),
+                        profile.avatar.body_type_or_build.as_str(),
+                    ]
+                    .iter()
+                    .filter(|s| !s.is_empty())
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(" • ");
+                }
+
+                let vp = profile
+                    .avatar
+                    .synthesize_visual_prompt(&proj.baseline.name, &proj.baseline.archetype);
+                (
+                    format!(
+                        "Updated avatar & physical profile for {} ({})",
+                        proj.baseline.name,
+                        if updated.is_empty() {
+                            "avatar".to_string()
+                        } else {
+                            updated.join(", ")
+                        }
+                    ),
+                    updated,
+                    serde_json::json!({ "avatar": profile.avatar, "visual_prompt": vp }),
+                )
+            }
+
+            "upsert_marker" => {
+                let location = args
+                    .get("location")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let description = args
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if location.is_empty() && description.is_empty() {
+                    bail!("upsert_marker requires 'location' or 'description'");
+                }
+                let kind = args
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("scar")
+                    .trim()
+                    .to_string();
+                let id = args
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .map(slugify)
+                    .unwrap_or_else(|| slugify(&format!("{kind}-{location}-{description}")));
+                let marker = PhysicalMarker {
+                    id: id.clone(),
+                    kind: kind.clone(),
+                    location: location.clone(),
+                    description: description.clone(),
+                    origin_or_story: args
+                        .get("origin_or_story")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    visible_when_clothed: args
+                        .get("visible_when_clothed")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true),
+                };
+                if let Some(ex) = profile
+                    .avatar
+                    .permanent_markers
+                    .iter_mut()
+                    .find(|m| m.id == id)
+                {
+                    *ex = marker.clone();
+                } else {
+                    profile.avatar.permanent_markers.push(marker.clone());
+                }
+                (
+                    format!(
+                        "Recorded permanent marker ({kind} on {location}) for {}",
+                        proj.baseline.name
+                    ),
+                    vec!["avatar.permanent_markers".to_string()],
+                    serde_json::json!({ "marker": marker, "permanent_markers": profile.avatar.permanent_markers }),
+                )
+            }
+
+            "remove_marker" => {
+                let id = args
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("remove_marker requires 'id'"))?;
+                let slug = slugify(id);
+                let before = profile.avatar.permanent_markers.len();
+                profile
+                    .avatar
+                    .permanent_markers
+                    .retain(|m| m.id != id && m.id != slug);
+                if profile.avatar.permanent_markers.len() == before {
+                    bail!("Permanent marker '{id}' not found on '{cid}'");
+                }
+                (
+                    format!("Removed permanent marker '{id}' from {}", proj.baseline.name),
+                    vec!["avatar.permanent_markers".to_string()],
+                    serde_json::json!({ "removed": true, "permanent_markers": profile.avatar.permanent_markers }),
+                )
+            }
+
+            "upsert_outfit" => {
+                let name = args
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| anyhow!("upsert_outfit requires 'name'"))?
+                    .to_string();
+                let id = args
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .map(slugify)
+                    .unwrap_or_else(|| slugify(&name));
+                let existing = profile
+                    .avatar
+                    .outfits
+                    .iter()
+                    .find(|o| o.id == id || o.name.eq_ignore_ascii_case(&name))
+                    .cloned();
+                let outfit = CharacterOutfit {
+                    id: id.clone(),
+                    name: name.clone(),
+                    occasion: args
+                        .get("occasion")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| existing.as_ref().map(|o| o.occasion.clone()))
+                        .unwrap_or_default(),
+                    description: args
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| existing.as_ref().map(|o| o.description.clone()))
+                        .unwrap_or_default(),
+                    headwear: args
+                        .get("headwear")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| existing.as_ref().map(|o| o.headwear.clone()))
+                        .unwrap_or_default(),
+                    outer_layer: args
+                        .get("outer_layer")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| existing.as_ref().map(|o| o.outer_layer.clone()))
+                        .unwrap_or_default(),
+                    top_layer: args
+                        .get("top_layer")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| existing.as_ref().map(|o| o.top_layer.clone()))
+                        .unwrap_or_default(),
+                    bottoms: args
+                        .get("bottoms")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| existing.as_ref().map(|o| o.bottoms.clone()))
+                        .unwrap_or_default(),
+                    footwear: args
+                        .get("footwear")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| existing.as_ref().map(|o| o.footwear.clone()))
+                        .unwrap_or_default(),
+                    accessories: args
+                        .get("accessories")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| existing.as_ref().map(|o| o.accessories.clone()))
+                        .unwrap_or_default(),
+                    color_palette: args
+                        .get("color_palette")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| existing.as_ref().map(|o| o.color_palette.clone()))
+                        .unwrap_or_default(),
+                    notes: args
+                        .get("notes")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| existing.as_ref().map(|o| o.notes.clone()))
+                        .unwrap_or_default(),
+                };
+                if let Some(ex) = profile
+                    .avatar
+                    .outfits
+                    .iter_mut()
+                    .find(|o| o.id == id || o.name.eq_ignore_ascii_case(&name))
+                {
+                    *ex = outfit.clone();
+                } else {
+                    profile.avatar.outfits.push(outfit.clone());
+                }
+                if args.get("set_active").and_then(|v| v.as_bool()).unwrap_or(false)
+                    || profile.avatar.active_outfit.is_empty()
+                {
+                    profile.avatar.active_outfit = outfit.id.clone();
+                }
+                (
+                    format!("Saved outfit '{}' for {}", outfit.name, proj.baseline.name),
+                    vec!["avatar.outfits".to_string()],
+                    serde_json::json!({ "outfit": outfit, "active_outfit": profile.avatar.active_outfit, "outfits": profile.avatar.outfits }),
+                )
+            }
+
+            "set_active_outfit" => {
+                let target = args
+                    .get("id")
+                    .or_else(|| args.get("name"))
+                    .or_else(|| args.get("active_outfit"))
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("set_active_outfit requires 'id' or 'name'"))?
+                    .trim();
+                let resolved = profile
+                    .avatar
+                    .outfits
+                    .iter()
+                    .find(|o| o.id.eq_ignore_ascii_case(target) || o.name.eq_ignore_ascii_case(target))
+                    .map(|o| o.id.clone())
+                    .unwrap_or_else(|| target.to_string());
+                profile.avatar.active_outfit = resolved.clone();
+                (
+                    format!("Changed active outfit for {} to '{}'", proj.baseline.name, resolved),
+                    vec!["avatar.active_outfit".to_string()],
+                    serde_json::json!({ "active_outfit": resolved }),
+                )
+            }
+
+            "remove_outfit" => {
+                let id = args
+                    .get("id")
+                    .or_else(|| args.get("name"))
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("remove_outfit requires 'id' or 'name'"))?;
+                let slug = slugify(id);
+                let before = profile.avatar.outfits.len();
+                profile
+                    .avatar
+                    .outfits
+                    .retain(|o| o.id != id && o.id != slug && !o.name.eq_ignore_ascii_case(id));
+                if profile.avatar.outfits.len() == before {
+                    bail!("Outfit '{id}' not found on '{cid}'");
+                }
+                if profile.avatar.active_outfit == id || profile.avatar.active_outfit == slug {
+                    profile.avatar.active_outfit = profile
+                        .avatar
+                        .outfits
+                        .first()
+                        .map(|o| o.id.clone())
+                        .unwrap_or_default();
+                }
+                (
+                    format!("Removed outfit '{id}' from {}", proj.baseline.name),
+                    vec!["avatar.outfits".to_string()],
+                    serde_json::json!({ "removed": true, "outfits": profile.avatar.outfits }),
+                )
+            }
+
+            "upsert_title" => {
+                let name = args
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| anyhow!("upsert_title requires 'name'"))?
+                    .to_string();
+                let id = args
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .map(slugify)
+                    .unwrap_or_else(|| slugify(&name));
+                let existing = profile
+                    .titles
+                    .iter()
+                    .find(|t| t.id == id || t.name.eq_ignore_ascii_case(&name))
+                    .cloned();
+                let stat_modifiers = if let Some(obj) =
+                    args.get("stat_modifiers").and_then(|v| v.as_object())
+                {
+                    let mut m = std::collections::BTreeMap::new();
+                    for (k, v) in obj {
+                        if let Some(n) = v.as_i64() {
+                            m.insert(k.clone(), n);
+                        }
+                    }
+                    m
+                } else {
+                    existing
+                        .as_ref()
+                        .map(|t| t.stat_modifiers.clone())
+                        .unwrap_or_default()
+                };
+                let title = CharacterTitle {
+                    id: id.clone(),
+                    name: name.clone(),
+                    kind: args
+                        .get("kind")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| existing.as_ref().map(|t| t.kind.clone()))
+                        .unwrap_or_else(|| "title".to_string()),
+                    equipped: args
+                        .get("equipped")
+                        .and_then(|v| v.as_bool())
+                        .or_else(|| existing.as_ref().map(|t| t.equipped))
+                        .unwrap_or(true),
+                    source: args
+                        .get("source")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| existing.as_ref().map(|t| t.source.clone()))
+                        .unwrap_or_default(),
+                    mechanical_effect: args
+                        .get("mechanical_effect")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| existing.as_ref().map(|t| t.mechanical_effect.clone()))
+                        .unwrap_or_default(),
+                    stat_modifiers,
+                    visibility: args
+                        .get("visibility")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| existing.as_ref().map(|t| t.visibility.clone()))
+                        .unwrap_or_else(|| "public".to_string()),
+                    notes: args
+                        .get("notes")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| existing.as_ref().map(|t| t.notes.clone()))
+                        .unwrap_or_default(),
+                };
+                if let Some(ex) = profile
+                    .titles
+                    .iter_mut()
+                    .find(|t| t.id == id || t.name.eq_ignore_ascii_case(&name))
+                {
+                    *ex = title.clone();
+                } else {
+                    profile.titles.push(title.clone());
+                }
+                (
+                    format!(
+                        "Saved title '{}' [{}] on {}",
+                        title.name,
+                        if title.equipped { "equipped" } else { "stored" },
+                        proj.baseline.name
+                    ),
+                    vec!["titles".to_string()],
+                    serde_json::json!({ "title": title, "titles": profile.titles }),
+                )
+            }
+
+            "toggle_title" => {
+                let id = args
+                    .get("id")
+                    .or_else(|| args.get("name"))
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("toggle_title requires 'id' or 'name'"))?;
+                let slug = slugify(id);
+                let t = profile
+                    .titles
+                    .iter_mut()
+                    .find(|t| t.id == id || t.id == slug || t.name.eq_ignore_ascii_case(id))
+                    .ok_or_else(|| anyhow!("Title '{id}' not found on '{cid}'"))?;
+                t.equipped = args
+                    .get("equipped")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(!t.equipped);
+                let out_t = t.clone();
+                (
+                    format!(
+                        "{} title '{}' on {}",
+                        if out_t.equipped { "Equipped" } else { "Unequipped" },
+                        out_t.name,
+                        proj.baseline.name
+                    ),
+                    vec!["titles".to_string()],
+                    serde_json::json!({ "title": out_t, "titles": profile.titles }),
+                )
+            }
+
+            "remove_title" => {
+                let id = args
+                    .get("id")
+                    .or_else(|| args.get("name"))
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("remove_title requires 'id' or 'name'"))?;
+                let slug = slugify(id);
+                let before = profile.titles.len();
+                profile
+                    .titles
+                    .retain(|t| t.id != id && t.id != slug && !t.name.eq_ignore_ascii_case(id));
+                if profile.titles.len() == before {
+                    bail!("Title '{id}' not found on '{cid}'");
+                }
+                (
+                    format!("Removed title '{id}' from {}", proj.baseline.name),
+                    vec!["titles".to_string()],
+                    serde_json::json!({ "removed": true, "titles": profile.titles }),
+                )
+            }
+
+            "adjust_stat_xp" => {
+                // Optional free stat point pool adjustments
+                if let Some(sp) = args.get("set_unspent_stat_points").and_then(|v| v.as_i64()) {
+                    profile.unspent_stat_points = sp.max(0);
+                }
+                if let Some(d) = args.get("unspent_stat_points_delta").and_then(|v| v.as_i64()) {
+                    profile.unspent_stat_points = (profile.unspent_stat_points + d).max(0);
+                }
+
+                let stat_opt = args
+                    .get("stat")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
+
+                if let Some(stat_name) = stat_opt {
+                    let spend_point = args
+                        .get("spend_stat_point")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if spend_point {
+                        if profile.unspent_stat_points <= 0 {
+                            bail!("No unspent stat points available to spend on '{stat_name}'");
+                        }
+                        profile.unspent_stat_points -= 1;
+                        self.modify_stat(
+                            &cid,
+                            &stat_name,
+                            Some(1),
+                            None,
+                            if reason.is_empty() {
+                                "Spent 1 unspent stat point"
+                            } else {
+                                &reason
+                            },
+                        )?;
+                        let summary = format!(
+                            "{} spent 1 free stat point -> +1 {} (remaining free points: {})",
+                            proj.baseline.name, stat_name, profile.unspent_stat_points
+                        );
+                        (
+                            summary,
+                            vec!["unspent_stat_points".to_string(), format!("stat:{stat_name}")],
+                            serde_json::json!({
+                                "unspent_stat_points": profile.unspent_stat_points,
+                                "stat_training": profile.stat_training
+                            }),
+                        )
+                    } else {
+                        let entry = profile
+                            .stat_training
+                            .entry(stat_name.clone())
+                            .or_insert_with(|| StatTrainingEntry {
+                                stat: stat_name.clone(),
+                                current_xp: 0,
+                                xp_to_next: 100,
+                                cumulative_xp: 0,
+                                points_gained_from_training: 0,
+                                training_notes: String::new(),
+                            });
+                        if let Some(n) = args.get("xp_to_next").and_then(|v| v.as_u64()) {
+                            entry.xp_to_next = n.max(1);
+                        }
+                        if let Some(tn) = args.get("training_notes").and_then(|v| v.as_str()) {
+                            entry.training_notes = tn.to_string();
+                        }
+
+                        let old_xp = entry.current_xp;
+                        let mut points_promoted: i64 = 0;
+                        let auto_promote = args
+                            .get("auto_promote")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true);
+
+                        if args.get("reset_xp").and_then(|v| v.as_bool()).unwrap_or(false) {
+                            entry.cumulative_xp = entry.cumulative_xp.saturating_sub(entry.current_xp);
+                            entry.current_xp = 0;
+                        } else if let Some(v) = args.get("set_xp").and_then(|v| v.as_u64()) {
+                            entry.current_xp = v;
+                            if let Some(c) = args.get("set_cumulative_xp").and_then(|v| v.as_u64()) {
+                                entry.cumulative_xp = c;
+                            }
+                        } else if let Some(d) = args
+                            .get("delta_xp")
+                            .or_else(|| args.get("xp"))
+                            .and_then(|v| v.as_i64())
+                        {
+                            if d >= 0 {
+                                let add = d as u64;
+                                entry.current_xp = entry.current_xp.saturating_add(add);
+                                entry.cumulative_xp = entry.cumulative_xp.saturating_add(add);
+                                if auto_promote {
+                                    while entry.current_xp >= entry.xp_to_next.max(1) {
+                                        let need = entry.xp_to_next.max(1);
+                                        entry.current_xp -= need;
+                                        entry.points_gained_from_training += 1;
+                                        points_promoted += 1;
+                                        entry.xp_to_next = (need as f64 * 1.25).round() as u64;
+                                    }
+                                }
+                            } else {
+                                let sub = d.unsigned_abs();
+                                entry.current_xp = entry.current_xp.saturating_sub(sub);
+                                entry.cumulative_xp = entry.cumulative_xp.saturating_sub(sub);
+                            }
+                        }
+
+                        let entry_snapshot = entry.clone();
+                        if points_promoted > 0 {
+                            self.modify_stat(
+                                &cid,
+                                &stat_name,
+                                Some(points_promoted),
+                                None,
+                                if reason.is_empty() {
+                                    "Stat Training XP threshold reached"
+                                } else {
+                                    &reason
+                                },
+                            )?;
+                        }
+                        let summary = format!(
+                            "{} Stat Training XP [{}]: {} -> {} / {} XP (total {}){}",
+                            proj.baseline.name,
+                            stat_name,
+                            old_xp,
+                            entry_snapshot.current_xp,
+                            entry_snapshot.xp_to_next,
+                            entry_snapshot.cumulative_xp,
+                            if points_promoted > 0 {
+                                format!(" (+{points_promoted} {stat_name}!)")
+                            } else {
+                                String::new()
+                            }
+                        );
+                        (
+                            summary,
+                            vec![format!("stat_training.{stat_name}")],
+                            serde_json::json!({
+                                "entry": entry_snapshot,
+                                "points_promoted": points_promoted,
+                                "unspent_stat_points": profile.unspent_stat_points,
+                                "stat_training": profile.stat_training
+                            }),
+                        )
+                    }
+                } else {
+                    (
+                        format!(
+                            "Updated unspent stat points for {} -> {}",
+                            proj.baseline.name, profile.unspent_stat_points
+                        ),
+                        vec!["unspent_stat_points".to_string()],
+                        serde_json::json!({ "unspent_stat_points": profile.unspent_stat_points }),
+                    )
+                }
+            }
+
+            "upsert_job" => {
+                let name = args
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| anyhow!("upsert_job requires 'name'"))?
+                    .to_string();
+                let job_id = args
+                    .get("job_id")
+                    .or_else(|| args.get("id"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .map(slugify)
+                    .unwrap_or_else(|| slugify(&name));
+                let existing = profile
+                    .jobs
+                    .iter()
+                    .find(|j| j.job_id == job_id || j.name.eq_ignore_ascii_case(&name))
+                    .cloned();
+                let job = CharacterJob {
+                    job_id: job_id.clone(),
+                    name: name.clone(),
+                    role: args
+                        .get("role")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| existing.as_ref().map(|j| j.role.clone()))
+                        .unwrap_or_else(|| "primary".to_string()),
+                    tier_or_rank: args
+                        .get("tier_or_rank")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| existing.as_ref().map(|j| j.tier_or_rank.clone()))
+                        .unwrap_or_default(),
+                    level: args
+                        .get("level")
+                        .and_then(|v| v.as_u64())
+                        .map(|n| (n as u32).max(1))
+                        .or_else(|| existing.as_ref().map(|j| j.level))
+                        .unwrap_or(1),
+                    current_xp: args
+                        .get("current_xp")
+                        .and_then(|v| v.as_u64())
+                        .or_else(|| existing.as_ref().map(|j| j.current_xp))
+                        .unwrap_or(0),
+                    xp_to_next: args
+                        .get("xp_to_next")
+                        .and_then(|v| v.as_u64())
+                        .map(|n| n.max(1))
+                        .or_else(|| existing.as_ref().map(|j| j.xp_to_next))
+                        .unwrap_or(250),
+                    cumulative_xp: args
+                        .get("cumulative_xp")
+                        .and_then(|v| v.as_u64())
+                        .or_else(|| existing.as_ref().map(|j| j.cumulative_xp))
+                        .unwrap_or(0),
+                    active: args
+                        .get("active")
+                        .and_then(|v| v.as_bool())
+                        .or_else(|| existing.as_ref().map(|j| j.active))
+                        .unwrap_or(true),
+                    governing_stats: args
+                        .get("governing_stats")
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                .collect()
+                        })
+                        .or_else(|| existing.as_ref().map(|j| j.governing_stats.clone()))
+                        .unwrap_or_default(),
+                    perks_and_features: args
+                        .get("perks_and_features")
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                .collect()
+                        })
+                        .or_else(|| existing.as_ref().map(|j| j.perks_and_features.clone()))
+                        .unwrap_or_default(),
+                    notes: args
+                        .get("notes")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| existing.as_ref().map(|j| j.notes.clone()))
+                        .unwrap_or_default(),
+                };
+                if let Some(ex) = profile
+                    .jobs
+                    .iter_mut()
+                    .find(|j| j.job_id == job_id || j.name.eq_ignore_ascii_case(&name))
+                {
+                    *ex = job.clone();
+                } else {
+                    profile.jobs.push(job.clone());
+                }
+                (
+                    format!(
+                        "Saved job '{}' [{} Lv {}] on {}",
+                        job.name, job.role, job.level, proj.baseline.name
+                    ),
+                    vec!["jobs".to_string()],
+                    serde_json::json!({ "job": job, "jobs": profile.jobs }),
+                )
+            }
+
+            "adjust_job_xp" => {
+                let target = args
+                    .get("job_id")
+                    .or_else(|| args.get("id"))
+                    .or_else(|| args.get("name"))
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("adjust_job_xp requires 'job_id' (or 'name')"))?;
+                let slug = slugify(target);
+                let job = profile
+                    .jobs
+                    .iter_mut()
+                    .find(|j| j.job_id == target || j.job_id == slug || j.name.eq_ignore_ascii_case(target))
+                    .ok_or_else(|| anyhow!("Job '{target}' not found on '{cid}'"))?;
+
+                let old_lvl = job.level;
+                let old_xp = job.current_xp;
+                let allow_demote = args
+                    .get("allow_demote")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let mut levels_changed: i64 = 0;
+
+                if args.get("reset_job").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    job.level = 1;
+                    job.current_xp = 0;
+                    job.cumulative_xp = 0;
+                    job.xp_to_next = 250;
+                    levels_changed = 1 - (old_lvl as i64);
+                } else if args
+                    .get("reset_stage_xp")
+                    .or_else(|| args.get("reset_xp"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    job.cumulative_xp = job.cumulative_xp.saturating_sub(job.current_xp);
+                    job.current_xp = 0;
+                } else {
+                    if let Some(lvl) = args.get("set_level").and_then(|v| v.as_u64()) {
+                        job.level = (lvl as u32).max(1);
+                        levels_changed = (job.level as i64) - (old_lvl as i64);
+                    }
+                    if let Some(v) = args.get("set_xp").and_then(|v| v.as_u64()) {
+                        job.current_xp = v;
+                    }
+                    if let Some(c) = args.get("set_cumulative_xp").and_then(|v| v.as_u64()) {
+                        job.cumulative_xp = c;
+                    }
+                    if let Some(d) = args
+                        .get("delta_xp")
+                        .or_else(|| args.get("xp"))
+                        .and_then(|v| v.as_i64())
+                    {
+                        if d >= 0 {
+                            let add = d as u64;
+                            job.current_xp = job.current_xp.saturating_add(add);
+                            job.cumulative_xp = job.cumulative_xp.saturating_add(add);
+                            while job.current_xp >= job.xp_to_next.max(1) {
+                                let need = job.xp_to_next.max(1);
+                                job.current_xp -= need;
+                                job.level += 1;
+                                levels_changed += 1;
+                                job.xp_to_next = ((need as f64) * 1.35).round() as u64;
+                            }
+                        } else {
+                            let mut rem = d.unsigned_abs();
+                            job.cumulative_xp = job.cumulative_xp.saturating_sub(rem);
+                            if rem <= job.current_xp {
+                                job.current_xp -= rem;
+                            } else if !allow_demote {
+                                job.current_xp = 0;
+                            } else {
+                                rem -= job.current_xp;
+                                job.current_xp = 0;
+                                while rem > 0 && job.level > 1 {
+                                    job.level -= 1;
+                                    levels_changed -= 1;
+                                    let prev_need =
+                                        ((job.xp_to_next as f64) / 1.35).round().max(100.0) as u64;
+                                    job.xp_to_next = prev_need;
+                                    if rem < prev_need {
+                                        job.current_xp = prev_need - rem;
+                                        rem = 0;
+                                    } else {
+                                        rem -= prev_need;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                let out_job = job.clone();
+                (
+                    format!(
+                        "{} Job XP [{}]: Lv {} ({} XP) -> Lv {} ({}/{} XP, total {})",
+                        proj.baseline.name,
+                        out_job.name,
+                        old_lvl,
+                        old_xp,
+                        out_job.level,
+                        out_job.current_xp,
+                        out_job.xp_to_next,
+                        out_job.cumulative_xp
+                    ),
+                    vec!["jobs".to_string()],
+                    serde_json::json!({ "job": out_job, "levels_changed": levels_changed, "jobs": profile.jobs }),
+                )
+            }
+
+            "remove_job" => {
+                let id = args
+                    .get("job_id")
+                    .or_else(|| args.get("id"))
+                    .or_else(|| args.get("name"))
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("remove_job requires 'job_id' (or 'name')"))?;
+                let slug = slugify(id);
+                let before = profile.jobs.len();
+                profile
+                    .jobs
+                    .retain(|j| j.job_id != id && j.job_id != slug && !j.name.eq_ignore_ascii_case(id));
+                if profile.jobs.len() == before {
+                    bail!("Job '{id}' not found on '{cid}'");
+                }
+                (
+                    format!("Removed job '{id}' from {}", proj.baseline.name),
+                    vec!["jobs".to_string()],
+                    serde_json::json!({ "removed": true, "jobs": profile.jobs }),
+                )
+            }
+
+            "upsert_proficiency" => {
+                let name = args
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| anyhow!("upsert_proficiency requires 'name'"))?
+                    .to_string();
+                let id = args
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .map(slugify)
+                    .unwrap_or_else(|| slugify(&name));
+                let existing = profile
+                    .proficiencies
+                    .iter()
+                    .find(|p| p.id == id || p.name.eq_ignore_ascii_case(&name))
+                    .cloned();
+                let prof = CharacterProficiency {
+                    id: id.clone(),
+                    name: name.clone(),
+                    category: args
+                        .get("category")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| existing.as_ref().map(|p| p.category.clone()))
+                        .unwrap_or_else(|| "tool".to_string()),
+                    rank: args
+                        .get("rank")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| existing.as_ref().map(|p| p.rank.clone()))
+                        .unwrap_or_else(|| "Proficient".to_string()),
+                    xp: args
+                        .get("xp")
+                        .and_then(|v| v.as_u64())
+                        .or_else(|| existing.as_ref().map(|p| p.xp))
+                        .unwrap_or(0),
+                    xp_to_next: args
+                        .get("xp_to_next")
+                        .and_then(|v| v.as_u64())
+                        .map(|n| n.max(1))
+                        .or_else(|| existing.as_ref().map(|p| p.xp_to_next))
+                        .unwrap_or(100),
+                    bonus: args
+                        .get("bonus")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| existing.as_ref().map(|p| p.bonus.clone()))
+                        .unwrap_or_default(),
+                    notes: args
+                        .get("notes")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| existing.as_ref().map(|p| p.notes.clone()))
+                        .unwrap_or_default(),
+                };
+                if let Some(ex) = profile
+                    .proficiencies
+                    .iter_mut()
+                    .find(|p| p.id == id || p.name.eq_ignore_ascii_case(&name))
+                {
+                    *ex = prof.clone();
+                } else {
+                    profile.proficiencies.push(prof.clone());
+                }
+                (
+                    format!(
+                        "Saved proficiency '{}' [{} • {}] on {}",
+                        prof.name, prof.category, prof.rank, proj.baseline.name
+                    ),
+                    vec!["proficiencies".to_string()],
+                    serde_json::json!({ "proficiency": prof, "proficiencies": profile.proficiencies }),
+                )
+            }
+
+            "adjust_proficiency_xp" => {
+                let target = args
+                    .get("id")
+                    .or_else(|| args.get("name"))
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("adjust_proficiency_xp requires 'id' or 'name'"))?;
+                let slug = slugify(target);
+                let prof = profile
+                    .proficiencies
+                    .iter_mut()
+                    .find(|p| p.id == target || p.id == slug || p.name.eq_ignore_ascii_case(target))
+                    .ok_or_else(|| anyhow!("Proficiency '{target}' not found on '{cid}'"))?;
+                let old_xp = prof.xp;
+                let old_rank = prof.rank.clone();
+                let recalc = args
+                    .get("recalc_rank")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                if args.get("reset_xp").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    prof.xp = 0;
+                } else if let Some(v) = args.get("set_xp").and_then(|v| v.as_u64()) {
+                    prof.xp = v;
+                } else if let Some(d) = args
+                    .get("delta_xp")
+                    .or_else(|| args.get("xp"))
+                    .and_then(|v| v.as_i64())
+                {
+                    prof.xp = if d >= 0 {
+                        prof.xp.saturating_add(d as u64)
+                    } else {
+                        prof.xp.saturating_sub(d.unsigned_abs())
+                    };
+                }
+                if recalc {
+                    let (new_rank, next_xp, bonus) = match prof.xp {
+                        0..=24 => ("Untrained", 25, "+0"),
+                        25..=99 => ("Familiar", 100, "+1"),
+                        100..=249 => ("Proficient", 250, "+2"),
+                        250..=499 => ("Expertise", 500, "+4"),
+                        500..=999 => ("Master", 1000, "+6"),
+                        _ => ("Grandmaster", 1000, "+8"),
+                    };
+                    prof.rank = new_rank.to_string();
+                    prof.xp_to_next = next_xp;
+                    prof.bonus = bonus.to_string();
+                }
+                let out_p = prof.clone();
+                (
+                    format!(
+                        "{} Proficiency XP [{}]: {} ({}) -> {} ({})",
+                        proj.baseline.name, out_p.name, old_xp, old_rank, out_p.xp, out_p.rank
+                    ),
+                    vec!["proficiencies".to_string()],
+                    serde_json::json!({ "proficiency": out_p, "proficiencies": profile.proficiencies }),
+                )
+            }
+
+            "remove_proficiency" => {
+                let id = args
+                    .get("id")
+                    .or_else(|| args.get("name"))
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("remove_proficiency requires 'id' or 'name'"))?;
+                let slug = slugify(id);
+                let before = profile.proficiencies.len();
+                profile
+                    .proficiencies
+                    .retain(|p| p.id != id && p.id != slug && !p.name.eq_ignore_ascii_case(id));
+                if profile.proficiencies.len() == before {
+                    bail!("Proficiency '{id}' not found on '{cid}'");
+                }
+                (
+                    format!("Removed proficiency '{id}' from {}", proj.baseline.name),
+                    vec!["proficiencies".to_string()],
+                    serde_json::json!({ "removed": true, "proficiencies": profile.proficiencies }),
+                )
+            }
+
+            "upsert_trait" => {
+                let name = args
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| anyhow!("upsert_trait requires 'name'"))?
+                    .to_string();
+                let id = args
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .map(slugify)
+                    .unwrap_or_else(|| slugify(&name));
+                let existing = profile
+                    .traits_and_perks
+                    .iter()
+                    .find(|t| t.id == id || t.name.eq_ignore_ascii_case(&name))
+                    .cloned();
+                let tr = CharacterTrait {
+                    id: id.clone(),
+                    name: name.clone(),
+                    category: args
+                        .get("category")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| existing.as_ref().map(|t| t.category.clone()))
+                        .unwrap_or_else(|| "physique".to_string()),
+                    rank_or_grade: args
+                        .get("rank_or_grade")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| existing.as_ref().map(|t| t.rank_or_grade.clone()))
+                        .unwrap_or_default(),
+                    active: args
+                        .get("active")
+                        .and_then(|v| v.as_bool())
+                        .or_else(|| existing.as_ref().map(|t| t.active))
+                        .unwrap_or(true),
+                    effect: args
+                        .get("effect")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| existing.as_ref().map(|t| t.effect.clone()))
+                        .unwrap_or_default(),
+                    notes: args
+                        .get("notes")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| existing.as_ref().map(|t| t.notes.clone()))
+                        .unwrap_or_default(),
+                };
+                if let Some(ex) = profile
+                    .traits_and_perks
+                    .iter_mut()
+                    .find(|t| t.id == id || t.name.eq_ignore_ascii_case(&name))
+                {
+                    *ex = tr.clone();
+                } else {
+                    profile.traits_and_perks.push(tr.clone());
+                }
+                (
+                    format!(
+                        "Saved trait '{}' [{}] on {}",
+                        tr.name, tr.category, proj.baseline.name
+                    ),
+                    vec!["traits_and_perks".to_string()],
+                    serde_json::json!({ "trait": tr, "traits_and_perks": profile.traits_and_perks }),
+                )
+            }
+
+            "remove_trait" => {
+                let id = args
+                    .get("id")
+                    .or_else(|| args.get("name"))
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("remove_trait requires 'id' or 'name'"))?;
+                let slug = slugify(id);
+                let before = profile.traits_and_perks.len();
+                profile
+                    .traits_and_perks
+                    .retain(|t| t.id != id && t.id != slug && !t.name.eq_ignore_ascii_case(id));
+                if profile.traits_and_perks.len() == before {
+                    bail!("Trait '{id}' not found on '{cid}'");
+                }
+                (
+                    format!("Removed trait '{id}' from {}", proj.baseline.name),
+                    vec!["traits_and_perks".to_string()],
+                    serde_json::json!({ "removed": true, "traits_and_perks": profile.traits_and_perks }),
+                )
+            }
+
+            other => bail!(
+                "Unknown manage_player_character action '{other}'. Expected: get_sheet, update_avatar, upsert_marker, remove_marker, upsert_outfit, set_active_outfit, remove_outfit, upsert_title, toggle_title, remove_title, adjust_stat_xp, upsert_job, adjust_job_xp, remove_job, upsert_proficiency, adjust_proficiency_xp, remove_proficiency, upsert_trait, remove_trait."
+            ),
+        };
+
+        profile.updated_at_world_time = now;
+        self.db.upsert_character_profile(&profile)?;
+        let full_summary = if reason.is_empty() {
+            summary
+        } else {
+            format!("{summary} — {reason}")
+        };
+        let ev = self.db.append_event(
+            proj.current.current_location,
+            vec![cid.clone()],
+            full_summary.clone(),
+            EventPayload::CharacterProfileUpdated {
+                character_id: cid.clone(),
+                fields_updated,
+            },
+        )?;
+        if act == "update_avatar" {
+            let _ = self.sync_apparel_discomfort(&cid, 0);
+        }
+        self.maybe_compile()?;
+        let mut out = extra_payload;
+        if let Some(obj) = out.as_object_mut() {
+            obj.insert("event_seq".to_string(), serde_json::json!(ev.seq));
+            obj.insert("summary".to_string(), serde_json::json!(full_summary));
+            obj.insert("character_id".to_string(), serde_json::json!(cid));
+        }
+        Ok(out)
+    }
+
+    // -------------------------------------------------------------------------
+    // Living World: Prominent Figure Mobility, Business Travel & Networking
+    // -------------------------------------------------------------------------
+
+    fn all_world_routes_merged(
+        &self,
+        all_places: &std::collections::BTreeMap<String, PlaceProjection>,
+    ) -> Vec<TravelRoute> {
+        let mut routes = self.db.list_travel_routes().unwrap_or_default();
+        let existing_pairs: std::collections::BTreeSet<(String, String)> = routes
+            .iter()
+            .flat_map(|r| {
+                let mut pairs = vec![(r.from_place_id.clone(), r.to_place_id.clone())];
+                if r.bidirectional {
+                    pairs.push((r.to_place_id.clone(), r.from_place_id.clone()));
+                }
+                pairs
+            })
+            .collect();
+        for synth in synthesize_routes_from_places(all_places) {
+            if !existing_pairs.contains(&(synth.from_place_id.clone(), synth.to_place_id.clone())) {
+                routes.push(synth);
+            }
+        }
+        routes
+    }
+
+    fn npc_is_mobile_alive(proj: &CharacterProjection) -> bool {
+        if proj.baseline.kind.eq_ignore_ascii_case("pc") {
+            return false;
+        }
+        let st = proj.current.alive_status.to_lowercase();
+        !matches!(
+            st.as_str(),
+            "dead" | "deceased" | "incapacitated" | "imprisoned" | "missing" | "coma" | "unconscious"
+        )
+    }
+
+    fn infer_npc_mobility_mode(
+        proj: &CharacterProjection,
+        profile: &CharacterProfileExt,
+        faction_leaders: &std::collections::BTreeSet<String>,
+        auto_include_prominent: bool,
+    ) -> Option<(String, Vec<String>)> {
+        if !Self::npc_is_mobile_alive(proj) {
+            return None;
+        }
+        let mode_l = profile.mobility.mobility_mode.trim().to_lowercase();
+        if mode_l == "stationary" {
+            return None;
+        }
+        if mode_l != "auto" && !mode_l.is_empty() {
+            let purposes = if !profile.mobility.purposes.is_empty() {
+                profile.mobility.purposes.clone()
+            } else {
+                default_purposes_for_mode(&mode_l)
+            };
+            return Some((mode_l, purposes));
+        }
+
+        let explicit = profile.mobility.prominent
+            || profile.mobility.active_trip.is_some()
+            || !profile.mobility.preferred_destinations.is_empty();
+
+        if !explicit && !auto_include_prominent {
+            return None;
+        }
+
+        let hay = format!(
+            "{} {} {} {} {} {}",
+            proj.baseline.title,
+            proj.baseline.archetype,
+            proj.baseline.tags.join(" "),
+            profile.occupation,
+            profile.social_class,
+            proj.baseline.faction
+        )
+        .to_lowercase();
+
+        let inferred = if hay.contains("merchant")
+            || hay.contains("trader")
+            || hay.contains("guildmaster")
+            || hay.contains("factor")
+            || hay.contains("caravan")
+            || hay.contains("broker")
+            || hay.contains("quartermaster")
+            || hay.contains("smuggler")
+        {
+            "business_circuit"
+        } else if hay.contains("envoy")
+            || hay.contains("diplomat")
+            || hay.contains("ambassador")
+            || hay.contains("magistrate")
+            || hay.contains("prefect")
+            || hay.contains("lord")
+            || hay.contains("noble")
+            || hay.contains("councilor")
+            || hay.contains("archivist")
+            || hay.contains("scholar")
+            || hay.contains("emissary")
+        {
+            "networking_envoy"
+        } else if hay.contains("elder")
+            || hay.contains("sect master")
+            || hay.contains("abbot")
+            || hay.contains("commander")
+            || hay.contains("captain")
+            || hay.contains("inspector")
+            || hay.contains("warden")
+            || hay.contains("steward")
+            || hay.contains("marshal")
+            || faction_leaders.contains(&proj.baseline.id)
+        {
+            "inspector"
+        } else if hay.contains("wanderer")
+            || hay.contains("courier")
+            || hay.contains("messenger")
+            || hay.contains("scout")
+            || hay.contains("mercenary")
+            || hay.contains("peddler")
+            || hay.contains("bard")
+            || hay.contains("ronin")
+        {
+            "wanderer"
+        } else if explicit {
+            "business_circuit"
+        } else {
+            return None;
+        };
+
+        let purposes = if !profile.mobility.purposes.is_empty() {
+            profile.mobility.purposes.clone()
+        } else {
+            default_purposes_for_mode(inferred)
+        };
+        Some((inferred.to_string(), purposes))
+    }
+
+    pub fn configure_npc_mobility(
+        &self,
+        character_id: &str,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let cid = resolve_character_id(&self.db, character_id)?;
+        let proj = load_character_projection(&self.db, &cid, None)?;
+        let mut profile = self.get_character_profile(&cid)?;
+        let m = &mut profile.mobility;
+
+        if let Some(p) = args.get("prominent").and_then(|v| v.as_bool()) {
+            m.prominent = p;
+        }
+        if let Some(mode) = args.get("mobility_mode").and_then(|v| v.as_str()) {
+            m.mobility_mode = mode.trim().to_lowercase();
+            if m.mobility_mode != "stationary" && args.get("prominent").is_none() {
+                m.prominent = true;
+            }
+        }
+        if let Some(home) = args.get("home_place_id").and_then(|v| v.as_str()) {
+            let trimmed = home.trim();
+            m.home_place_id = if trimmed.is_empty() {
+                None
+            } else {
+                Some(resolve_place_id(&self.db, trimmed).unwrap_or_else(|_| slugify(trimmed)))
+            };
+        } else if m.home_place_id.is_none() {
+            m.home_place_id = proj
+                .current
+                .current_location
+                .clone()
+                .or_else(|| proj.baseline.initial_location.clone());
+        }
+        if let Some(arr) = args.get("preferred_destinations").and_then(|v| v.as_array()) {
+            m.preferred_destinations = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(str::trim).filter(|s| !s.is_empty()))
+                .map(|s| resolve_place_id(&self.db, s).unwrap_or_else(|_| slugify(s)))
+                .collect();
+        }
+        if let Some(arr) = args.get("purposes").and_then(|v| v.as_array()) {
+            m.purposes = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+        if let Some(d) = args.get("trip_cadence_days").and_then(|v| v.as_u64()) {
+            m.trip_cadence_days = (d as u32).max(1);
+        }
+        if let Some(d) = args.get("stay_duration_days").and_then(|v| v.as_u64()) {
+            m.stay_duration_days = (d as u32).max(1);
+        }
+        if let Some(sp) = args.get("travel_speed_mode").and_then(|v| v.as_str()) {
+            if !sp.trim().is_empty() {
+                m.travel_speed_mode = sp.trim().to_lowercase();
+            }
+        }
+        if let Some(arr) = args.get("entourage_ids").and_then(|v| v.as_array()) {
+            m.entourage_ids = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(str::trim).filter(|s| !s.is_empty()))
+                .map(|s| resolve_character_id(&self.db, s).unwrap_or_else(|_| slugify(s)))
+                .collect();
+        }
+        if let Some(st) = args.get("current_status").and_then(|v| v.as_str()) {
+            m.current_status = st.trim().to_lowercase();
+            if m.current_status == "at_home" {
+                m.active_trip = None;
+            }
+        }
+
+        let now = self.db.get_campaign_meta()?.clock.format_short();
+        profile.updated_at_world_time = now;
+        self.db.upsert_character_profile(&profile)?;
+        let summary = format!(
+            "Configured mobility for {} [prominent={}, mode={}, home={}, stops={}]",
+            proj.baseline.name,
+            profile.mobility.prominent,
+            profile.mobility.mobility_mode,
+            profile
+                .mobility
+                .home_place_id
+                .as_deref()
+                .unwrap_or("none"),
+            profile.mobility.preferred_destinations.len()
+        );
+        let ev = self.db.append_event(
+            proj.current.current_location,
+            vec![cid.clone()],
+            summary.clone(),
+            EventPayload::CharacterProfileUpdated {
+                character_id: cid.clone(),
+                fields_updated: vec!["mobility".to_string()],
+            },
+        )?;
+        self.maybe_compile()?;
+        Ok(serde_json::json!({
+            "event_seq": ev.seq,
+            "summary": summary,
+            "character_id": cid,
+            "mobility": profile.mobility
+        }))
+    }
+
+    pub fn dispatch_npc_trip(
+        &self,
+        character_id: &str,
+        destination_place_id: &str,
+        purpose: &str,
+        details: &str,
+        stay_duration_days: Option<u32>,
+        transport_mode: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let cid = resolve_character_id(&self.db, character_id)?;
+        let dest = resolve_place_id(&self.db, destination_place_id)?;
+        let proj = load_character_projection(&self.db, &cid, None)?;
+        if !Self::npc_is_mobile_alive(&proj) {
+            bail!(
+                "Character '{}' ({}, {}) cannot be dispatched on an autonomous NPC trip",
+                proj.baseline.name,
+                proj.baseline.kind,
+                proj.current.alive_status
+            );
+        }
+        let origin = proj
+            .current
+            .current_location
+            .clone()
+            .or_else(|| proj.baseline.initial_location.clone())
+            .ok_or_else(|| anyhow!("Character '{}' has no current location to depart from", cid))?;
+        if origin == dest {
+            bail!("'{}' is already at '{}'", proj.baseline.name, dest);
+        }
+
+        let meta = self.db.get_campaign_meta()?;
+        let all_places = load_all_place_projections(&self.db, None)?;
+        let routes = self.all_world_routes_merged(&all_places);
+        let mut profile = self.get_character_profile(&cid)?;
+        let mode = transport_mode
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_lowercase())
+            .unwrap_or_else(|| profile.mobility.travel_speed_mode.clone());
+
+        let (legs, _km, hours_f) = compute_shortest_route(
+            &routes,
+            &origin,
+            &dest,
+            &mode,
+            &meta.clock.season,
+            &meta.clock.global_weather,
+            1.0,
+            false,
+        )
+        .ok_or_else(|| {
+            anyhow!(
+                "No open travel route exists from '{origin}' to '{dest}' (all connecting routes may be blocked/destroyed)"
+            )
+        })?;
+
+        let mut detour_note = String::new();
+        let direct_closed = routes.iter().any(|r| {
+            ((r.from_place_id == origin && r.to_place_id == dest)
+                || (r.bidirectional && r.from_place_id == dest && r.to_place_id == origin))
+                && (r.status.eq_ignore_ascii_case("blocked")
+                    || r.status.eq_ignore_ascii_case("destroyed"))
+        });
+        if direct_closed {
+            detour_note = format!("Detoured around closed direct road {origin} -> {dest}");
+        }
+
+        let travel_hours = (hours_f.ceil() as u64).max(2);
+        let now_h = meta.clock.total_hours();
+        let eta_h = now_h + (travel_hours as i64);
+        let eta_clock = meta.clock.clock_after_hours(travel_hours);
+        let stay_days = stay_duration_days.unwrap_or(profile.mobility.stay_duration_days.max(1));
+        let ret_h = eta_h + (stay_days as i64) * 24;
+        let ret_clock = eta_clock.clock_after_hours((stay_days as u64) * 24);
+        let waypoints: Vec<String> = legs.iter().map(|l| l.to_place_id.clone()).collect();
+        let clean_purpose = if purpose.trim().is_empty() {
+            "business".to_string()
+        } else {
+            purpose.trim().to_string()
+        };
+
+        let trip = NpcTripState {
+            origin_place_id: origin.clone(),
+            destination_place_id: dest.clone(),
+            route_waypoints: waypoints,
+            purpose: clean_purpose.clone(),
+            details: details.trim().to_string(),
+            departed_at_world_time: meta.clock.format_short(),
+            departed_total_hours: now_h,
+            eta_world_time: eta_clock.format_short(),
+            eta_total_hours: eta_h,
+            return_after_total_hours: ret_h,
+            return_after_world_time: ret_clock.format_short(),
+            transport_mode: mode.clone(),
+            detour_note: detour_note.clone(),
+        };
+
+        if profile.mobility.home_place_id.is_none() {
+            profile.mobility.home_place_id = Some(origin.clone());
+        }
+        profile.mobility.prominent = true;
+        profile.mobility.current_status = "in_transit".to_string();
+        profile.mobility.active_trip = Some(trip.clone());
+        profile.updated_at_world_time = meta.clock.format_short();
+        self.db.upsert_character_profile(&profile)?;
+
+        let summary = format!(
+            "{} departed {} for {} ({}, ~{}h by {}, ETA {}){}{}",
+            proj.baseline.name,
+            origin,
+            dest,
+            clean_purpose,
+            travel_hours,
+            mode,
+            trip.eta_world_time,
+            if details.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", details.trim())
+            },
+            if detour_note.is_empty() {
+                String::new()
+            } else {
+                format!(" [{detour_note}]")
+            }
+        );
+        let ev = self.db.append_event(
+            Some(origin.clone()),
+            vec![cid.clone(), origin, dest],
+            summary.clone(),
+            EventPayload::NarrativeEvent {
+                title: format!("Departure: {} ({})", proj.baseline.name, clean_purpose),
+                details: summary.clone(),
+                tags: vec!["npc_movement".into(), clean_purpose],
+            },
+        )?;
+        self.maybe_compile()?;
+        Ok(serde_json::json!({
+            "event_seq": ev.seq,
+            "summary": summary,
+            "character_id": cid,
+            "trip": trip
+        }))
+    }
+
+    fn resolve_npc_arrival(
+        &self,
+        cid: &str,
+        proj_name: &str,
+        profile: &mut CharacterProfileExt,
+        now_h: i64,
+        now_str: &str,
+        all_chars: &std::collections::BTreeMap<String, CharacterProjection>,
+        all_places: &std::collections::BTreeMap<String, PlaceProjection>,
+    ) -> Result<serde_json::Value> {
+        let trip = profile
+            .mobility
+            .active_trip
+            .clone()
+            .ok_or_else(|| anyhow!("No active trip to resolve on '{cid}'"))?;
+        let dest = trip.destination_place_id.clone();
+        let dest_name = all_places
+            .get(&dest)
+            .map(|p| p.baseline.name.clone())
+            .unwrap_or_else(|| dest.clone());
+
+        // Move traveler + entourage into destination
+        let move_reason = format!(
+            "Arrived for {}{}",
+            trip.purpose,
+            if trip.details.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", trip.details)
+            }
+        );
+        let _ = self.move_character(cid, &dest, &move_reason);
+        for eid in &profile.mobility.entourage_ids {
+            if all_chars
+                .get(eid)
+                .map(Self::npc_is_mobile_alive)
+                .unwrap_or(false)
+            {
+                let _ = self.move_character(eid, &dest, &format!("Accompanying {proj_name}"));
+            }
+        }
+
+        let mut engagement_opt = None;
+        let mut rumor_shared: Option<String> = None;
+
+        if trip.purpose.eq_ignore_ascii_case("return_home") {
+            profile.mobility.current_status = "at_home".to_string();
+            profile.mobility.active_trip = None;
+            profile.mobility.last_trip_ended_total_hours = Some(now_h);
+        } else {
+            profile.mobility.current_status = "visiting".to_string();
+            // Find counterparts present at destination for organic business / networking engagement
+            let counterparts: Vec<(&String, &CharacterProjection)> = all_chars
+                .iter()
+                .filter(|(other_id, other_p)| {
+                    other_id.as_str() != cid
+                        && !profile.mobility.entourage_ids.contains(*other_id)
+                        && Self::npc_is_mobile_alive(other_p)
+                        && other_p.current.current_location.as_deref() == Some(dest.as_str())
+                })
+                .take(2)
+                .collect();
+
+            let cp_ids: Vec<String> = counterparts.iter().map(|(id, _)| (*id).clone()).collect();
+            let cp_names: Vec<String> = counterparts
+                .iter()
+                .map(|(_, p)| p.baseline.name.clone())
+                .collect();
+
+            let eng_summary = if !cp_names.is_empty() {
+                format!(
+                    "{proj_name} arrived in {dest_name} for {} and networked with {}",
+                    trip.purpose,
+                    cp_names.join(" & ")
+                )
+            } else {
+                format!(
+                    "{proj_name} arrived in {dest_name} to conduct {} business",
+                    trip.purpose
+                )
+            };
+
+            let eng = NpcEngagement {
+                world_time: now_str.to_string(),
+                place_id: dest.clone(),
+                purpose: trip.purpose.clone(),
+                counterparts: cp_ids.clone(),
+                summary: eng_summary.clone(),
+                visibility: "public".to_string(),
+            };
+            profile.mobility.recent_engagements.push(eng.clone());
+            if profile.mobility.recent_engagements.len() > 10 {
+                let drop_n = profile.mobility.recent_engagements.len() - 10;
+                profile.mobility.recent_engagements.drain(0..drop_n);
+            }
+
+            // Record mirrored engagement on counterparts + organic rumor propagation (1 public claim max)
+            let traveler_beliefs = self.db.list_beliefs_for_actor(cid).unwrap_or_default();
+            let all_claims = self.db.list_knowledge_claims().unwrap_or_default();
+            for cp_id in &cp_ids {
+                if let Ok(mut cp_prof) = self.get_character_profile(cp_id) {
+                    cp_prof.mobility.recent_engagements.push(NpcEngagement {
+                        world_time: now_str.to_string(),
+                        place_id: dest.clone(),
+                        purpose: trip.purpose.clone(),
+                        counterparts: vec![cid.to_string()],
+                        summary: eng_summary.clone(),
+                        visibility: "public".to_string(),
+                    });
+                    if cp_prof.mobility.recent_engagements.len() > 10 {
+                        let drop_n = cp_prof.mobility.recent_engagements.len() - 10;
+                        cp_prof.mobility.recent_engagements.drain(0..drop_n);
+                    }
+                    cp_prof.updated_at_world_time = now_str.to_string();
+                    let _ = self.db.upsert_character_profile(&cp_prof);
+                }
+
+                // Propagate up to 1 non-concealed public claim the traveler knows that the counterpart doesn't
+                if rumor_shared.is_none() && !traveler_beliefs.is_empty() {
+                    let cp_known: std::collections::BTreeSet<String> = self
+                        .db
+                        .list_beliefs_for_actor(cp_id)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|b| b.claim_id)
+                        .collect();
+                    for tb in &traveler_beliefs {
+                        if tb.concealing || tb.confidence < 55 || cp_known.contains(&tb.claim_id) {
+                            continue;
+                        }
+                        if let Some(cl) = all_claims.iter().find(|c| {
+                            c.id == tb.claim_id
+                                && c.superseded_by_id.is_none()
+                                && c.visibility != "gm_secret"
+                        }) {
+                            let propagated = ActorBelief {
+                                claim_id: cl.id.clone(),
+                                actor_id: cp_id.clone(),
+                                perceived_claim: if tb.perceived_claim.is_empty() {
+                                    cl.claim.clone()
+                                } else {
+                                    tb.perceived_claim.clone()
+                                },
+                                stance: "believes".to_string(),
+                                confidence: tb.confidence.saturating_sub(10).max(40),
+                                source: format!("networked_with:{cid}"),
+                                source_trustworthy: Some(true),
+                                concealing: false,
+                                outdated: tb.outdated,
+                                learned_at_world_time: now_str.to_string(),
+                                notes: format!("Exchanged during {} in {dest_name}", trip.purpose),
+                            };
+                            if self.db.upsert_actor_belief(&propagated).is_ok() {
+                                rumor_shared = Some(format!(
+                                    "{proj_name} shared '{}' with {cp_id} in {dest_name}",
+                                    cl.subject
+                                ));
                             }
                             break;
                         }
                     }
                 }
-                if prepare_dossiers {
-                    if let Ok(d) = self.prepare_autonomy_dossier(
-                        "faction",
-                        Some(&fac.id),
-                        &[],
-                        duration_hours,
-                        fac.territory.first().map(|s| s.as_str()),
+            }
+
+            let mut involved = vec![cid.to_string(), dest.clone()];
+            involved.extend(cp_ids.iter().cloned());
+            let _ = self.db.append_event(
+                Some(dest.clone()),
+                involved,
+                eng_summary.clone(),
+                EventPayload::NarrativeEvent {
+                    title: format!("Arrival & Networking: {proj_name} in {dest_name}"),
+                    details: eng_summary,
+                    tags: vec!["npc_movement".into(), trip.purpose.clone()],
+                },
+            );
+            engagement_opt = Some(eng);
+        }
+
+        profile.updated_at_world_time = now_str.to_string();
+        self.db.upsert_character_profile(profile)?;
+
+        Ok(serde_json::json!({
+            "event": if trip.purpose == "return_home" { "returned_home" } else { "arrived" },
+            "character_id": cid,
+            "name": proj_name,
+            "destination": dest,
+            "purpose": trip.purpose,
+            "engagement": engagement_opt,
+            "rumor_shared": rumor_shared
+        }))
+    }
+
+    /// Simulates prominent NPC business travel, diplomatic/networking circuits, arrivals, departures,
+    /// route-disruption detours/stranding, and organic rumor propagation across elapsed in-world hours.
+    pub fn tick_npc_movements(
+        &self,
+        elapsed_hours: u64,
+        scope_character_ids: &[String],
+        auto_include_prominent: bool,
+        seed: u64,
+    ) -> Result<serde_json::Value> {
+        let meta = self.db.get_campaign_meta()?;
+        let now_h = meta.clock.total_hours();
+        let now_str = meta.clock.format_short();
+        let all_places = load_all_place_projections(&self.db, None)?;
+        if all_places.len() < 2 {
+            return Ok(serde_json::json!({
+                "events_count": 0,
+                "events": [],
+                "note": "Need at least 2 connected places for NPC travel."
+            }));
+        }
+        let routes = self.all_world_routes_merged(&all_places);
+        if routes.is_empty() {
+            return Ok(serde_json::json!({
+                "events_count": 0,
+                "events": [],
+                "note": "No travel routes defined between places yet."
+            }));
+        }
+
+        let all_chars = load_all_character_projections(&self.db, None)?;
+        let mut faction_leaders = std::collections::BTreeSet::new();
+        for fac in self.db.list_factions().unwrap_or_default() {
+            for m in &fac.members {
+                let rl = m.rank.to_lowercase();
+                if rl.contains("leader")
+                    || rl.contains("elder")
+                    || rl.contains("master")
+                    || rl.contains("captain")
+                    || rl.contains("envoy")
+                    || rl.contains("steward")
+                    || rl.contains("chief")
+                {
+                    faction_leaders.insert(m.character_id.clone());
+                }
+            }
+        }
+
+        let scope_set: std::collections::BTreeSet<String> = scope_character_ids
+            .iter()
+            .map(|s| resolve_character_id(&self.db, s).unwrap_or_else(|_| slugify(s)))
+            .collect();
+
+        // Collect all eligible prominent / active-trip NPCs
+        let mut candidates: Vec<(String, String, Vec<String>)> = Vec::new();
+        for (cid, proj) in &all_chars {
+            if !scope_set.is_empty() && !scope_set.contains(cid) {
+                // Even when scoped, always finish arrivals for NPCs already in transit or visiting!
+                let prof = self.get_character_profile(cid)?;
+                if prof.mobility.active_trip.is_none() && !prof.mobility.prominent {
+                    continue;
+                }
+            }
+            let prof = self.get_character_profile(cid)?;
+            if let Some((mode, purposes)) =
+                Self::infer_npc_mobility_mode(proj, &prof, &faction_leaders, auto_include_prominent)
+            {
+                candidates.push((cid.clone(), mode, purposes));
+            }
+        }
+
+        let mut events_out: Vec<serde_json::Value> = Vec::new();
+
+        for (idx, (cid, effective_mode, purposes)) in candidates.iter().enumerate() {
+            let proj = match all_chars.get(cid) {
+                Some(p) => p,
+                None => continue,
+            };
+            let mut profile = self.get_character_profile(cid)?;
+            if profile.mobility.home_place_id.is_none() {
+                profile.mobility.home_place_id = proj
+                    .current
+                    .current_location
+                    .clone()
+                    .or_else(|| proj.baseline.initial_location.clone());
+            }
+            let home_id = match profile.mobility.home_place_id.clone() {
+                Some(h) => h,
+                None => continue,
+            };
+
+            // PHASE A: Complete in-transit trips whose ETA has arrived
+            if profile.mobility.current_status == "in_transit" {
+                if let Some(ref tr) = profile.mobility.active_trip {
+                    if tr.eta_total_hours <= now_h {
+                        if let Ok(ev_json) = self.resolve_npc_arrival(
+                            cid,
+                            &proj.baseline.name,
+                            &mut profile,
+                            now_h,
+                            &now_str,
+                            &all_chars,
+                            &all_places,
+                        ) {
+                            events_out.push(ev_json);
+                        }
+                    }
+                }
+            }
+
+            // PHASE B: End visits whose stay duration has elapsed -> depart to next stop or home
+            if profile.mobility.current_status == "visiting" {
+                let due_to_leave = profile
+                    .mobility
+                    .active_trip
+                    .as_ref()
+                    .map(|t| t.return_after_total_hours <= now_h)
+                    .unwrap_or(true);
+                if due_to_leave {
+                    let cur_loc = profile
+                        .mobility
+                        .active_trip
+                        .as_ref()
+                        .map(|t| t.destination_place_id.clone())
+                        .or_else(|| proj.current.current_location.clone())
+                        .unwrap_or_else(|| home_id.clone());
+
+                    // Decide next leg: next stop in business_circuit (if any unvisited) or return_home
+                    let mut next_dest = home_id.clone();
+                    let mut next_purpose = "return_home".to_string();
+                    let mut next_details = format!("Returning to {home_id}");
+
+                    if effective_mode == "business_circuit"
+                        && profile.mobility.preferred_destinations.len() >= 2
+                        && cur_loc != home_id
+                    {
+                        let next_idx = profile.mobility.circuit_cursor + 1;
+                        if next_idx < profile.mobility.preferred_destinations.len() {
+                            let cand = profile.mobility.preferred_destinations[next_idx].clone();
+                            if cand != cur_loc {
+                                profile.mobility.circuit_cursor = next_idx;
+                                next_dest = cand;
+                                next_purpose = purposes
+                                    .get(next_idx % purposes.len().max(1))
+                                    .cloned()
+                                    .unwrap_or_else(|| "business".to_string());
+                                next_details = "Continuing business circuit".to_string();
+                            }
+                        } else {
+                            profile.mobility.circuit_cursor = 0;
+                        }
+                    }
+
+                    if cur_loc == next_dest {
+                        profile.mobility.current_status = "at_home".to_string();
+                        profile.mobility.active_trip = None;
+                        profile.mobility.last_trip_ended_total_hours = Some(now_h);
+                        profile.updated_at_world_time = now_str.clone();
+                        self.db.upsert_character_profile(&profile)?;
+                    } else if let Some((legs, _km, hours_f)) = compute_shortest_route(
+                        &routes,
+                        &cur_loc,
+                        &next_dest,
+                        &profile.mobility.travel_speed_mode,
+                        &meta.clock.season,
+                        &meta.clock.global_weather,
+                        1.0,
+                        false,
                     ) {
-                        dossiers.push(d);
+                        let travel_h = (hours_f.ceil() as u64).max(2);
+                        let dep_h = profile
+                            .mobility
+                            .active_trip
+                            .as_ref()
+                            .map(|t| t.return_after_total_hours.min(now_h))
+                            .unwrap_or(now_h);
+                        let eta_h = dep_h + (travel_h as i64);
+                        let stay_d = profile.mobility.stay_duration_days.max(1);
+                        let eta_delta = (eta_h - now_h).max(0) as u64;
+                        let eta_clock = meta.clock.clock_after_hours(eta_delta);
+                        let ret_clock = eta_clock.clock_after_hours((stay_d as u64) * 24);
+                        let trip = NpcTripState {
+                            origin_place_id: cur_loc.clone(),
+                            destination_place_id: next_dest.clone(),
+                            route_waypoints: legs.iter().map(|l| l.to_place_id.clone()).collect(),
+                            purpose: next_purpose.clone(),
+                            details: next_details,
+                            departed_at_world_time: now_str.clone(),
+                            departed_total_hours: dep_h,
+                            eta_world_time: eta_clock.format_short(),
+                            eta_total_hours: eta_h,
+                            return_after_total_hours: eta_h + (stay_d as i64) * 24,
+                            return_after_world_time: ret_clock.format_short(),
+                            transport_mode: profile.mobility.travel_speed_mode.clone(),
+                            detour_note: String::new(),
+                        };
+                        profile.mobility.current_status = "in_transit".to_string();
+                        profile.mobility.active_trip = Some(trip);
+                        profile.updated_at_world_time = now_str.clone();
+                        self.db.upsert_character_profile(&profile)?;
+
+                        if eta_h <= now_h {
+                            if let Ok(ev_json) = self.resolve_npc_arrival(
+                                cid,
+                                &proj.baseline.name,
+                                &mut profile,
+                                now_h,
+                                &now_str,
+                                &all_chars,
+                                &all_places,
+                            ) {
+                                events_out.push(ev_json);
+                            }
+                        } else {
+                            events_out.push(serde_json::json!({
+                                "event": "departed",
+                                "character_id": cid,
+                                "name": proj.baseline.name,
+                                "from": cur_loc,
+                                "to": next_dest,
+                                "purpose": next_purpose,
+                                "eta": eta_clock.format_short()
+                            }));
+                        }
+                    } else {
+                        // All routes back home are blocked/destroyed -> figure is stranded!
+                        profile.mobility.current_status = "stranded".to_string();
+                        if let Some(ref mut tr) = profile.mobility.active_trip {
+                            tr.detour_note = format!(
+                                "Stranded in {cur_loc}: no open route to {next_dest} (roads blocked/destroyed)"
+                            );
+                        }
+                        profile.updated_at_world_time = now_str.clone();
+                        self.db.upsert_character_profile(&profile)?;
+                        let note = format!(
+                            "{} is stranded in {cur_loc} — route to {next_dest} is severed",
+                            proj.baseline.name
+                        );
+                        let _ = self.db.append_event(
+                            Some(cur_loc.clone()),
+                            vec![cid.clone(), cur_loc.clone(), next_dest.clone()],
+                            note.clone(),
+                            EventPayload::NarrativeEvent {
+                                title: format!("Traveler Stranded: {}", proj.baseline.name),
+                                details: note.clone(),
+                                tags: vec!["npc_movement".into(), "stranded".into()],
+                            },
+                        );
+                        events_out.push(serde_json::json!({
+                            "event": "stranded",
+                            "character_id": cid,
+                            "name": proj.baseline.name,
+                            "at": cur_loc,
+                            "intended_destination": next_dest,
+                            "note": note
+                        }));
+                    }
+                }
+            }
+
+            // PHASE C: Prominent figures at home whose cadence window has elapsed embark on business/networking travel
+            if profile.mobility.current_status == "at_home" || profile.mobility.current_status == "stranded" {
+                let cadence_h = (profile.mobility.trip_cadence_days.max(1) as i64) * 24;
+                // Deterministic stagger so prominent NPCs spread out naturally instead of all leaving the same hour
+                let h_mix = seed
+                    .wrapping_add((idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+                    .wrapping_add(cid.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64)));
+                let should_depart = match profile.mobility.last_trip_ended_total_hours {
+                    Some(last_h) => (now_h - last_h) >= cadence_h,
+                    None => {
+                        // First-ever trip: departs if elapsed_hours >= stagger window (at most cadence_h)
+                        let stagger = (h_mix % (cadence_h.max(24) as u64)).min(48) as i64;
+                        (elapsed_hours as i64) >= stagger || profile.mobility.prominent
+                    }
+                };
+
+                if should_depart {
+                    let origin = proj
+                        .current
+                        .current_location
+                        .clone()
+                        .unwrap_or_else(|| home_id.clone());
+
+                    // Build ranked destination candidates
+                    let mut dest_pool: Vec<String> = Vec::new();
+                    if !profile.mobility.preferred_destinations.is_empty() {
+                        let cur_i = profile.mobility.circuit_cursor % profile.mobility.preferred_destinations.len();
+                        for offset in 0..profile.mobility.preferred_destinations.len() {
+                            let p = &profile.mobility.preferred_destinations[(cur_i + offset) % profile.mobility.preferred_destinations.len()];
+                            if p != &origin && !dest_pool.contains(p) {
+                                dest_pool.push(p.clone());
+                            }
+                        }
+                    } else {
+                        // For networking_envoy: prioritize places currently hosting other alive NPCs!
+                        if effective_mode == "networking_envoy" {
+                            for (oid, op) in &all_chars {
+                                if oid != cid && Self::npc_is_mobile_alive(op) {
+                                    if let Some(ref oloc) = op.current.current_location {
+                                        if oloc != &origin && !dest_pool.contains(oloc) {
+                                            dest_pool.push(oloc.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Add all other places in the world (filtered by real Dijkstra reachability below!)
+                        for pid in all_places.keys() {
+                            if pid != &origin && !dest_pool.contains(pid) {
+                                dest_pool.push(pid.clone());
+                            }
+                        }
+                    }
+
+                    // Filter to reachable destinations via Dijkstra
+                    let mut reachable: Vec<(String, Vec<String>, u64, String)> = Vec::new();
+                    for cand in &dest_pool {
+                        if let Some((legs, _km, hours_f)) = compute_shortest_route(
+                            &routes,
+                            &origin,
+                            cand,
+                            &profile.mobility.travel_speed_mode,
+                            &meta.clock.season,
+                            &meta.clock.global_weather,
+                            1.0,
+                            false,
+                        ) {
+                            let direct_closed = routes.iter().any(|r| {
+                                ((r.from_place_id == origin && r.to_place_id == *cand)
+                                    || (r.bidirectional && r.from_place_id == *cand && r.to_place_id == origin))
+                                    && (r.status.eq_ignore_ascii_case("blocked")
+                                        || r.status.eq_ignore_ascii_case("destroyed"))
+                            });
+                            let detour = if direct_closed {
+                                format!("Detoured around closed road {origin} -> {cand}")
+                            } else {
+                                String::new()
+                            };
+                            reachable.push((
+                                cand.clone(),
+                                legs.iter().map(|l| l.to_place_id.clone()).collect(),
+                                (hours_f.ceil() as u64).max(2),
+                                detour,
+                            ));
+                        }
+                    }
+
+                    if !reachable.is_empty() {
+                        let pick_idx = if !profile.mobility.preferred_destinations.is_empty()
+                            || effective_mode == "networking_envoy"
+                        {
+                            0
+                        } else {
+                            (h_mix as usize) % reachable.len()
+                        };
+                        let (dest, waypoints, travel_h, detour_note) = reachable.remove(pick_idx);
+                        let purpose = purposes
+                            .get((h_mix as usize) % purposes.len().max(1))
+                            .cloned()
+                            .unwrap_or_else(|| "business".to_string());
+                        let stay_d = profile.mobility.stay_duration_days.max(1);
+                        // Depart partway through the elapsed window if elapsed_hours > travel_h so arrivals feel natural
+                        let dep_offset = if elapsed_hours > travel_h {
+                            (elapsed_hours - travel_h).min(elapsed_hours / 2)
+                        } else {
+                            0
+                        };
+                        let dep_h = now_h - (elapsed_hours.saturating_sub(dep_offset) as i64);
+                        let eta_h = dep_h + (travel_h as i64);
+                        let eta_clock = if eta_h > now_h {
+                            meta.clock.clock_after_hours((eta_h - now_h) as u64)
+                        } else {
+                            meta.clock.clone()
+                        };
+                        let ret_h = eta_h + (stay_d as i64) * 24;
+                        let ret_clock = eta_clock.clock_after_hours((stay_d as u64) * 24);
+                        let details = format!("Scheduled {effective_mode} trip ({purpose})");
+
+                        let trip = NpcTripState {
+                            origin_place_id: origin.clone(),
+                            destination_place_id: dest.clone(),
+                            route_waypoints: waypoints,
+                            purpose: purpose.clone(),
+                            details: details.clone(),
+                            departed_at_world_time: now_str.clone(),
+                            departed_total_hours: dep_h,
+                            eta_world_time: eta_clock.format_short(),
+                            eta_total_hours: eta_h,
+                            return_after_total_hours: ret_h,
+                            return_after_world_time: ret_clock.format_short(),
+                            transport_mode: profile.mobility.travel_speed_mode.clone(),
+                            detour_note: detour_note.clone(),
+                        };
+
+                        profile.mobility.prominent = true;
+                        profile.mobility.current_status = "in_transit".to_string();
+                        profile.mobility.active_trip = Some(trip);
+                        profile.updated_at_world_time = now_str.clone();
+                        self.db.upsert_character_profile(&profile)?;
+
+                        let dep_summary = format!(
+                            "{} departed {} for {} ({}, ~{}h by {}){}",
+                            proj.baseline.name,
+                            origin,
+                            dest,
+                            purpose,
+                            travel_h,
+                            profile.mobility.travel_speed_mode,
+                            if detour_note.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" [{detour_note}]")
+                            }
+                        );
+                        let _ = self.db.append_event(
+                            Some(origin.clone()),
+                            vec![cid.clone(), origin.clone(), dest.clone()],
+                            dep_summary.clone(),
+                            EventPayload::NarrativeEvent {
+                                title: format!("Business/Networking Departure: {}", proj.baseline.name),
+                                details: dep_summary,
+                                tags: vec!["npc_movement".into(), purpose.clone()],
+                            },
+                        );
+
+                        if eta_h <= now_h {
+                            if let Ok(ev_json) = self.resolve_npc_arrival(
+                                cid,
+                                &proj.baseline.name,
+                                &mut profile,
+                                now_h,
+                                &now_str,
+                                &all_chars,
+                                &all_places,
+                            ) {
+                                events_out.push(ev_json);
+                            }
+                        } else {
+                            events_out.push(serde_json::json!({
+                                "event": "departed",
+                                "character_id": cid,
+                                "name": proj.baseline.name,
+                                "from": origin,
+                                "to": dest,
+                                "purpose": purpose,
+                                "eta": eta_clock.format_short(),
+                                "detour_note": detour_note
+                            }));
+                        }
                     }
                 }
             }
         }
 
+        if !events_out.is_empty() {
+            self.maybe_compile()?;
+        }
+        Ok(serde_json::json!({
+            "world_time": now_str,
+            "elapsed_hours": elapsed_hours,
+            "events_count": events_out.len(),
+            "events": events_out
+        }))
+    }
+
+    pub fn list_npc_movements(&self) -> Result<serde_json::Value> {
+        let meta = self.db.get_campaign_meta()?;
+        let all_chars = load_all_character_projections(&self.db, None)?;
+        let all_places = load_all_place_projections(&self.db, None)?;
+        let mut faction_leaders = std::collections::BTreeSet::new();
+        for fac in self.db.list_factions().unwrap_or_default() {
+            for m in &fac.members {
+                let rl = m.rank.to_lowercase();
+                if rl.contains("leader")
+                    || rl.contains("elder")
+                    || rl.contains("master")
+                    || rl.contains("captain")
+                    || rl.contains("envoy")
+                    || rl.contains("steward")
+                {
+                    faction_leaders.insert(m.character_id.clone());
+                }
+            }
+        }
+
+        let mut figures = Vec::new();
+        let mut recent_engagements = Vec::new();
+        for (cid, proj) in &all_chars {
+            if proj.baseline.kind.eq_ignore_ascii_case("pc") {
+                continue;
+            }
+            let prof = self.get_character_profile(cid)?;
+            let inferred = Self::infer_npc_mobility_mode(proj, &prof, &faction_leaders, true);
+            let is_prominent = prof.mobility.prominent || inferred.is_some();
+            let effective_mode = inferred
+                .as_ref()
+                .map(|(m, _)| m.clone())
+                .unwrap_or_else(|| prof.mobility.mobility_mode.clone());
+            for eng in &prof.mobility.recent_engagements {
+                recent_engagements.push(serde_json::json!({
+                    "character_id": cid,
+                    "name": proj.baseline.name,
+                    "world_time": eng.world_time,
+                    "place_id": eng.place_id,
+                    "purpose": eng.purpose,
+                    "counterparts": eng.counterparts,
+                    "summary": eng.summary
+                }));
+            }
+            figures.push(serde_json::json!({
+                "character_id": cid,
+                "name": proj.baseline.name,
+                "title": proj.baseline.title,
+                "archetype": proj.baseline.archetype,
+                "faction": proj.baseline.faction,
+                "alive_status": proj.current.alive_status,
+                "current_location": proj.current.current_location,
+                "prominent": is_prominent,
+                "effective_mode": effective_mode,
+                "mobility": prof.mobility
+            }));
+        }
+
+        let places: Vec<serde_json::Value> = all_places
+            .values()
+            .map(|p| serde_json::json!({ "id": p.baseline.id, "name": p.baseline.name, "place_type": p.baseline.place_type }))
+            .collect();
+
+        Ok(serde_json::json!({
+            "world_time": meta.clock.format_short(),
+            "total_hours": meta.clock.total_hours(),
+            "figures": figures,
+            "recent_engagements": recent_engagements,
+            "places": places
+        }))
+    }
+
+    // -------------------------------------------------------------------------
+    // Sparse Multi-Scale 2D (x, y) Map Grids & Coordinate Atlas
+    // -------------------------------------------------------------------------
+
+    pub fn upsert_map_grid(&self, mut grid: MapGrid) -> Result<(MapGrid, WorldEvent)> {
+        if grid.name.trim().is_empty() {
+            bail!("Map grid `name` cannot be empty");
+        }
+        grid.id = if grid.id.trim().is_empty() {
+            slugify(&grid.name)
+        } else {
+            slugify(&grid.id)
+        };
+        grid.width = grid.width.clamp(4, 100);
+        grid.height = grid.height.clamp(4, 100);
+        if grid.cell_scale_label.trim().is_empty() {
+            grid.cell_scale_label = "5 km".to_string();
+        }
+        if grid.default_terrain.trim().is_empty() {
+            grid.default_terrain = "wilderness".to_string();
+        }
+        if let Some(ref p) = grid.parent_place_id {
+            let t = p.trim();
+            grid.parent_place_id = if t.is_empty() {
+                None
+            } else {
+                Some(resolve_place_id(&self.db, t).unwrap_or_else(|_| slugify(t)))
+            };
+        }
+        grid.updated_at_world_time = self.db.get_campaign_meta()?.clock.format_short();
+        self.db.upsert_map_grid(&grid)?;
         let summary = format!(
-            "World advanced {duration_hours}h -> {} (season_changed={season_changed}, weather={}, recoveries={}, markets={}, upkeep={})",
-            new_clock.format_short(),
-            weather_updates.len(),
-            recovery_updates.len(),
-            market_reports.len(),
-            upkeep_applied.len()
+            "Saved 2D map grid '{}' (`{}`) [{} • {}x{}, 1 cell = {}]",
+            grid.name, grid.id, grid.scale_kind, grid.width, grid.height, grid.cell_scale_label
         );
-        let master_ev = self.db.append_event_causal(
-            place_ids.first().map(|s| slugify(s)),
-            place_ids
-                .iter()
-                .chain(faction_ids.iter())
-                .chain(character_ids.iter())
-                .map(|s| slugify(s))
-                .collect(),
+        let ev = self.db.append_event(
+            grid.parent_place_id.clone(),
+            vec![grid.id.clone()],
             summary.clone(),
-            EventPayload::WorldAdvanced {
-                duration_hours,
-                scoped_places: place_ids.iter().map(|s| slugify(s)).collect(),
-                scoped_factions: faction_ids.iter().map(|s| slugify(s)).collect(),
-                scoped_characters: character_ids.iter().map(|s| slugify(s)).collect(),
-                summary,
+            EventPayload::NarrativeEvent {
+                title: format!("Map Grid Updated: {}", grid.name),
+                details: summary,
+                tags: vec!["map_grid".into(), grid.scale_kind.clone()],
             },
-            EventCausalMeta {
-                actor_id: None,
-                causal_event_ids: sub_events,
-                visibility: "public".to_string(),
+        )?;
+        self.maybe_compile()?;
+        Ok((grid, ev))
+    }
+
+    pub fn list_map_grids_overview(&self) -> Result<serde_json::Value> {
+        let grids = self.db.list_map_grids()?;
+        let places: Vec<serde_json::Value> = load_all_place_projections(&self.db, None)?
+            .values()
+            .map(|p| {
+                serde_json::json!({
+                    "id": p.baseline.id,
+                    "name": p.baseline.name,
+                    "place_type": p.baseline.place_type,
+                    "terrain": p.baseline.terrain,
+                    "faction": p.current.controlling_faction
+                })
+            })
+            .collect();
+        let factions: Vec<serde_json::Value> = self
+            .db
+            .list_factions()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|f| serde_json::json!({ "id": f.id, "name": f.name }))
+            .collect();
+        Ok(serde_json::json!({
+            "count": grids.len(),
+            "grids": grids,
+            "places": places,
+            "factions": factions
+        }))
+    }
+
+    pub fn get_map_grid_snapshot(
+        &self,
+        grid_id: &str,
+        center: Option<(i32, i32)>,
+        radius: Option<i32>,
+        include_gm_secrets: bool,
+    ) -> Result<serde_json::Value> {
+        let gid = slugify(grid_id);
+        let grid = self
+            .db
+            .get_map_grid(&gid)?
+            .ok_or_else(|| anyhow!("Map grid '{gid}' not found"))?;
+        let raw_cells = self.db.list_map_cells(&gid)?;
+
+        let mut place_coords: std::collections::BTreeMap<String, (i32, i32)> =
+            std::collections::BTreeMap::new();
+        for c in &raw_cells {
+            if let Some(ref pid) = c.place_id {
+                place_coords.insert(pid.clone(), (c.x, c.y));
+            }
+        }
+
+        let mut cells_out: Vec<MapGridCell> = raw_cells
+            .iter()
+            .filter(|c| {
+                if let (Some((cx, cy)), Some(r)) = (center, radius) {
+                    (c.x - cx).abs() <= r && (c.y - cy).abs() <= r
+                } else {
+                    true
+                }
+            })
+            .filter(|c| include_gm_secrets || !c.fog_status.eq_ignore_ascii_case("unexplored"))
+            .cloned()
+            .collect();
+        if !include_gm_secrets {
+            for c in &mut cells_out {
+                c.gm_notes.clear();
+            }
+        }
+
+        let neighborhood_lines = if let Some((cx, cy)) = center {
+            format_grid_neighborhood_lines(&grid, &raw_cells, cx, cy, include_gm_secrets)
+        } else {
+            vec![]
+        };
+
+        let all_places = load_all_place_projections(&self.db, None)?;
+        let routes_all = self.all_world_routes_merged(&all_places);
+        let grid_routes: Vec<serde_json::Value> = routes_all
+            .iter()
+            .filter_map(|r| {
+                let (x1, y1) = place_coords.get(&r.from_place_id).copied()?;
+                let (x2, y2) = place_coords.get(&r.to_place_id).copied()?;
+                Some(serde_json::json!({
+                    "id": r.id,
+                    "from_place_id": r.from_place_id,
+                    "to_place_id": r.to_place_id,
+                    "x1": x1, "y1": y1,
+                    "x2": x2, "y2": y2,
+                    "status": r.status,
+                    "distance_km": r.distance_km,
+                    "terrain": r.terrain
+                }))
+            })
+            .collect();
+
+        // Map live character & traveling NPC pins onto cell coordinates
+        let all_chars = load_all_character_projections(&self.db, None)?;
+        let mut pins: Vec<serde_json::Value> = Vec::new();
+        for (cid, cp) in &all_chars {
+            let prof = self.get_character_profile(cid).ok();
+            let in_transit_trip = prof.as_ref().and_then(|p| {
+                if p.mobility.current_status == "in_transit" {
+                    p.mobility.active_trip.as_ref()
+                } else {
+                    None
+                }
+            });
+            if let Some(tr) = in_transit_trip {
+                if let (Some(&(x1, y1)), Some(&(x2, y2))) = (
+                    place_coords.get(&tr.origin_place_id),
+                    place_coords.get(&tr.destination_place_id),
+                ) {
+                    pins.push(serde_json::json!({
+                        "character_id": cid,
+                        "name": cp.baseline.name,
+                        "kind": cp.baseline.kind,
+                        "status": "in_transit",
+                        "x": (x1 as f64 + x2 as f64) / 2.0,
+                        "y": (y1 as f64 + y2 as f64) / 2.0,
+                        "origin": tr.origin_place_id,
+                        "destination": tr.destination_place_id,
+                        "purpose": tr.purpose,
+                        "eta": tr.eta_world_time
+                    }));
+                    continue;
+                }
+            }
+            if let Some(ref loc) = cp.current.current_location {
+                if let Some(&(px, py)) = place_coords.get(loc) {
+                    pins.push(serde_json::json!({
+                        "character_id": cid,
+                        "name": cp.baseline.name,
+                        "kind": cp.baseline.kind,
+                        "status": prof
+                            .as_ref()
+                            .map(|p| p.mobility.current_status.as_str())
+                            .unwrap_or("present"),
+                        "x": px as f64,
+                        "y": py as f64,
+                        "place_id": loc
+                    }));
+                }
+            }
+        }
+
+        let placed_places: Vec<serde_json::Value> = place_coords
+            .iter()
+            .map(|(pid, (px, py))| {
+                let pname = all_places
+                    .get(pid)
+                    .map(|p| p.baseline.name.clone())
+                    .unwrap_or_else(|| pid.clone());
+                serde_json::json!({ "id": pid, "name": pname, "x": px, "y": py })
+            })
+            .collect();
+
+        Ok(serde_json::json!({
+            "grid": grid,
+            "cell_count": cells_out.len(),
+            "cells": cells_out,
+            "placed_places": placed_places,
+            "routes": grid_routes,
+            "character_pins": pins,
+            "neighborhood_summary": neighborhood_lines
+        }))
+    }
+
+    pub fn upsert_map_cells(
+        &self,
+        grid_id: &str,
+        mut cells: Vec<MapGridCell>,
+        reason: &str,
+    ) -> Result<serde_json::Value> {
+        let gid = slugify(grid_id);
+        let grid = self
+            .db
+            .get_map_grid(&gid)?
+            .ok_or_else(|| anyhow!("Map grid '{gid}' not found"))?;
+        let now = self.db.get_campaign_meta()?.clock.format_short();
+        let mut saved = Vec::new();
+        let mut involved = vec![gid.clone()];
+
+        for mut cell in cells.drain(..) {
+            if cell.x < 0 || cell.y < 0 || cell.x >= grid.width as i32 || cell.y >= grid.height as i32 {
+                bail!(
+                    "Cell ({}, {}) out of bounds for grid '{}' ({}x{})",
+                    cell.x,
+                    cell.y,
+                    gid,
+                    grid.width,
+                    grid.height
+                );
+            }
+            cell.grid_id = gid.clone();
+            if cell.terrain.trim().is_empty() {
+                cell.terrain = grid.default_terrain.clone();
+            }
+            if cell.fog_status.trim().is_empty() {
+                cell.fog_status = "charted".to_string();
+            }
+            if let Some(ref pid_raw) = cell.place_id {
+                let t = pid_raw.trim();
+                if t.is_empty() {
+                    cell.place_id = None;
+                } else {
+                    let rpid = resolve_place_id(&self.db, t).unwrap_or_else(|_| slugify(t));
+                    cell.place_id = Some(rpid.clone());
+                    if cell.label.trim().is_empty() {
+                        if let Ok(Some(pb)) = self.db.get_place_baseline(&rpid) {
+                            cell.label = pb.name;
+                        }
+                    }
+                    // Keep PlaceSpatialExt.coordinates & map_region synchronized!
+                    let mut sp = self
+                        .db
+                        .get_place_spatial(&rpid)?
+                        .unwrap_or_else(|| PlaceSpatialExt {
+                            place_id: rpid.clone(),
+                            ..Default::default()
+                        });
+                    sp.coordinates = Some([cell.x as f64, cell.y as f64]);
+                    sp.map_region = gid.clone();
+                    sp.updated_at_world_time = now.clone();
+                    self.db.upsert_place_spatial(&sp)?;
+                    if !involved.contains(&rpid) {
+                        involved.push(rpid);
+                    }
+                }
+            }
+            if let Some(ref fac) = cell.faction_control {
+                if fac.trim().is_empty() {
+                    cell.faction_control = None;
+                }
+            }
+            cell.updated_at_world_time = now.clone();
+            self.db.upsert_map_cell(&cell)?;
+            saved.push(cell);
+        }
+
+        let summary = format!(
+            "Updated {} cell(s) on map grid '{}'{}",
+            saved.len(),
+            grid.name,
+            if reason.is_empty() {
+                String::new()
+            } else {
+                format!(" — {reason}")
+            }
+        );
+        let ev = self.db.append_event(
+            None,
+            involved,
+            summary.clone(),
+            EventPayload::NarrativeEvent {
+                title: format!("Map Grid Cells Updated: {}", grid.name),
+                details: summary.clone(),
+                tags: vec!["map_grid".into()],
             },
         )?;
         self.maybe_compile()?;
         Ok(serde_json::json!({
-            "event_seq": master_ev.seq,
-            "world_clock": new_clock,
-            "season_changed": season_changed,
-            "weather_updates": weather_updates,
-            "recovery_updates": recovery_updates,
-            "market_reports": market_reports,
-            "upkeep_applied": upkeep_applied,
-            "autonomy_dossiers": dossiers
+            "event_seq": ev.seq,
+            "summary": summary,
+            "updated_count": saved.len(),
+            "cells": saved
         }))
+    }
+
+    pub fn clear_map_cell(&self, grid_id: &str, x: i32, y: i32) -> Result<serde_json::Value> {
+        let gid = slugify(grid_id);
+        let existed = self.db.delete_map_cell(&gid, x, y)?;
+        let summary = format!("Cleared cell ({x}, {y}) on map grid '{gid}'");
+        let ev = self.db.append_event(
+            None,
+            vec![gid.clone()],
+            summary.clone(),
+            EventPayload::NarrativeEvent {
+                title: "Map Grid Cell Cleared".to_string(),
+                details: summary.clone(),
+                tags: vec!["map_grid".into()],
+            },
+        )?;
+        self.maybe_compile()?;
+        Ok(serde_json::json!({
+            "event_seq": ev.seq,
+            "cleared": existed,
+            "summary": summary
+        }))
+    }
+
+    /// Places existing campaign places onto a grid using existing PlaceSpatialExt coordinates or clean spacing.
+    pub fn auto_layout_places_on_grid(&self, grid_id: &str) -> Result<serde_json::Value> {
+        let gid = slugify(grid_id);
+        let grid = self
+            .db
+            .get_map_grid(&gid)?
+            .ok_or_else(|| anyhow!("Map grid '{gid}' not found"))?;
+        let existing = self.db.list_map_cells(&gid)?;
+        let already_placed: std::collections::BTreeSet<String> = existing
+            .iter()
+            .filter_map(|c| c.place_id.clone())
+            .collect();
+        let mut occupied: std::collections::BTreeSet<(i32, i32)> =
+            existing.iter().map(|c| (c.x, c.y)).collect();
+
+        let places = load_all_place_projections(&self.db, None)?;
+        let mut to_save = Vec::new();
+        let mut cursor = 0usize;
+        let cols = ((grid.width as usize).saturating_sub(2) / 3).max(1);
+
+        for (pid, pp) in &places {
+            if already_placed.contains(pid) {
+                continue;
+            }
+            // Prefer existing PlaceSpatialExt coordinates if inside grid bounds and free
+            let mut chosen: Option<(i32, i32)> = None;
+            if let Ok(Some(sp)) = self.db.get_place_spatial(pid) {
+                if let Some([fx, fy]) = sp.coordinates {
+                    let ix = (fx.round() as i32).clamp(0, (grid.width as i32) - 1);
+                    let iy = (fy.round() as i32).clamp(0, (grid.height as i32) - 1);
+                    if !occupied.contains(&(ix, iy)) {
+                        chosen = Some((ix, iy));
+                    }
+                }
+            }
+            while chosen.is_none() {
+                let gx = (1 + (cursor % cols) * 3) as i32;
+                let gy = (1 + (cursor / cols) * 3) as i32;
+                cursor += 1;
+                if gx < grid.width as i32 && gy < grid.height as i32 && !occupied.contains(&(gx, gy))
+                {
+                    chosen = Some((gx, gy));
+                } else if cursor > (grid.width * grid.height) as usize {
+                    // Fallback scan any free cell
+                    'scan: for y in 0..grid.height as i32 {
+                        for x in 0..grid.width as i32 {
+                            if !occupied.contains(&(x, y)) {
+                                chosen = Some((x, y));
+                                break 'scan;
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+            if let Some((x, y)) = chosen {
+                occupied.insert((x, y));
+                let t = pp.baseline.terrain.trim().to_lowercase();
+                let terrain = if t.is_empty() {
+                    if pp.baseline.place_type.to_lowercase().contains("settlement")
+                        || pp.baseline.place_type.to_lowercase().contains("city")
+                        || pp.baseline.place_type.to_lowercase().contains("port")
+                    {
+                        "urban".to_string()
+                    } else {
+                        grid.default_terrain.clone()
+                    }
+                } else {
+                    t
+                };
+                to_save.push(MapGridCell {
+                    grid_id: gid.clone(),
+                    x,
+                    y,
+                    terrain,
+                    elevation: 0,
+                    label: pp.baseline.name.clone(),
+                    place_id: Some(pid.clone()),
+                    landmark_name: String::new(),
+                    faction_control: pp.current.controlling_faction.clone(),
+                    fog_status: "charted".to_string(),
+                    passable: true,
+                    hazards: vec![],
+                    notes: pp.baseline.place_type.clone(),
+                    gm_notes: String::new(),
+                    updated_at_world_time: String::new(),
+                });
+            }
+        }
+
+        if to_save.is_empty() {
+            return Ok(serde_json::json!({
+                "placed_count": 0,
+                "summary": "All campaign places are already placed on this grid."
+            }));
+        }
+        self.upsert_map_cells(&gid, to_save, "Auto-placed existing campaign places")
+    }
+
+    // -------------------------------------------------------------------------
+    // Active Engine Signal Bus, Declarative Stage Rules, Auto-Clocks & Routines
+    // -------------------------------------------------------------------------
+
+    pub fn emit_signal(
+        &self,
+        sig: crate::signals::EngineSignal,
+    ) -> Result<crate::signals::EngineSignal> {
+        let now_str = self
+            .db
+            .get_campaign_meta()
+            .map(|m| m.clock.format_short())
+            .unwrap_or_default();
+        let norm = sig.normalized(&now_str);
+        self.db.upsert_signal(&norm)?;
+        Ok(norm)
+    }
+
+    pub fn list_active_signals(
+        &self,
+        perspective: Option<&str>,
+        place_id: Option<&str>,
+        character_ids: &[String],
+        include_gm_secrets: bool,
+    ) -> Result<Vec<crate::signals::EngineSignal>> {
+        let meta = self.db.get_campaign_meta()?;
+        let all_chars = load_all_character_projections(&self.db, None)?;
+        let all_places = load_all_place_projections(&self.db, None)?;
+        let resolved_place = place_id
+            .filter(|s| !s.trim().is_empty())
+            .map(|p| resolve_place_id(&self.db, p).unwrap_or_else(|_| slugify(p)));
+
+        let focus_set_opt: Option<std::collections::BTreeSet<String>> =
+            if resolved_place.is_none() && character_ids.is_empty() {
+                None
+            } else {
+                let mut set = std::collections::BTreeSet::new();
+                if let Some(ref pid) = resolved_place {
+                    set.insert(pid.clone());
+                    if let Some(pp) = all_places.get(pid) {
+                        for cid in &pp.current.present_characters {
+                            set.insert(cid.clone());
+                        }
+                    }
+                }
+                for raw_cid in character_ids {
+                    if !raw_cid.trim().is_empty() {
+                        let cid = resolve_character_id(&self.db, raw_cid)
+                            .unwrap_or_else(|_| slugify(raw_cid));
+                        set.insert(cid);
+                    }
+                }
+                Some(set)
+            };
+
+        let raw_persp = perspective
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("gm");
+        let is_gm = raw_persp.eq_ignore_ascii_case("gm");
+        let pov_actor: Option<String> = if is_gm || raw_persp.eq_ignore_ascii_case("player") {
+            None
+        } else {
+            Some(resolve_character_id(&self.db, raw_persp).unwrap_or_else(|_| slugify(raw_persp)))
+        };
+        let pc_ids: std::collections::BTreeSet<String> = all_chars
+            .values()
+            .filter(|c| c.baseline.kind.eq_ignore_ascii_case("pc"))
+            .map(|c| c.baseline.id.clone())
+            .collect();
+
+        let signals = crate::signals::evaluate_live_signals(
+            &self.db,
+            &all_chars,
+            &all_places,
+            focus_set_opt.as_ref(),
+            resolved_place.as_deref(),
+            &meta.clock.format_short(),
+        )?;
+        Ok(crate::signals::filter_signals_for_perspective(
+            signals,
+            raw_persp,
+            pov_actor.as_deref(),
+            &pc_ids,
+            is_gm && include_gm_secrets,
+        ))
+    }
+
+    pub fn update_signal(
+        &self,
+        id_or_dedup: &str,
+        action_or_status: &str,
+    ) -> Result<Option<crate::signals::EngineSignal>> {
+        let act = action_or_status.trim().to_ascii_lowercase();
+        if act == "delete" || act == "clear" {
+            let _ = self.db.delete_signal(id_or_dedup)?;
+            return Ok(None);
+        }
+        let new_status = match act.as_str() {
+            "ack" | "acknowledge" | "acknowledged" => "acknowledged",
+            "resolve" | "resolved" | "dismiss" => "resolved",
+            "reopen" | "active" => "active",
+            other => bail!("Unknown signal status/action '{other}'. Expected acknowledge, resolve, active, or delete."),
+        };
+        let now_str = self
+            .db
+            .get_campaign_meta()
+            .map(|m| m.clock.format_short())
+            .unwrap_or_default();
+        if let Some(updated) = self.db.update_signal_status(id_or_dedup, new_status, &now_str)? {
+            return Ok(Some(updated));
+        }
+        // Materialize live-derived signal so acknowledging/resolving suppresses it cleanly!
+        if let Ok(live) = self.list_active_signals(Some("gm"), None, &[], true) {
+            if let Some(mut found) = live
+                .into_iter()
+                .find(|s| s.id == id_or_dedup || s.dedup_key == id_or_dedup)
+            {
+                found.status = new_status.to_string();
+                found.updated_at_world_time = now_str;
+                self.db.upsert_signal(&found)?;
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn upsert_routine(
+        &self,
+        mut routine: crate::routines::CharacterRoutine,
+    ) -> Result<(crate::routines::CharacterRoutine, WorldEvent)> {
+        let cid = resolve_character_id(&self.db, &routine.character_id)?;
+        routine.character_id = cid.clone();
+        if routine.name.trim().is_empty() {
+            bail!("Routine `name` cannot be empty");
+        }
+        if routine.id.trim().is_empty() {
+            routine.id = slugify(&format!("{cid}-{}", routine.name));
+        } else {
+            routine.id = slugify(&routine.id);
+        }
+        routine.cadence_hours = routine.cadence_hours.max(1);
+        if let Some(ref req_loc) = routine.require_location_id {
+            let t = req_loc.trim();
+            routine.require_location_id = if t.is_empty() {
+                None
+            } else {
+                Some(resolve_place_id(&self.db, t).unwrap_or_else(|_| slugify(t)))
+            };
+        }
+        routine.min_currency = routine
+            .min_currency
+            .into_iter()
+            .map(|(k, v)| (normalize_currency_key(&k), v))
+            .collect();
+        routine.currency_deltas = routine
+            .currency_deltas
+            .into_iter()
+            .map(|(k, v)| (normalize_currency_key(&k), v))
+            .collect();
+
+        let meta = self.db.get_campaign_meta()?;
+        if routine.last_tick_total_hours.is_none() {
+            if let Some(existing) = self.db.get_routine(&routine.id)? {
+                routine.last_tick_total_hours = existing.last_tick_total_hours;
+            }
+            if routine.last_tick_total_hours.is_none() {
+                routine.last_tick_total_hours = Some(meta.clock.total_hours());
+            }
+        }
+        routine.updated_at_world_time = meta.clock.format_short();
+        self.db.upsert_routine(&routine)?;
+
+        let proj = load_character_projection(&self.db, &cid, None)?;
+        let summary = format!(
+            "Configured standing routine '{}' [{} | every {}h | {}] for {}",
+            routine.name,
+            routine.category,
+            routine.cadence_hours,
+            if routine.enabled { "enabled" } else { "disabled" },
+            proj.baseline.name
+        );
+        let ev = self.db.append_event(
+            proj.current.current_location,
+            vec![cid, routine.id.clone()],
+            summary.clone(),
+            EventPayload::NarrativeEvent {
+                title: format!("Standing Routine Saved: {}", routine.name),
+                details: summary,
+                tags: vec!["routine".into(), routine.category.clone()],
+            },
+        )?;
+        self.maybe_compile()?;
+        Ok((routine, ev))
+    }
+
+    pub fn list_routines(
+        &self,
+        character_id: Option<&str>,
+    ) -> Result<Vec<crate::routines::CharacterRoutine>> {
+        let resolved = match character_id.filter(|s| !s.trim().is_empty()) {
+            Some(raw) => Some(resolve_character_id(&self.db, raw).unwrap_or_else(|_| slugify(raw))),
+            None => None,
+        };
+        self.db.list_routines(resolved.as_deref())
+    }
+
+    pub fn delete_routine(&self, routine_id: &str) -> Result<bool> {
+        let rid = slugify(routine_id);
+        let removed = self.db.delete_routine(&rid)?;
+        let _ = self.db.delete_signal(&format!("routine_paused:{rid}"));
+        Ok(removed)
+    }
+
+    pub(crate) fn tick_auto_clocks(
+        &self,
+        prev_total_hours: i64,
+        new_total_hours: i64,
+        now_str: &str,
+    ) -> Result<Vec<String>> {
+        let mut digests = Vec::new();
+        for mut clock in self.db.list_clocks()? {
+            if !clock.status.eq_ignore_ascii_case("active") {
+                continue;
+            }
+            let Some(cadence) = clock.cadence_hours.filter(|&h| h > 0) else {
+                continue;
+            };
+            let anchor = clock.last_tick_total_hours.unwrap_or(prev_total_hours);
+            if new_total_hours <= anchor {
+                continue;
+            }
+            let elapsed = (new_total_hours - anchor) as u64;
+            let cycles = elapsed / cadence;
+            if cycles == 0 {
+                if clock.last_tick_total_hours.is_none() {
+                    clock.last_tick_total_hours = Some(anchor);
+                    self.db.upsert_clock(&clock)?;
+                }
+                continue;
+            }
+
+            clock.last_tick_total_hours = Some(anchor + (cycles * cadence) as i64);
+            let raw_filled = clock.filled + (cycles as i64);
+            let mut filled_triggered = false;
+            if raw_filled >= clock.segments {
+                filled_triggered = true;
+                if clock.auto_reset {
+                    clock.filled = raw_filled % clock.segments.max(1);
+                    clock.status = "active".to_string();
+                } else {
+                    clock.filled = clock.segments;
+                    clock.status = "completed".to_string();
+                }
+            } else {
+                clock.filled = raw_filled;
+            }
+            self.db.upsert_clock(&clock)?;
+
+            let summary = format!(
+                "Auto-ticked clock '{}' (+{} segment(s)) -> {}/{} [{}]{}",
+                clock.name,
+                cycles,
+                clock.filled,
+                clock.segments,
+                clock.status,
+                if filled_triggered && clock.auto_reset {
+                    " [FILLED & AUTO-RESET]"
+                } else if filled_triggered {
+                    " [COMPLETED!]"
+                } else {
+                    ""
+                }
+            );
+            let ev = self.db.append_event(
+                None,
+                clock.related_ids.clone(),
+                summary.clone(),
+                EventPayload::ClockTicked {
+                    clock_id: clock.id.clone(),
+                    delta: cycles as i64,
+                    set_status: Some(clock.status.clone()),
+                    reason: format!("Automatic {cadence}h time-cadence tick"),
+                },
+            )?;
+            if filled_triggered {
+                let _ = self.emit_signal(crate::signals::EngineSignal {
+                    id: String::new(),
+                    dedup_key: format!("clock_filled:{}:{}", clock.id, ev.seq),
+                    code: "CLOCK_FILLED".to_string(),
+                    severity: "critical".to_string(),
+                    category: "clock".to_string(),
+                    title: format!("Clock Filled: '{}' ({}/{})", clock.name, clock.segments, clock.segments),
+                    summary: format!(
+                        "Timed clock '{}' reached completion at {now_str}! {}",
+                        clock.name,
+                        if clock.consequence_on_fill.is_empty() {
+                            clock.description.as_str()
+                        } else {
+                            clock.consequence_on_fill.as_str()
+                        }
+                    ),
+                    entity_ids: clock.related_ids.clone(),
+                    location_id: None,
+                    suggested_actions: vec![format!("Enact consequence for '{}' in scene.", clock.name)],
+                    visibility: "gm_secret".to_string(),
+                    status: "active".to_string(),
+                    source_event_seq: Some(ev.seq),
+                    created_at_world_time: now_str.to_string(),
+                    updated_at_world_time: now_str.to_string(),
+                });
+            }
+            digests.push(summary);
+        }
+        Ok(digests)
+    }
+
+    pub(crate) fn tick_character_routines(
+        &self,
+        prev_total_hours: i64,
+        new_total_hours: i64,
+        now_str: &str,
+    ) -> Result<Vec<String>> {
+        let mut digests = Vec::new();
+        let routines = self.db.list_routines(None)?;
+        if routines.is_empty() {
+            return Ok(digests);
+        }
+
+        for mut r in routines {
+            if !r.enabled {
+                continue;
+            }
+            let cadence = r.cadence_hours.max(1);
+            let anchor = r.last_tick_total_hours.unwrap_or(prev_total_hours);
+            if new_total_hours <= anchor {
+                continue;
+            }
+            let elapsed = (new_total_hours - anchor) as u64;
+            let cycles = elapsed / cadence;
+            if cycles == 0 {
+                if r.last_tick_total_hours.is_none() {
+                    r.last_tick_total_hours = Some(anchor);
+                    self.db.upsert_routine(&r)?;
+                }
+                continue;
+            }
+
+            let Ok(proj) = load_character_projection(&self.db, &r.character_id, None) else {
+                continue;
+            };
+            let cid = proj.baseline.id.clone();
+
+            // 1. Evaluate guard conditions
+            let mut guard_fail: Option<String> = None;
+            if let Some(ref req_loc) = r.require_location_id {
+                if proj.current.current_location.as_deref() != Some(req_loc.as_str()) {
+                    guard_fail = Some(format!(
+                        "{} is at '{}' instead of required '{}'",
+                        proj.baseline.name,
+                        proj.current.current_location.as_deref().unwrap_or("unknown"),
+                        req_loc
+                    ));
+                }
+            }
+            if guard_fail.is_none() {
+                if let Some(ref min_inj) = r.halt_on_injury_severity {
+                    let thresh = crate::routines::injury_severity_rank(min_inj);
+                    if thresh > 0 {
+                        let active_inj = self.db.list_injuries(Some(&cid), false).unwrap_or_default();
+                        if let Some(hit) = active_inj.iter().find(|i| {
+                            !i.status.eq_ignore_ascii_case("healed")
+                                && crate::routines::injury_severity_rank(&i.severity) >= thresh
+                        }) {
+                            guard_fail = Some(format!(
+                                "Halted due to {} injury '{}'",
+                                hit.severity, hit.name
+                            ));
+                        }
+                    }
+                }
+            }
+            if guard_fail.is_none() && !r.halt_if_conditions.is_empty() {
+                for hc in &r.halt_if_conditions {
+                    let hcl = hc.trim().to_lowercase();
+                    if !hcl.is_empty() {
+                        if let Some(c) = proj
+                            .current
+                            .conditions
+                            .iter()
+                            .find(|c| c.name.to_lowercase().contains(&hcl))
+                        {
+                            guard_fail = Some(format!("Halted due to active condition '{}'", c.name));
+                            break;
+                        }
+                    }
+                }
+            }
+            if guard_fail.is_none() {
+                for (curr, min_amt) in &r.min_currency {
+                    let cur_key = normalize_currency_key(curr);
+                    let mut bal = self.db.get_currency_balance(&cid, &cur_key)?;
+                    if bal < *min_amt {
+                        if self
+                            .try_make_currency_change(&cid, &cur_key, *min_amt, now_str)?
+                            .is_some()
+                        {
+                            bal = self.db.get_currency_balance(&cid, &cur_key)?;
+                        }
+                    }
+                    if bal < *min_amt {
+                        guard_fail = Some(format!(
+                            "Insufficient {cur_key} reserve (has {bal}, requires {min_amt})"
+                        ));
+                        break;
+                    }
+                }
+            }
+
+            // Check negative currency_deltas affordability across cycles
+            let mut eff_cycles = cycles;
+            if guard_fail.is_none() {
+                for (curr, delta) in &r.currency_deltas {
+                    if *delta < 0 {
+                        let cost_per = delta.unsigned_abs() as i64;
+                        let total_cost = cost_per.saturating_mul(eff_cycles as i64);
+                        let cur_key = normalize_currency_key(curr);
+                        let mut bal = self.db.get_currency_balance(&cid, &cur_key)?;
+                        if bal < total_cost {
+                            let _ = self.try_make_currency_change(&cid, &cur_key, total_cost, now_str);
+                            bal = self.db.get_currency_balance(&cid, &cur_key)?;
+                        }
+                        let affordable = (bal.max(0) / cost_per.max(1)) as u64;
+                        if affordable == 0 {
+                            guard_fail = Some(format!(
+                                "Insufficient {cur_key} to pay routine cost ({cost_per} {cur_key}/cycle; balance {bal})"
+                            ));
+                            break;
+                        }
+                        eff_cycles = eff_cycles.min(affordable);
+                    }
+                }
+            }
+
+            if let Some(reason_msg) = guard_fail {
+                r.paused_reason = reason_msg.clone();
+                r.last_tick_total_hours = Some(anchor + (cycles * cadence) as i64);
+                r.updated_at_world_time = now_str.to_string();
+                self.db.upsert_routine(&r)?;
+                let _ = self.emit_signal(crate::signals::EngineSignal {
+                    id: String::new(),
+                    dedup_key: format!("routine_paused:{}", r.id),
+                    code: "ROUTINE_PAUSED".to_string(),
+                    severity: "warning".to_string(),
+                    category: "routine".to_string(),
+                    title: format!("Routine Paused: '{}' ({})", r.name, proj.baseline.name),
+                    summary: reason_msg,
+                    entity_ids: vec![cid],
+                    location_id: proj.current.current_location,
+                    suggested_actions: vec!["Address the blocking condition/location/funds to resume routine ticks.".to_string()],
+                    visibility: "player".to_string(),
+                    status: "active".to_string(),
+                    source_event_seq: None,
+                    created_at_world_time: now_str.to_string(),
+                    updated_at_world_time: now_str.to_string(),
+                });
+                continue;
+            }
+
+            // Clear any prior paused notice
+            if !r.paused_reason.is_empty() {
+                r.paused_reason.clear();
+                let _ = self.db.delete_signal(&format!("routine_paused:{}", r.id));
+            }
+
+            let mut applied_parts: Vec<String> = Vec::new();
+            let reason_tag = format!("Routine '{}' ({} cycle(s))", r.name, eff_cycles);
+
+            // Apply currency deltas
+            for (curr, delta) in &r.currency_deltas {
+                if *delta == 0 {
+                    continue;
+                }
+                let total_d = delta.saturating_mul(eff_cycles as i64);
+                let cur_key = normalize_currency_key(curr);
+                if total_d > 0 {
+                    if let Some(ref cp_owner) = r.counterparty_id {
+                        let cpo = slugify(cp_owner);
+                        let cp_bal = self.db.get_currency_balance(&cpo, &cur_key)?;
+                        if cp_bal >= total_d {
+                            let _ = self.transfer_currency(&cpo, &cid, total_d, &cur_key, &reason_tag);
+                        } else {
+                            let cur_bal = self.db.get_currency_balance(&cid, &cur_key)?;
+                            self.db
+                                .set_currency_balance(&cid, &cur_key, cur_bal + total_d, now_str)?;
+                        }
+                    } else {
+                        let cur_bal = self.db.get_currency_balance(&cid, &cur_key)?;
+                        self.db
+                            .set_currency_balance(&cid, &cur_key, cur_bal + total_d, now_str)?;
+                    }
+                    applied_parts.push(format!("+{total_d} {cur_key}"));
+                } else {
+                    let cost = total_d.unsigned_abs() as i64;
+                    let mut cur_bal = self.db.get_currency_balance(&cid, &cur_key)?;
+                    if cur_bal < cost {
+                        let _ = self.try_make_currency_change(&cid, &cur_key, cost, now_str);
+                        cur_bal = self.db.get_currency_balance(&cid, &cur_key)?;
+                    }
+                    let new_bal = (cur_bal - cost).max(0);
+                    self.db.set_currency_balance(&cid, &cur_key, new_bal, now_str)?;
+                    if let Some(ref cp_owner) = r.counterparty_id {
+                        let cpo = slugify(cp_owner);
+                        let cpb = self.db.get_currency_balance(&cpo, &cur_key)?;
+                        self.db.set_currency_balance(&cpo, &cur_key, cpb + cost, now_str)?;
+                    }
+                    applied_parts.push(format!("-{cost} {cur_key}"));
+                }
+            }
+
+            // Apply resource deltas
+            for (res_name, delta) in &r.resource_deltas {
+                if *delta != 0 {
+                    let total_d = delta.saturating_mul(eff_cycles as i64);
+                    let _ = self.modify_resource(&cid, res_name, Some(total_d), None, None, None, &reason_tag);
+                    applied_parts.push(format!("{res_name} {total_d:+}"));
+                }
+            }
+
+            // Apply progression XP
+            for (track_id, xp_per) in &r.progression_xp {
+                let total_xp = xp_per.saturating_mul(eff_cycles);
+                if total_xp > 0 {
+                    if let Ok((resp, _)) = self.advance_progression_xp(&cid, track_id, total_xp, &reason_tag) {
+                        let stg = resp["track"]["sub_stage_label"]
+                            .as_str()
+                            .filter(|s| !s.is_empty())
+                            .or_else(|| resp["track"]["major_stage_name"].as_str())
+                            .unwrap_or(track_id);
+                        applied_parts.push(format!("{track_id} +{total_xp} XP ({stg})"));
+                    }
+                }
+            }
+
+            // Apply skill XP
+            for (sk_name, xp_per) in &r.skill_xp {
+                let total_xp = xp_per.saturating_mul(eff_cycles);
+                if total_xp > 0 {
+                    if let Ok((prog, _)) = self.grant_skill_xp(&cid, sk_name, total_xp, None, &reason_tag) {
+                        applied_parts.push(format!("{} +{total_xp} XP ({})", prog.skill_name, prog.new_rank));
+                    }
+                }
+            }
+
+            // Apply job XP
+            for (job_id, xp_per) in &r.job_xp {
+                let total_xp = xp_per.saturating_mul(eff_cycles);
+                if total_xp > 0 {
+                    let _ = self.manage_player_character_action(
+                        Some(&cid),
+                        "adjust_job_xp",
+                        &serde_json::json!({
+                            "job_id": job_id,
+                            "delta_xp": total_xp as i64,
+                            "reason": reason_tag
+                        }),
+                    );
+                    applied_parts.push(format!("job:{job_id} +{total_xp} XP"));
+                }
+            }
+
+            // Apply stat training XP
+            for (stat_name, xp_per) in &r.stat_training_xp {
+                let total_xp = xp_per.saturating_mul(eff_cycles);
+                if total_xp > 0 {
+                    let _ = self.manage_player_character_action(
+                        Some(&cid),
+                        "adjust_stat_xp",
+                        &serde_json::json!({
+                            "stat": stat_name,
+                            "delta_xp": total_xp as i64,
+                            "reason": reason_tag
+                        }),
+                    );
+                    applied_parts.push(format!("stat:{stat_name} +{total_xp} XP"));
+                }
+            }
+
+            r.last_tick_total_hours = Some(anchor + (cycles * cadence) as i64);
+            r.updated_at_world_time = now_str.to_string();
+            self.db.upsert_routine(&r)?;
+
+            if !applied_parts.is_empty() {
+                let digest = format!(
+                    "{} — Routine '{}' x{} cycle(s): {}",
+                    proj.baseline.name,
+                    r.name,
+                    eff_cycles,
+                    applied_parts.join(", ")
+                );
+                let ev = self.db.append_event(
+                    proj.current.current_location.clone(),
+                    vec![cid.clone(), r.id.clone()],
+                    digest.clone(),
+                    EventPayload::NarrativeEvent {
+                        title: format!("Routine Completed: {}", r.name),
+                        details: digest.clone(),
+                        tags: vec!["routine".into(), r.category.clone()],
+                    },
+                )?;
+                let _ = self.emit_signal(crate::signals::EngineSignal {
+                    id: String::new(),
+                    dedup_key: format!("routine_digest:{}", r.id),
+                    code: "ROUTINE_DIGEST".to_string(),
+                    severity: "info".to_string(),
+                    category: "routine".to_string(),
+                    title: format!("{} — '{}' ({} cycle(s))", proj.baseline.name, r.name, eff_cycles),
+                    summary: applied_parts.join(", "),
+                    entity_ids: vec![cid],
+                    location_id: proj.current.current_location,
+                    suggested_actions: vec![],
+                    visibility: "player".to_string(),
+                    status: "active".to_string(),
+                    source_event_seq: Some(ev.seq),
+                    created_at_world_time: now_str.to_string(),
+                    updated_at_world_time: now_str.to_string(),
+                });
+                digests.push(digest);
+            }
+        }
+        Ok(digests)
+    }
+
+    pub(crate) fn lookup_stage_rule(
+        track: &CharacterProgressionTrack,
+        ladder: Option<&ProgressionLadder>,
+        major_idx: u32,
+        sub_stage: u32,
+    ) -> Option<crate::routines::StageTransitionRule> {
+        let composite_key = format!("{major_idx}:{sub_stage}");
+        if let Some(r) = track.stage_rules.get(&composite_key) {
+            return Some(r.clone());
+        }
+        if major_idx == 0 {
+            if let Some(r) = track.stage_rules.get(&sub_stage.to_string()) {
+                return Some(r.clone());
+            }
+        }
+        // Fallback: if track has a single major stage or keyed by 1-based stage name/number
+        if let Some(r) = track.stage_rules.get(&sub_stage.to_string()) {
+            if ladder.map_or(true, |l| l.stages.len() <= 1) {
+                return Some(r.clone());
+            }
+        }
+        if let Some(lad) = ladder {
+            if let Some(st) = lad.stages.get(major_idx as usize) {
+                if let Some(r) = st.sub_stage_rules.get(&sub_stage) {
+                    return Some(r.clone());
+                }
+                if sub_stage == 1 {
+                    if let Some(ref r) = st.stage_rule {
+                        return Some(r.clone());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub fn apply_stage_transition_rule(
+        &self,
+        character_id: &str,
+        track_name: &str,
+        stage_label: &str,
+        rule: &crate::routines::StageTransitionRule,
+        source_event_seq: Option<i64>,
+    ) -> Result<serde_json::Value> {
+        let cid = resolve_character_id(&self.db, character_id)?;
+        let now_str = self.db.get_campaign_meta()?.clock.format_short();
+        let proj = load_character_projection(&self.db, &cid, None)?;
+        let mut prof = self.get_character_profile(&cid)?;
+        let mut changes: Vec<String> = Vec::new();
+        let mut avatar_changed = false;
+
+        // Preserve Day-1 baseline measurements/height/weight automatically before applying first transformation!
+        if !rule.height.trim().is_empty() {
+            if prof.avatar.baseline_height.trim().is_empty() && !prof.avatar.height.trim().is_empty() {
+                prof.avatar.baseline_height = prof.avatar.height.clone();
+            }
+            prof.avatar.height = rule.height.trim().to_string();
+            avatar_changed = true;
+            changes.push(format!("Height -> {}", prof.avatar.height));
+        }
+        if !rule.weight.trim().is_empty() {
+            if prof.avatar.baseline_weight.trim().is_empty() && !prof.avatar.weight.trim().is_empty() {
+                prof.avatar.baseline_weight = prof.avatar.weight.clone();
+            }
+            prof.avatar.weight = rule.weight.trim().to_string();
+            avatar_changed = true;
+            changes.push(format!("Weight -> {}", prof.avatar.weight));
+        }
+        if !rule.measurements.is_empty() {
+            if prof.avatar.baseline_measurements.is_empty() && !prof.avatar.measurements.is_empty() {
+                prof.avatar.baseline_measurements = prof.avatar.measurements.clone();
+            }
+            let mut m_list = Vec::new();
+            for (k, v) in &rule.measurements {
+                let nk = crate::autonomy::normalize_measurement_key(k);
+                if !nk.is_empty() && !v.trim().is_empty() {
+                    prof.avatar.measurements.insert(nk.clone(), v.trim().to_string());
+                    m_list.push(format!("{nk} {}", v.trim()));
+                }
+            }
+            if !m_list.is_empty() {
+                avatar_changed = true;
+                changes.push(format!("Measurements: {}", m_list.join(", ")));
+            }
+        }
+
+        if !rule.appearance_stage.trim().is_empty() {
+            prof.avatar.appearance_stage = rule.appearance_stage.trim().to_string();
+            avatar_changed = true;
+        }
+        if !rule.avatar_summary.trim().is_empty() {
+            prof.avatar.avatar_summary = rule.avatar_summary.trim().to_string();
+            avatar_changed = true;
+        }
+        if !rule.body_type_or_build.trim().is_empty() {
+            prof.avatar.body_type_or_build = rule.body_type_or_build.trim().to_string();
+            avatar_changed = true;
+        }
+        if !rule.silhouette.trim().is_empty() {
+            prof.avatar.silhouette = rule.silhouette.trim().to_string();
+            avatar_changed = true;
+        }
+        if !rule.posture_and_gait.trim().is_empty() {
+            prof.avatar.posture_and_gait = rule.posture_and_gait.trim().to_string();
+            avatar_changed = true;
+        }
+        if !rule.proportions_summary.trim().is_empty() {
+            prof.avatar.proportions_summary = rule.proportions_summary.trim().to_string();
+            avatar_changed = true;
+        }
+        if !rule.clothing_fit.trim().is_empty() {
+            prof.avatar.clothing_fit = rule.clothing_fit.trim().to_string();
+            avatar_changed = true;
+        }
+        if !rule.face_shape_and_features.trim().is_empty() {
+            prof.avatar.face_shape_and_features = rule.face_shape_and_features.trim().to_string();
+            avatar_changed = true;
+        }
+        if !rule.skin_tone_and_texture.trim().is_empty() {
+            prof.avatar.skin_tone_and_texture = rule.skin_tone_and_texture.trim().to_string();
+            avatar_changed = true;
+        }
+        if !rule.hair.trim().is_empty() {
+            prof.avatar.hair = rule.hair.trim().to_string();
+            avatar_changed = true;
+        }
+        if let Some(ref fh) = rule.facial_hair {
+            prof.avatar.facial_hair = fh.trim().to_string();
+            avatar_changed = true;
+            changes.push(if prof.avatar.facial_hair.is_empty() {
+                "Facial hair cleared".to_string()
+            } else {
+                format!("Facial hair -> {}", prof.avatar.facial_hair)
+            });
+        }
+        if !rule.voice_and_speech.trim().is_empty() {
+            prof.avatar.voice_and_speech = rule.voice_and_speech.trim().to_string();
+            avatar_changed = true;
+        }
+        if !rule.perceived_change_note.trim().is_empty() {
+            prof.avatar.perceived_change_note = rule.perceived_change_note.trim().to_string();
+            avatar_changed = true;
+        }
+        if !rule.next_transformation_trajectory.trim().is_empty() {
+            prof.avatar.transformation_trajectory = rule.next_transformation_trajectory.trim().to_string();
+        }
+
+        if rule.unspent_stat_points_delta != 0 {
+            prof.unspent_stat_points = (prof.unspent_stat_points + rule.unspent_stat_points_delta).max(0);
+            changes.push(format!(
+                "Unspent stat points {:+} (now {})",
+                rule.unspent_stat_points_delta, prof.unspent_stat_points
+            ));
+        }
+
+        for gt in &rule.grant_traits {
+            let tid = if gt.id.trim().is_empty() {
+                slugify(&gt.name)
+            } else {
+                slugify(&gt.id)
+            };
+            let tr_obj = CharacterTrait {
+                id: tid.clone(),
+                name: gt.name.clone(),
+                category: gt.category.clone(),
+                rank_or_grade: gt.rank_or_grade.clone(),
+                active: gt.active,
+                effect: gt.effect.clone(),
+                notes: gt.notes.clone(),
+            };
+            if let Some(ex) = prof
+                .traits_and_perks
+                .iter_mut()
+                .find(|x| x.id == tid || x.name.eq_ignore_ascii_case(&gt.name))
+            {
+                *ex = tr_obj;
+            } else {
+                prof.traits_and_perks.push(tr_obj);
+            }
+            changes.push(format!("Trait granted: {}", gt.name));
+        }
+
+        if avatar_changed || !rule.checkpoint_summary.trim().is_empty() {
+            let cp_stage = if !rule.appearance_stage.trim().is_empty() {
+                rule.appearance_stage.trim().to_string()
+            } else {
+                format!("{track_name} — {stage_label}")
+            };
+            let cp = crate::autonomy::AppearanceCheckpoint {
+                stage: cp_stage.clone(),
+                world_time: now_str.clone(),
+                summary: if !rule.checkpoint_summary.trim().is_empty() {
+                    rule.checkpoint_summary.trim().to_string()
+                } else {
+                    changes.join("; ")
+                },
+                height: prof.avatar.height.clone(),
+                weight: prof.avatar.weight.clone(),
+                measurements: prof.avatar.measurements.clone(),
+            };
+            if let Some(ex) = prof
+                .avatar
+                .transformation_log
+                .iter_mut()
+                .find(|x| x.stage.eq_ignore_ascii_case(&cp_stage))
+            {
+                *ex = cp;
+            } else {
+                prof.avatar.transformation_log.push(cp);
+            }
+            if !prof.avatar.height.is_empty() || !prof.avatar.body_type_or_build.is_empty() {
+                prof.height_and_build = [
+                    prof.avatar.height.as_str(),
+                    prof.avatar.weight.as_str(),
+                    prof.avatar.body_type_or_build.as_str(),
+                ]
+                .iter()
+                .filter(|s| !s.is_empty())
+                .copied()
+                .collect::<Vec<_>>()
+                .join(" • ");
+            }
+        }
+
+        prof.updated_at_world_time = now_str.clone();
+        self.db.upsert_character_profile(&prof)?;
+
+        // Stat overrides & deltas
+        let reason_note = format!("Stage rule: {track_name} ({stage_label})");
+        for (st_k, st_v) in &rule.stat_set {
+            let _ = self.modify_stat(&cid, st_k, None, Some(*st_v), &reason_note)?;
+            changes.push(format!("{st_k} = {st_v}"));
+        }
+        for (st_k, st_d) in &rule.stat_deltas {
+            if *st_d != 0 {
+                let _ = self.modify_stat(&cid, st_k, Some(*st_d), None, &reason_note)?;
+                changes.push(format!("{st_k} {st_d:+}"));
+            }
+        }
+
+        // Remove & upsert conditions
+        for rc in &rule.remove_conditions {
+            if !rc.trim().is_empty() {
+                let _ = self.remove_condition(&cid, rc.trim(), &reason_note);
+                changes.push(format!("Cleared condition '{rc}'"));
+            }
+        }
+        for uc in &rule.upsert_conditions {
+            if !uc.name.trim().is_empty() {
+                let _ = self.add_condition(
+                    &cid,
+                    StatusCondition {
+                        name: uc.name.clone(),
+                        kind: uc.kind.clone(),
+                        severity: uc.severity.clone(),
+                        duration: uc.duration.clone(),
+                        source: if uc.source.is_empty() {
+                            format!("{track_name} ({stage_label})")
+                        } else {
+                            uc.source.clone()
+                        },
+                        notes: uc.notes.clone(),
+                    },
+                )?;
+                changes.push(format!("Condition: {} ({})", uc.name, uc.severity));
+            }
+        }
+
+        // Re-evaluate worn garment fit & discomfort immediately against the updated body!
+        let _ = self.sync_apparel_discomfort(&cid, 0);
+
+        // Clear any stale manual sync alarm on this character
+        for s in self.db.list_signals(Some("active")).unwrap_or_default() {
+            if s.code == "APPEARANCE_SYNC_DUE" && s.entity_ids.contains(&cid) {
+                let _ = self.db.update_signal_status(&s.id, "resolved", &now_str);
+            }
+        }
+
+        let mut sig_summary = if changes.is_empty() {
+            format!("Applied stage rule for {} at {stage_label}.", proj.baseline.name)
+        } else {
+            format!("Auto-applied: {}.", changes.join(" | "))
+        };
+        if !rule.narrative_directive.trim().is_empty() {
+            sig_summary.push_str(&format!(" Directive: {}", rule.narrative_directive.trim()));
+        }
+
+        let emitted = self.emit_signal(crate::signals::EngineSignal {
+            id: String::new(),
+            dedup_key: format!("stage_rule_applied:{cid}:{}:{}", slugify(track_name), slugify(stage_label)),
+            code: "STAGE_RULE_APPLIED".to_string(),
+            severity: "critical".to_string(),
+            category: "progression".to_string(),
+            title: format!("{} — {} Transition Applied ({stage_label})", proj.baseline.name, track_name),
+            summary: sig_summary.clone(),
+            entity_ids: vec![cid.clone()],
+            location_id: proj.current.current_location,
+            suggested_actions: vec![],
+            visibility: rule.signal_visibility.clone(),
+            status: "active".to_string(),
+            source_event_seq,
+            created_at_world_time: now_str.clone(),
+            updated_at_world_time: now_str,
+        })?;
+
+        Ok(serde_json::json!({
+            "stage": stage_label,
+            "changes": changes,
+            "narrative_directive": rule.narrative_directive,
+            "signal_id": emitted.id
+        }))
+    }
+
+    pub(crate) fn award_coupled_activity_xp(
+        &self,
+        cid: &str,
+        skill_name: &str,
+        explicit_stat: Option<&str>,
+        skill_xp_gained: u64,
+        ruleset: &RulesetProfile,
+        source_event_seq: Option<i64>,
+    ) -> Result<(Option<(String, u64)>, Vec<(String, u64)>)> {
+        let proj = load_character_projection(&self.db, cid, None)?;
+        let mut prof = self.get_character_profile(cid)?;
+        let now_str = self.db.get_campaign_meta()?.clock.format_short();
+        let mut changed = false;
+
+        // 1. Governing Stat Training XP trickle (35% of skill XP)
+        let gov_stat: Option<String> = explicit_stat
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                proj.current
+                    .skills
+                    .iter()
+                    .find(|s| s.name.eq_ignore_ascii_case(skill_name))
+                    .and_then(|s| s.governing_stat.clone())
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .or_else(|| {
+                lookup_skill_definition(ruleset, skill_name).map(|d| d.governing_stat.clone())
+            })
+            .map(|raw_s| {
+                crate::mechanics::find_character_stat(&proj.current.stats, &raw_s)
+                    .map(|(k, _)| k.clone())
+                    .unwrap_or(raw_s)
+            });
+
+        let mut stat_xp_out: Option<(String, u64)> = None;
+        if let Some(ref st_name) = gov_stat {
+            let st_xp = ((skill_xp_gained as f64) * 0.35).ceil().max(1.0) as u64;
+            let entry = prof
+                .stat_training
+                .entry(st_name.clone())
+                .or_insert_with(|| StatTrainingEntry {
+                    stat: st_name.clone(),
+                    current_xp: 0,
+                    xp_to_next: crate::routines::stat_training_threshold_for_points(0),
+                    cumulative_xp: 0,
+                    points_gained_from_training: 0,
+                    training_notes: String::new(),
+                });
+            entry.current_xp = entry.current_xp.saturating_add(st_xp);
+            entry.cumulative_xp = entry.cumulative_xp.saturating_add(st_xp);
+            let mut earned_pts: i64 = 0;
+            while entry.current_xp >= entry.xp_to_next.max(1) {
+                let need = entry.xp_to_next.max(1);
+                entry.current_xp -= need;
+                entry.points_gained_from_training += 1;
+                earned_pts += 1;
+                entry.xp_to_next = crate::routines::stat_training_threshold_for_points(
+                    entry.points_gained_from_training,
+                );
+            }
+            if earned_pts > 0 {
+                if ruleset.auto_apply_stat_points {
+                    let _ = self.modify_stat(
+                        cid,
+                        st_name,
+                        Some(earned_pts),
+                        None,
+                        "Earned from sustained activity Stat Training XP",
+                    );
+                } else {
+                    prof.unspent_stat_points += earned_pts;
+                }
+                let _ = self.emit_signal(crate::signals::EngineSignal {
+                    id: String::new(),
+                    dedup_key: format!("stat_pt_earned:{cid}:{st_name}:{}", entry.points_gained_from_training),
+                    code: "STAT_POINT_EARNED".to_string(),
+                    severity: "info".to_string(),
+                    category: "progression".to_string(),
+                    title: format!("{} — Earned +{earned_pts} Stat Point ({st_name} Training)", proj.baseline.name),
+                    summary: if ruleset.auto_apply_stat_points {
+                        format!("{}'s {st_name} increased by +{earned_pts} from sustained practice.", proj.baseline.name)
+                    } else {
+                        format!(
+                            "{} completed {st_name} training threshold (+{earned_pts} unspent stat point(s), total {}).",
+                            proj.baseline.name, prof.unspent_stat_points
+                        )
+                    },
+                    entity_ids: vec![cid.to_string()],
+                    location_id: proj.current.current_location.clone(),
+                    suggested_actions: vec![],
+                    visibility: "player".to_string(),
+                    status: "active".to_string(),
+                    source_event_seq,
+                    created_at_world_time: now_str.clone(),
+                    updated_at_world_time: now_str.clone(),
+                });
+            }
+            stat_xp_out = Some((st_name.clone(), st_xp));
+            changed = true;
+        }
+
+        // 2. Matching Active CharacterJob XP trickle (50% of skill XP)
+        let mut job_xp_out: Vec<(String, u64)> = Vec::new();
+        let sk_lower = skill_name.trim().to_lowercase();
+        let gov_lower = gov_stat.as_deref().unwrap_or("").to_lowercase();
+        let job_xp = ((skill_xp_gained as f64) * 0.50).ceil().max(1.0) as u64;
+        for job in prof.jobs.iter_mut().filter(|j| j.active) {
+            let matches_stat = !gov_lower.is_empty()
+                && job
+                    .governing_stats
+                    .iter()
+                    .any(|gs| gs.eq_ignore_ascii_case(&gov_lower));
+            let matches_text = job.name.to_lowercase().contains(&sk_lower)
+                || sk_lower.contains(&job.name.to_lowercase())
+                || job.notes.to_lowercase().contains(&sk_lower)
+                || job
+                    .perks_and_features
+                    .iter()
+                    .any(|p| p.to_lowercase().contains(&sk_lower));
+            if matches_stat || matches_text {
+                let old_lvl = job.level;
+                job.current_xp = job.current_xp.saturating_add(job_xp);
+                job.cumulative_xp = job.cumulative_xp.saturating_add(job_xp);
+                while job.current_xp >= job.xp_to_next.max(1) {
+                    let need = job.xp_to_next.max(1);
+                    job.current_xp -= need;
+                    job.level += 1;
+                    job.xp_to_next = ((need as f64) * 1.35).round().max(100.0) as u64;
+                }
+                if job.level > old_lvl {
+                    let _ = self.emit_signal(crate::signals::EngineSignal {
+                        id: String::new(),
+                        dedup_key: format!("job_lvl_up:{cid}:{}:{}", job.job_id, job.level),
+                        code: "JOB_LEVEL_UP".to_string(),
+                        severity: "warning".to_string(),
+                        category: "progression".to_string(),
+                        title: format!("{} — Job '{}' Reached Level {}!", proj.baseline.name, job.name, job.level),
+                        summary: format!(
+                            "{}'s '{}' advanced from Lv {} to Lv {}.",
+                            proj.baseline.name, job.name, old_lvl, job.level
+                        ),
+                        entity_ids: vec![cid.to_string()],
+                        location_id: proj.current.current_location.clone(),
+                        suggested_actions: vec![],
+                        visibility: "player".to_string(),
+                        status: "active".to_string(),
+                        source_event_seq,
+                        created_at_world_time: now_str.clone(),
+                        updated_at_world_time: now_str.clone(),
+                    });
+                }
+                job_xp_out.push((job.name.clone(), job_xp));
+                changed = true;
+            }
+        }
+
+        if changed {
+            prof.updated_at_world_time = now_str;
+            self.db.upsert_character_profile(&prof)?;
+        }
+        Ok((stat_xp_out, job_xp_out))
+    }
+
+    /// Attempts to satisfy `needed_amount` in `target_currency` by converting other denominations
+    /// within the **exact same currency family** (`currency_family`) using `RulesetProfile.currency_rates`.
+    /// Preserves 100% exact integer wealth in base units (zero silent creation or loss).
+    pub(crate) fn try_make_currency_change(
+        &self,
+        owner_id: &str,
+        target_currency: &str,
+        needed_amount: i64,
+        now_str: &str,
+    ) -> Result<Option<String>> {
+        if needed_amount <= 0 {
+            return Ok(None);
+        }
+        let ruleset = self.get_ruleset_profile_or_default(None)?;
+        let Some(&target_rate) = ruleset.currency_rates.get(target_currency) else {
+            return Ok(None);
+        };
+        if target_rate <= 0 {
+            return Ok(None);
+        }
+        let fam = currency_family(target_currency);
+        let balances = self.db.list_currency_balances(owner_id)?;
+        let cur_target_bal = balances.get(target_currency).copied().unwrap_or(0);
+        if cur_target_bal >= needed_amount {
+            return Ok(None);
+        }
+
+        // Gather all other currencies held by `owner_id` in the same family with positive rates
+        let mut other_coins: Vec<(String, i64, i64)> = balances
+            .iter()
+            .filter(|(c, &amt)| {
+                amt > 0
+                    && c.as_str() != target_currency
+                    && currency_family(c) == fam
+                    && ruleset.currency_rates.get(c.as_str()).copied().unwrap_or(0) > 0
+            })
+            .map(|(c, &amt)| {
+                let r = ruleset.currency_rates[c.as_str()];
+                (c.clone(), amt, r)
+            })
+            .collect();
+        if other_coins.is_empty() {
+            return Ok(None);
+        }
+
+        let deficit_target = needed_amount - cur_target_bal;
+        let deficit_base: i128 = (deficit_target as i128) * (target_rate as i128);
+        let other_total_base: i128 = other_coins
+            .iter()
+            .map(|(_, amt, r)| (*amt as i128) * (*r as i128))
+            .sum();
+        if other_total_base < deficit_base {
+            return Ok(None);
+        }
+
+        // Prefer consolidating smaller coins first, then breaking the smallest sufficient higher coin
+        other_coins.sort_by_key(|(_, _, r)| *r);
+        let mut gathered_base: i128 = 0;
+        let mut spent_parts: Vec<String> = Vec::new();
+        let mut updated_others: Vec<(String, i64)> = Vec::new();
+
+        for (coin_name, avail, rate) in other_coins {
+            if gathered_base >= deficit_base {
+                break;
+            }
+            let still_needed_base = deficit_base - gathered_base;
+            let rate_128 = rate as i128;
+            let needed_units = ((still_needed_base + rate_128 - 1) / rate_128).min(avail as i128) as i64;
+            if needed_units > 0 {
+                gathered_base += (needed_units as i128) * rate_128;
+                updated_others.push((coin_name.clone(), avail - needed_units));
+                spent_parts.push(format!("{needed_units} {coin_name}"));
+            }
+        }
+
+        if gathered_base < deficit_base {
+            return Ok(None);
+        }
+
+        // Convert gathered_base into as many `target_currency` units as possible, returning any sub-unit remainder in base currency (rate == 1)
+        let target_rate_128 = target_rate as i128;
+        let added_target = (gathered_base / target_rate_128) as i64;
+        let remainder_base = (gathered_base % target_rate_128) as i64;
+
+        let base_unit_key: Option<String> = if remainder_base > 0 {
+            let found = ruleset
+                .currency_rates
+                .iter()
+                .find(|(k, &r)| r == 1 && currency_family(k) == fam)
+                .map(|(k, _)| k.clone());
+            if found.is_none() {
+                // Cannot represent remainder without losing value; abort conversion safely
+                return Ok(None);
+            }
+            found
+        } else {
+            None
+        };
+
+        for (coin_name, new_amt) in updated_others {
+            self.db
+                .set_currency_balance(owner_id, &coin_name, new_amt, now_str)?;
+        }
+        let new_target_bal = cur_target_bal + added_target;
+        self.db
+            .set_currency_balance(owner_id, target_currency, new_target_bal, now_str)?;
+
+        let mut recv_parts = vec![format!("+{added_target} {target_currency}")];
+        if let Some(ref bkey) = base_unit_key {
+            let cur_b = self.db.get_currency_balance(owner_id, bkey)?;
+            self.db
+                .set_currency_balance(owner_id, bkey, cur_b + remainder_base, now_str)?;
+            recv_parts.push(format!("+{remainder_base} {bkey} change"));
+        }
+
+        Ok(Some(format!(
+            "Auto-exchanged {} -> {}",
+            spent_parts.join(" + "),
+            recv_parts.join(", ")
+        )))
+    }
+}
+
+fn default_purposes_for_mode(mode: &str) -> Vec<String> {
+    match mode {
+        "business_circuit" => vec!["business".into(), "procurement".into(), "networking".into()],
+        "networking_envoy" => vec!["networking".into(), "diplomacy".into(), "business".into()],
+        "inspector" => vec!["inspection".into(), "sect_business".into(), "networking".into()],
+        "wanderer" => vec!["networking".into(), "rumor_gathering".into(), "business".into()],
+        "local_commuter" => vec!["business".into(), "errands".into()],
+        _ => vec!["business".into(), "networking".into()],
     }
 }
 

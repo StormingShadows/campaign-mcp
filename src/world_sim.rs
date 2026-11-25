@@ -365,12 +365,13 @@ pub fn compute_shortest_route(
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ItemEconomics {
+    #[serde(alias = "item_name", alias = "name")]
     pub item_key: String,
     #[serde(default)]
     pub weight_kg: f64,
-    #[serde(default)]
+    #[serde(default, alias = "bulk")]
     pub volume_liters: f64,
-    #[serde(default)]
+    #[serde(default, alias = "base_price", alias = "price")]
     pub unit_value: i64,
     #[serde(default = "default_currency")]
     pub currency: String,
@@ -399,6 +400,36 @@ pub struct EncumbranceReport {
     pub item_weights: Vec<(String, f64)>,
 }
 
+/// Heuristic fallback item weight (in kg) when an item does not have an explicit `ItemEconomics` entry.
+pub fn estimate_item_weight_kg(it: &crate::models::Item) -> f64 {
+    let mut hay = it.name.to_ascii_lowercase();
+    if let Some(ref sl) = it.slot {
+        hay.push(' ');
+        hay.push_str(&sl.to_ascii_lowercase());
+    }
+    for t in &it.tags {
+        hay.push(' ');
+        hay.push_str(&t.to_ascii_lowercase());
+    }
+    if hay.contains("plate") || hay.contains("heavy armor") || hay.contains("anvil") {
+        18.0
+    } else if hay.contains("chainmail") || hay.contains("scale mail") || hay.contains("medium armor") || hay.contains("timber") || hay.contains("beam") {
+        10.0
+    } else if hay.contains("greatsword") || hay.contains("halberd") || hay.contains("maul") || hay.contains("heavy weapon") || hay.contains("ingot") || hay.contains("ore") {
+        4.5
+    } else if hay.contains("leather armor") || hay.contains("brigandine") || hay.contains("shield") || hay.contains("tool kit") || hay.contains("carpenter") {
+        3.5
+    } else if hay.contains("sword") || hay.contains("saber") || hay.contains("axe") || hay.contains("hatchet") || hay.contains("spear") || hay.contains("bow") || hay.contains("rifle") || hay.contains("hammer") || hay.contains("saw") || hay.contains("weapon") || hay.contains("bedroll") || hay.contains("blanket") {
+        1.4
+    } else if hay.contains("jacket") || hay.contains("coat") || hay.contains("robe") || hay.contains("tunic") || hay.contains("trousers") || hay.contains("pants") || hay.contains("boots") || hay.contains("cloak") || hay.contains("clothing") || hay.contains("apparel") {
+        0.8
+    } else if hay.contains("coin") || hay.contains("cash") || hay.contains("tael") || hay.contains("scroll") || hay.contains("letter") || hay.contains("slip") || hay.contains("ring") || hay.contains("pill") || hay.contains("needle") {
+        0.08
+    } else {
+        0.5
+    }
+}
+
 pub fn compute_encumbrance(
     proj: &CharacterProjection,
     econ_map: &BTreeMap<String, ItemEconomics>,
@@ -423,7 +454,7 @@ pub fn compute_encumbrance(
         let unit_w = econ_map
             .get(&key)
             .map(|e| e.weight_kg)
-            .unwrap_or(0.5); // sensible 0.5 kg default for uncataloged gear
+            .unwrap_or_else(|| estimate_item_weight_kg(it));
         let w = (unit_w * it.quantity.max(1) as f64 * 100.0).round() / 100.0;
         total += w;
         breakdown.push((format!("{} x{}", it.name, it.quantity), w));
@@ -538,8 +569,8 @@ pub fn evaluate_market_prices(
     let mut prices = Vec::new();
 
     for c in &market.commodities {
-        let sd_ratio = (c.demand.max(1) as f64) / (c.supply.max(10) as f64);
-        let sd_mult = sd_ratio.clamp(0.4, 4.0);
+        let sd_ratio = (c.demand.max(1) as f64) / (c.supply.max(1) as f64);
+        let sd_mult = sd_ratio.powf(0.55).clamp(0.55, 2.50);
         let seas_mult = c
             .seasonal_multipliers
             .iter()
@@ -1071,4 +1102,705 @@ fn parse_word_or_number(tok: &str) -> Option<f64> {
         "thirty" => Some(30.0),
         _ => None,
     }
+}
+
+// ============================================================================
+// 7. Stateful Progression System (Xianxia Realms 1-9, Parallel Manuals,
+//    Sci-Fi Tiers, D&D Levels, Bottlenecks & Breakthroughs)
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgressionStageDef {
+    /// Display name of this major realm, tier, or level bracket (e.g. "Qi Condensation", "Level 5", "Psionic Grade II").
+    pub name: String,
+    /// Number of sub-stages inside this major stage (e.g. 9 for Xianxia Layers 1..=9, 1 for flat D&D levels).
+    #[serde(default = "default_sub_stages")]
+    pub sub_stages: u32,
+    /// Prefix for sub-stage formatting (e.g. "Layer", "Stage", "Grade"; empty omits sub-stage label when sub_stages == 1).
+    #[serde(default = "default_sub_stage_prefix")]
+    pub sub_stage_prefix: String,
+    /// Optional explicit names for each sub-stage (e.g. ["Early", "Mid", "Late", "Peak"]).
+    #[serde(default)]
+    pub sub_stage_names: Vec<String>,
+    /// XP required per sub-stage (used when `xp_thresholds` is empty).
+    #[serde(default = "default_xp_per_sub")]
+    pub xp_per_sub_stage: u64,
+    /// Optional per-sub-stage XP costs (length == sub_stages) for non-linear curves.
+    #[serde(default)]
+    pub xp_thresholds: Vec<u64>,
+    /// When true, advancing past the final sub-stage stops at a bottleneck until `attempt_breakthrough` succeeds!
+    #[serde(default = "default_true_ws")]
+    pub breakthrough_required_at_peak: bool,
+    /// Grounded DC tier for breakthrough (e.g. "moderate", "hard", "very_hard", "nearly_impossible").
+    #[serde(default)]
+    pub breakthrough_dc_tier: Option<String>,
+    /// Optional explicit breakthrough DC (overrides tier if set).
+    #[serde(default)]
+    pub breakthrough_dc: Option<i64>,
+    /// Mechanical check modifier granted at this major stage (e.g. +1, +2, +4).
+    #[serde(default)]
+    pub passive_modifier: i64,
+    /// Optional lifespan benchmark (for cultivation realms / longevity settings).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifespan_years: Option<u32>,
+    /// Narrative/mechanical properties unlocked upon entering this stage.
+    #[serde(default)]
+    pub properties: Vec<String>,
+    /// Binding halt-conditions or prerequisites for this stage (e.g. Pavilion check-ins, tribulations, cyberware tolerances).
+    #[serde(default)]
+    pub halt_conditions: Vec<String>,
+    /// Optional declarative state-machine bundle executed automatically when entering sub_stage 1 of this major stage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_rule: Option<crate::routines::StageTransitionRule>,
+    /// Optional per-sub-stage (1-based) declarative rules executed automatically when entering each minor layer/grade.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sub_stage_rules: BTreeMap<u32, crate::routines::StageTransitionRule>,
+}
+
+fn default_sub_stages() -> u32 {
+    9
+}
+
+fn default_sub_stage_prefix() -> String {
+    "Layer".to_string()
+}
+
+fn default_xp_per_sub() -> u64 {
+    100
+}
+
+fn default_true_ws() -> bool {
+    true
+}
+
+impl ProgressionStageDef {
+    pub fn xp_for_sub_stage(&self, sub_stage_1based: u32) -> u64 {
+        let idx = sub_stage_1based.saturating_sub(1) as usize;
+        if let Some(&v) = self.xp_thresholds.get(idx) {
+            return v.max(1);
+        }
+        self.xp_per_sub_stage.max(1)
+    }
+
+    pub fn format_sub_stage(&self, sub_stage: u32) -> String {
+        if self.sub_stages <= 1 {
+            return String::new();
+        }
+        let idx = sub_stage.saturating_sub(1) as usize;
+        if let Some(custom) = self.sub_stage_names.get(idx) {
+            return custom.clone();
+        }
+        if self.sub_stage_prefix.trim().is_empty() {
+            format!("{sub_stage}/{}", self.sub_stages)
+        } else {
+            format!("{} {sub_stage}/{}", self.sub_stage_prefix, self.sub_stages)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgressionLadder {
+    #[serde(default)]
+    pub id: String,
+    pub name: String,
+    /// e.g. "realm_ladder", "parallel_manual", "body_refinement", "character_level", "scifi_tier"
+    #[serde(default = "default_ladder_kind")]
+    pub kind: String,
+    #[serde(default)]
+    pub description: String,
+    /// Optional linked StoryText ID if this ladder belongs to a specific cultivation manual / codex.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_text_id: Option<String>,
+    /// Optional linked CatalogItem ID if this manual is tracked as a physical carryable relic/tome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_item_id: Option<String>,
+    /// Auto-resolved human-readable title of the linked manual/scroll.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub manual_title: String,
+    /// Canonical notes about cultivating this manual (meridian paths, affinity, incompatibilities, quirks).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub manual_notes: String,
+    /// Skills/tags where tracks on this ladder automatically contribute their `check_modifier`.
+    #[serde(default)]
+    pub default_check_tags: Vec<String>,
+    pub stages: Vec<ProgressionStageDef>,
+    #[serde(default)]
+    pub updated_at_world_time: String,
+}
+
+fn default_ladder_kind() -> String {
+    "realm_ladder".to_string()
+}
+
+impl ProgressionLadder {
+    pub fn from_preset(preset: &str, custom_id: Option<&str>) -> anyhow::Result<Self> {
+        let now = String::new();
+        match preset.trim().to_lowercase().as_str() {
+            "xianxia_standard" | "xianxia" | "cultivation" => Ok(Self {
+                id: custom_id.unwrap_or("qi-cultivation").to_string(),
+                name: "Orthodox Qi Cultivation Ladder (1-9 Layers)".to_string(),
+                kind: "realm_ladder".to_string(),
+                description: "Standard xianxia major realms with 9 minor layers each, bottleneck breakthroughs at Layer 9, and non-spendable cumulative Cultivation XP.".to_string(),
+                source_text_id: None,
+                source_item_id: None,
+                manual_title: String::new(),
+                manual_notes: String::new(),
+                default_check_tags: vec!["qi-sense".into(), "meditation".into(), "cultivation".into(), "formation".into()],
+                stages: vec![
+                    ProgressionStageDef {
+                        name: "Mortal".into(),
+                        sub_stages: 1,
+                        sub_stage_prefix: String::new(),
+                        sub_stage_names: vec!["Unawakened".into()],
+                        xp_per_sub_stage: 50,
+                        xp_thresholds: vec![],
+                        breakthrough_required_at_peak: true,
+                        breakthrough_dc_tier: Some("moderate".into()),
+                        breakthrough_dc: None,
+                        passive_modifier: 0,
+                        lifespan_years: Some(80),
+                        properties: vec!["Mortal meridians (unopened)".into()],
+                        halt_conditions: vec!["Must sense ambient qi and open initiating meridians".into()],
+                        stage_rule: None,
+                        sub_stage_rules: BTreeMap::new(),
+                    },
+                    ProgressionStageDef {
+                        name: "Qi Condensation".into(),
+                        sub_stages: 9,
+                        sub_stage_prefix: "Layer".into(),
+                        sub_stage_names: vec![],
+                        xp_per_sub_stage: 100,
+                        xp_thresholds: vec![100, 150, 200, 300, 400, 550, 750, 1000, 1300],
+                        breakthrough_required_at_peak: true,
+                        breakthrough_dc_tier: Some("hard".into()),
+                        breakthrough_dc: None,
+                        passive_modifier: 1,
+                        lifespan_years: Some(120),
+                        properties: vec!["Qi Sensing & Meridian Circulation".into(), "Basic Spiritual Sense".into()],
+                        halt_conditions: vec!["Layer 9 peak requires Foundation Establishment breakthrough".into()],
+                        stage_rule: None,
+                        sub_stage_rules: BTreeMap::new(),
+                    },
+                    ProgressionStageDef {
+                        name: "Foundation Establishment".into(),
+                        sub_stages: 9,
+                        sub_stage_prefix: "Layer".into(),
+                        sub_stage_names: vec![],
+                        xp_per_sub_stage: 1500,
+                        xp_thresholds: vec![1500, 2000, 2500, 3200, 4000, 5000, 6200, 7600, 9200],
+                        breakthrough_required_at_peak: true,
+                        breakthrough_dc_tier: Some("very_hard".into()),
+                        breakthrough_dc: None,
+                        passive_modifier: 3,
+                        lifespan_years: Some(220),
+                        properties: vec!["Liquefied True Qi".into(), "Artifact Resonance & Short Flight".into()],
+                        halt_conditions: vec!["Layer 9 peak requires Golden Core condensation".into()],
+                        stage_rule: None,
+                        sub_stage_rules: BTreeMap::new(),
+                    },
+                    ProgressionStageDef {
+                        name: "Golden Core".into(),
+                        sub_stages: 9,
+                        sub_stage_prefix: "Layer".into(),
+                        sub_stage_names: vec![],
+                        xp_per_sub_stage: 12000,
+                        xp_thresholds: vec![],
+                        breakthrough_required_at_peak: true,
+                        breakthrough_dc_tier: Some("very_hard".into()),
+                        breakthrough_dc: Some(26),
+                        passive_modifier: 5,
+                        lifespan_years: Some(500),
+                        properties: vec!["Crystallized Golden Core".into(), "Extended Spiritual Sense & Aerial Mastery".into()],
+                        halt_conditions: vec!["Layer 9 peak requires Nascent Soul formation".into()],
+                        stage_rule: None,
+                        sub_stage_rules: BTreeMap::new(),
+                    },
+                    ProgressionStageDef {
+                        name: "Nascent Soul".into(),
+                        sub_stages: 9,
+                        sub_stage_prefix: "Layer".into(),
+                        sub_stage_names: vec![],
+                        xp_per_sub_stage: 50000,
+                        xp_thresholds: vec![],
+                        breakthrough_required_at_peak: true,
+                        breakthrough_dc_tier: Some("nearly_impossible".into()),
+                        breakthrough_dc: None,
+                        passive_modifier: 7,
+                        lifespan_years: Some(1000),
+                        properties: vec!["Manifest Nascent Soul".into(), "Domain Projection & Instant Teleportation".into()],
+                        halt_conditions: vec![],
+                        stage_rule: None,
+                        sub_stage_rules: BTreeMap::new(),
+                    },
+                ],
+                updated_at_world_time: now,
+            }),
+            "body_tempering" | "body_refinement" => Ok(Self {
+                id: custom_id.unwrap_or("body-tempering").to_string(),
+                name: "Parallel Body Tempering Discipline (1-9 Layers)".to_string(),
+                kind: "body_refinement".to_string(),
+                description: "Parallel physical refinement track practiced alongside qi cultivation; enhances physical resilience and exertion without replacing the main qi ladder.".to_string(),
+                source_text_id: None,
+                source_item_id: None,
+                manual_title: String::new(),
+                manual_notes: String::new(),
+                default_check_tags: vec!["athletics".into(), "physical-exertion".into(), "body-tempering".into(), "endurance".into()],
+                stages: vec![
+                    ProgressionStageDef {
+                        name: "Skin & Sinew Conditioning".into(),
+                        sub_stages: 9,
+                        sub_stage_prefix: "Layer".into(),
+                        sub_stage_names: vec![],
+                        xp_per_sub_stage: 80,
+                        xp_thresholds: vec![40, 60, 90, 140, 210, 320, 480, 720, 1080],
+                        breakthrough_required_at_peak: true,
+                        breakthrough_dc_tier: Some("moderate".into()),
+                        breakthrough_dc: None,
+                        passive_modifier: 1,
+                        lifespan_years: None,
+                        properties: vec!["Hardened fascia & reduced fatigue".into()],
+                        halt_conditions: vec!["Over-training without restorative diet causes strain injury".into()],
+                        stage_rule: None,
+                        sub_stage_rules: BTreeMap::new(),
+                    },
+                    ProgressionStageDef {
+                        name: "Bone & Marrow Forging".into(),
+                        sub_stages: 9,
+                        sub_stage_prefix: "Layer".into(),
+                        sub_stage_names: vec![],
+                        xp_per_sub_stage: 250,
+                        xp_thresholds: vec![150, 225, 340, 510, 760, 1140, 1710, 2560, 3840],
+                        breakthrough_required_at_peak: true,
+                        breakthrough_dc_tier: Some("hard".into()),
+                        breakthrough_dc: None,
+                        passive_modifier: 2,
+                        lifespan_years: None,
+                        properties: vec!["Dense skeletal frame & high impact tolerance".into()],
+                        halt_conditions: vec![],
+                        stage_rule: None,
+                        sub_stage_rules: BTreeMap::new(),
+                    },
+                    ProgressionStageDef {
+                        name: "Viscera & Blood Purification".into(),
+                        sub_stages: 9,
+                        sub_stage_prefix: "Layer".into(),
+                        sub_stage_names: vec![],
+                        xp_per_sub_stage: 800,
+                        xp_thresholds: vec![500, 750, 1125, 1690, 2530, 3800, 5700, 8550, 12800],
+                        breakthrough_required_at_peak: true,
+                        breakthrough_dc_tier: Some("very_hard".into()),
+                        breakthrough_dc: None,
+                        passive_modifier: 4,
+                        lifespan_years: None,
+                        properties: vec!["High toxin resistance & rapid natural recovery".into()],
+                        halt_conditions: vec![],
+                        stage_rule: None,
+                        sub_stage_rules: BTreeMap::new(),
+                    },
+                ],
+                updated_at_world_time: now,
+            }),
+            "dnd_level_20" | "dnd5e" | "level_20" => {
+                let xp_table: [u64; 20] = [
+                    300, 600, 1800, 3800, 7500, 9000, 11000, 14000, 16000, 21000,
+                    15000, 20000, 20000, 25000, 30000, 30000, 40000, 40000, 50000, 50000,
+                ];
+                let stages = (1u32..=20)
+                    .map(|lvl| {
+                        let prof = 2 + ((lvl - 1) / 4) as i64;
+                        let asi_rule = if matches!(lvl, 4 | 8 | 12 | 16 | 19) {
+                            Some(crate::routines::StageTransitionRule {
+                                unspent_stat_points_delta: 2,
+                                narrative_directive: format!(
+                                    "Reached Level {lvl} Ability Score Improvement (+2 unspent stat points unlocked)."
+                                ),
+                                ..Default::default()
+                            })
+                        } else {
+                            None
+                        };
+                        ProgressionStageDef {
+                            name: format!("Level {lvl}"),
+                            sub_stages: 1,
+                            sub_stage_prefix: String::new(),
+                            sub_stage_names: vec![],
+                            xp_per_sub_stage: xp_table[(lvl - 1) as usize],
+                            xp_thresholds: vec![],
+                            breakthrough_required_at_peak: false,
+                            breakthrough_dc_tier: None,
+                            breakthrough_dc: None,
+                            passive_modifier: prof,
+                            lifespan_years: None,
+                            properties: vec![format!("Proficiency Tier +{prof}")],
+                            halt_conditions: vec![],
+                            stage_rule: asi_rule,
+                            sub_stage_rules: BTreeMap::new(),
+                        }
+                    })
+                    .collect();
+                Ok(Self {
+                    id: custom_id.unwrap_or("character-level").to_string(),
+                    name: "Standard RPG Character Level (1-20)".to_string(),
+                    kind: "character_level".to_string(),
+                    description: "Classic 1-20 level progression with automatic level-ups and scaling proficiency (+2 to +6).".to_string(),
+                    source_text_id: None,
+                    source_item_id: None,
+                    manual_title: String::new(),
+                    manual_notes: String::new(),
+                    default_check_tags: vec![],
+                    stages,
+                    updated_at_world_time: now,
+                })
+            }
+            "scifi_tier" | "scifi" | "cyberpunk" => Ok(Self {
+                id: custom_id.unwrap_or("scifi-tier").to_string(),
+                name: "Sci-Fi Operational / Neural Tier Ladder (Grades 1-5)".to_string(),
+                kind: "scifi_tier".to_string(),
+                description: "Modular sci-fi progression for psionic grades, neural-link clearance, or operative tiers with 5 sub-grades per tier.".to_string(),
+                source_text_id: None,
+                source_item_id: None,
+                manual_title: String::new(),
+                manual_notes: String::new(),
+                default_check_tags: vec!["hacking".into(), "piloting".into(), "psionics".into(), "engineering".into()],
+                stages: (1u32..=5)
+                    .map(|tier| ProgressionStageDef {
+                        name: format!("Tier {tier}"),
+                        sub_stages: 5,
+                        sub_stage_prefix: "Grade".into(),
+                        sub_stage_names: vec![],
+                        xp_per_sub_stage: 200 * (tier as u64),
+                        xp_thresholds: vec![],
+                        breakthrough_required_at_peak: true,
+                        breakthrough_dc_tier: Some(match tier {
+                            1 => "easy",
+                            2 => "moderate",
+                            3 => "hard",
+                            4 => "very_hard",
+                            _ => "nearly_impossible",
+                        }.into()),
+                        breakthrough_dc: None,
+                        passive_modifier: tier as i64,
+                        lifespan_years: None,
+                        properties: vec![format!("Tier {tier} neural/clearance bandwidth unlocked")],
+                        halt_conditions: vec![format!("Requires Tier {} certification/integration check at Grade 5", tier + 1)],
+                        stage_rule: None,
+                        sub_stage_rules: BTreeMap::new(),
+                    })
+                    .collect(),
+                updated_at_world_time: now,
+            }),
+            other => anyhow::bail!(
+                "Unknown progression ladder preset '{other}'. Supported: xianxia_standard, body_tempering, dnd_level_20, scifi_tier"
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CharacterProgressionTrack {
+    pub character_id: String,
+    pub track_id: String,
+    pub name: String,
+    /// e.g. "primary_realm" | "parallel_manual" | "body_refinement" | "level" | "discipline"
+    #[serde(default = "default_track_kind")]
+    pub track_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ladder_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_text_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_item_id: Option<String>,
+    /// Auto-resolved human-readable title of the linked cultivation manual/scroll.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub manual_title: String,
+    /// Notes specific to the particular manual being cultivated (breathing rhythm, meridian notes, incompatibilities, comprehension insights).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub manual_notes: String,
+    #[serde(default)]
+    pub major_stage_index: u32,
+    pub major_stage_name: String,
+    #[serde(default = "default_sub_one")]
+    pub sub_stage: u32,
+    #[serde(default = "default_sub_stages")]
+    pub sub_stage_max: u32,
+    #[serde(default)]
+    pub sub_stage_label: String,
+    #[serde(default)]
+    pub current_xp: u64,
+    #[serde(default = "default_xp_per_sub")]
+    pub xp_to_next: u64,
+    #[serde(default)]
+    pub cumulative_xp: u64,
+    #[serde(default)]
+    pub at_bottleneck: bool,
+    #[serde(default)]
+    pub bottleneck_reason: String,
+    #[serde(default)]
+    pub halt_conditions: Vec<String>,
+    #[serde(default)]
+    pub active_properties: Vec<String>,
+    #[serde(default)]
+    pub check_modifier: i64,
+    #[serde(default)]
+    pub check_tags: Vec<String>,
+    /// "active" | "stalled" | "halted" | "completed" | "crippled"
+    #[serde(default = "default_track_status")]
+    pub status: String,
+    #[serde(default)]
+    pub notes: String,
+    #[serde(default)]
+    pub gm_notes: String,
+    /// Optional per-track declarative stage rules keyed by `"<sub_stage>"` (e.g. `"6"`) or `"<major_idx>:<sub_stage>"` (e.g. `"0:6"`).
+    /// Overrides any ladder-wide `ProgressionStageDef` rule for manual-specific transformations or curses!
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub stage_rules: BTreeMap<String, crate::routines::StageTransitionRule>,
+    #[serde(default)]
+    pub updated_at_world_time: String,
+}
+
+fn default_track_kind() -> String {
+    "primary_realm".to_string()
+}
+
+fn default_sub_one() -> u32 {
+    1
+}
+
+fn default_track_status() -> String {
+    "active".to_string()
+}
+
+impl CharacterProgressionTrack {
+    pub fn format_stage(&self) -> String {
+        if self.sub_stage_max <= 1 {
+            self.major_stage_name.clone()
+        } else if !self.sub_stage_label.is_empty() {
+            format!("{} ({})", self.major_stage_name, self.sub_stage_label)
+        } else {
+            format!(
+                "{} (Layer {}/{})",
+                self.major_stage_name, self.sub_stage, self.sub_stage_max
+            )
+        }
+    }
+}
+
+// ============================================================================
+// 8. Sparse Multi-Scale 2D (x, y) Map Grids & Compass Neighborhood Helpers
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MapGrid {
+    #[serde(default)]
+    pub id: String,
+    pub name: String,
+    /// "world" | "region" | "settlement" | "dungeon" | "space_sector" | "tactical"
+    #[serde(default = "default_grid_scale_kind")]
+    pub scale_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_place_id: Option<String>,
+    #[serde(default = "default_grid_w")]
+    pub width: u32,
+    #[serde(default = "default_grid_h")]
+    pub height: u32,
+    /// Human-readable scale per cell (e.g. "5 km", "100 m", "1 AU", "10 ft").
+    #[serde(default = "default_cell_scale")]
+    pub cell_scale_label: String,
+    /// Default biome/terrain inherited by unpainted sparse cells (avoids empty-grid tax!).
+    #[serde(default = "default_grid_terrain")]
+    pub default_terrain: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub updated_at_world_time: String,
+}
+
+fn default_grid_scale_kind() -> String {
+    "region".to_string()
+}
+
+fn default_grid_w() -> u32 {
+    16
+}
+
+fn default_grid_h() -> u32 {
+    12
+}
+
+fn default_cell_scale() -> String {
+    "5 km".to_string()
+}
+
+fn default_grid_terrain() -> String {
+    "wilderness".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MapGridCell {
+    pub grid_id: String,
+    pub x: i32,
+    pub y: i32,
+    #[serde(default = "default_grid_terrain")]
+    pub terrain: String,
+    #[serde(default)]
+    pub elevation: i32,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub place_id: Option<String>,
+    #[serde(default)]
+    pub landmark_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub faction_control: Option<String>,
+    /// "charted" | "surveyed" | "glimpsed" | "unexplored"
+    #[serde(default = "default_fog_status")]
+    pub fog_status: String,
+    #[serde(default = "default_true")]
+    pub passable: bool,
+    #[serde(default)]
+    pub hazards: Vec<String>,
+    #[serde(default)]
+    pub notes: String,
+    #[serde(default)]
+    pub gm_notes: String,
+    #[serde(default)]
+    pub updated_at_world_time: String,
+}
+
+fn default_fog_status() -> String {
+    "charted".to_string()
+}
+
+/// Converts a 2D map offset `(dx, dy)` (with +x = East, +y = South) into an 8-point compass bearing.
+pub fn compass_bearing(dx: i32, dy: i32) -> &'static str {
+    if dx == 0 && dy == 0 {
+        return "HERE";
+    }
+    let angle = (dy as f64).atan2(dx as f64).to_degrees(); // 0=E, 90=S, -90=N, +-180=W
+    if (-22.5..22.5).contains(&angle) {
+        "E"
+    } else if (22.5..67.5).contains(&angle) {
+        "SE"
+    } else if (67.5..112.5).contains(&angle) {
+        "S"
+    } else if (112.5..157.5).contains(&angle) {
+        "SW"
+    } else if !(-157.5..157.5).contains(&angle) {
+        "W"
+    } else if (-157.5..-112.5).contains(&angle) {
+        "NW"
+    } else if (-112.5..-67.5).contains(&angle) {
+        "N"
+    } else {
+        "NE"
+    }
+}
+
+/// Produces a compact, token-safe compass neighborhood summary around `(cx, cy)` for LLM context & docs.
+/// Strictly strips `gm_notes` and conceals `unexplored` cells when `include_gm_secrets == false`.
+pub fn format_grid_neighborhood_lines(
+    grid: &MapGrid,
+    cells: &[MapGridCell],
+    cx: i32,
+    cy: i32,
+    include_gm_secrets: bool,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "**Map Grid:** {} (`{}` | {} | {}x{}, 1 cell = {} | default: {}) — Position `({}, {})`",
+        grid.name,
+        grid.id,
+        grid.scale_kind,
+        grid.width,
+        grid.height,
+        grid.cell_scale_label,
+        grid.default_terrain,
+        cx,
+        cy
+    ));
+
+    // 1. Immediate 3x3 adjacent non-empty cells (N, NE, E, SE, S, SW, W, NW)
+    let dirs = [
+        (0, -1, "N"),
+        (1, -1, "NE"),
+        (1, 0, "E"),
+        (1, 1, "SE"),
+        (0, 1, "S"),
+        (-1, 1, "SW"),
+        (-1, 0, "W"),
+        (-1, -1, "NW"),
+    ];
+    let mut adj = Vec::new();
+    for (dx, dy, lbl) in dirs {
+        if let Some(c) = cells.iter().find(|c| c.x == cx + dx && c.y == cy + dy) {
+            if !include_gm_secrets && c.fog_status.eq_ignore_ascii_case("unexplored") {
+                adj.push(format!("{lbl} ({},{}): Unexplored", c.x, c.y));
+                continue;
+            }
+            let mut desc = c.terrain.clone();
+            if let Some(ref pid) = c.place_id {
+                desc.push_str(&format!(" [Place: `{pid}`]"));
+            }
+            if !c.landmark_name.is_empty() {
+                desc.push_str(&format!(" [Landmark: {}]", c.landmark_name));
+            } else if !c.label.is_empty() {
+                desc.push_str(&format!(" [{}]", c.label));
+            }
+            if !c.passable {
+                desc.push_str(" (IMPASSABLE)");
+            }
+            if !c.hazards.is_empty() {
+                desc.push_str(&format!(" (Hazards: {})", c.hazards.join(", ")));
+            }
+            if include_gm_secrets && !c.gm_notes.is_empty() {
+                desc.push_str(&format!(" *(GM: {})*", c.gm_notes));
+            }
+            adj.push(format!("{lbl} ({},{}): {desc}", c.x, c.y));
+        }
+    }
+    if !adj.is_empty() {
+        lines.push(format!("- **Adjacent Cells (3x3):** {}", adj.join(" | ")));
+    }
+
+    // 2. Nearest placed cities / landmarks on the same grid (beyond immediate cell)
+    let mut distant: Vec<(f64, String)> = Vec::new();
+    for c in cells {
+        if c.x == cx && c.y == cy {
+            continue;
+        }
+        if c.place_id.is_none() && c.landmark_name.is_empty() && c.label.is_empty() {
+            continue;
+        }
+        if !include_gm_secrets && c.fog_status.eq_ignore_ascii_case("unexplored") {
+            continue;
+        }
+        let dx = c.x - cx;
+        let dy = c.y - cy;
+        let dist = ((dx * dx + dy * dy) as f64).sqrt();
+        if dist <= 1.5 {
+            continue; // already covered in 3x3 adjacent list
+        }
+        let bearing = compass_bearing(dx, dy);
+        let name = if let Some(ref pid) = c.place_id {
+            if !c.label.is_empty() {
+                format!("{} (`{pid}`)", c.label)
+            } else {
+                format!("`{pid}`")
+            }
+        } else if !c.landmark_name.is_empty() {
+            c.landmark_name.clone()
+        } else {
+            c.label.clone()
+        };
+        distant.push((
+            dist,
+            format!("{name} at ({},{}) — {:.1} cells {bearing}", c.x, c.y, dist),
+        ));
+    }
+    distant.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+    if !distant.is_empty() {
+        let top: Vec<String> = distant.into_iter().take(6).map(|(_, s)| s).collect();
+        lines.push(format!("- **Bearings to Nearby Landmarks/Places:** {}", top.join(" | ")));
+    }
+    lines
 }

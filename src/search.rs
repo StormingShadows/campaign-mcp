@@ -173,10 +173,65 @@ pub struct ItemSearchFilter {
     pub keyword: Option<String>,
     #[serde(default)]
     pub tag: Option<String>,
+    /// Multi-tag filter (e.g. ["clothing", "winter-gear"]). Matched using `tag_match` ("all" default or "any").
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// "all" (AND, default) or "any" (OR) when `tags` has multiple entries.
+    #[serde(default)]
+    pub tag_match: Option<String>,
+    /// Exclude items carrying any of these tags.
+    #[serde(default)]
+    pub exclude_tags: Vec<String>,
+    #[serde(default)]
+    pub equipped: Option<bool>,
     #[serde(default)]
     pub related_to: Option<String>,
     #[serde(default)]
     pub limit: Option<usize>,
+}
+
+/// Multi-dimensional filter for searching character equipment & carried inventories by tag, slot, equip state, sizing, or text.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InventorySearchFilter {
+    /// Optional character slug; if omitted, searches across all characters' inventories.
+    #[serde(default)]
+    pub character_id: Option<String>,
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub tag: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// "all" (AND, default) or "any" (OR)
+    #[serde(default)]
+    pub tag_match: Option<String>,
+    #[serde(default)]
+    pub exclude_tags: Vec<String>,
+    #[serde(default)]
+    pub equipped: Option<bool>,
+    #[serde(default)]
+    pub slot: Option<String>,
+    #[serde(default)]
+    pub has_sizing: Option<bool>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InventorySearchHit {
+    pub character_id: String,
+    pub character_name: String,
+    pub primary_group: String,
+    pub item: crate::models::Item,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InventorySearchResult {
+    pub count: usize,
+    pub total_inventory_count: usize,
+    pub tag_facets: std::collections::BTreeMap<String, usize>,
+    pub group_counts: std::collections::BTreeMap<String, usize>,
+    pub items: Vec<InventorySearchHit>,
 }
 
 /// Multi-dimensional "Search By" filter for Entity Histories
@@ -1145,8 +1200,44 @@ pub fn search_items_filtered(db: &CampaignDb, filter: &ItemSearchFilter) -> Resu
             }
         }
         if let Some(ref tag) = filter.tag {
-            let tl = tag.trim().to_lowercase();
-            if !tl.is_empty() && !item.tags.iter().any(|t| t.to_lowercase().contains(&tl)) {
+            let tl = crate::models::normalize_item_tag(tag);
+            if !tl.is_empty()
+                && !item
+                    .tags
+                    .iter()
+                    .any(|t| crate::models::normalize_item_tag(t).contains(&tl))
+            {
+                continue;
+            }
+        }
+        if !filter.tags.is_empty() {
+            let wanted = crate::models::normalize_item_tags(&filter.tags);
+            if !wanted.is_empty() {
+                let item_norm = crate::models::normalize_item_tags(&item.tags);
+                let match_any = filter
+                    .tag_match
+                    .as_deref()
+                    .map(|m| m.eq_ignore_ascii_case("any") || m.eq_ignore_ascii_case("or"))
+                    .unwrap_or(false);
+                let ok = if match_any {
+                    wanted.iter().any(|w| item_norm.iter().any(|t| t == w || t.contains(w)))
+                } else {
+                    wanted.iter().all(|w| item_norm.iter().any(|t| t == w || t.contains(w)))
+                };
+                if !ok {
+                    continue;
+                }
+            }
+        }
+        if !filter.exclude_tags.is_empty() {
+            let excl = crate::models::normalize_item_tags(&filter.exclude_tags);
+            let item_norm = crate::models::normalize_item_tags(&item.tags);
+            if excl.iter().any(|x| item_norm.iter().any(|t| t == x)) {
+                continue;
+            }
+        }
+        if let Some(eq) = filter.equipped {
+            if item.equipped != eq {
                 continue;
             }
         }
@@ -1162,6 +1253,173 @@ pub fn search_items_filtered(db: &CampaignDb, filter: &ItemSearchFilter) -> Resu
         }
     }
     Ok(out)
+}
+
+pub fn compute_catalog_tag_facets(items: &[CatalogItem]) -> std::collections::BTreeMap<String, usize> {
+    let mut facets = std::collections::BTreeMap::new();
+    for item in items {
+        for tag in crate::models::normalize_item_tags(&item.tags) {
+            *facets.entry(tag).or_insert(0) += 1;
+        }
+    }
+    facets
+}
+
+pub fn search_character_inventory(
+    db: &CampaignDb,
+    filter: &InventorySearchFilter,
+) -> Result<InventorySearchResult> {
+    let chars: Vec<CharacterProjection> = if let Some(ref cid) = filter.character_id {
+        let trimmed = cid.trim();
+        if trimmed.is_empty() {
+            load_all_character_projections(db, None)?
+                .into_values()
+                .collect()
+        } else {
+            let target_slug = slugify(trimmed);
+            let resolved = db
+                .list_character_baselines()?
+                .into_iter()
+                .find(|c| {
+                    c.id == target_slug
+                        || c.id.eq_ignore_ascii_case(trimmed)
+                        || c.name.eq_ignore_ascii_case(trimmed)
+                })
+                .map(|c| c.id)
+                .unwrap_or(target_slug);
+            vec![crate::projection::load_character_projection(
+                db, &resolved, None,
+            )?]
+        }
+    } else {
+        load_all_character_projections(db, None)?
+            .into_values()
+            .collect()
+    };
+
+    let mut total_inventory_count = 0usize;
+    let mut tag_facets: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut group_counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut hits: Vec<InventorySearchHit> = Vec::new();
+
+    let mut wanted_tags = crate::models::normalize_item_tags(&filter.tags);
+    if let Some(ref single) = filter.tag {
+        let n = crate::models::normalize_item_tag(single);
+        if !n.is_empty() && !wanted_tags.iter().any(|w| w == &n) {
+            wanted_tags.push(n);
+        }
+    }
+    let excl_tags = crate::models::normalize_item_tags(&filter.exclude_tags);
+    let match_any = filter
+        .tag_match
+        .as_deref()
+        .map(|m| m.eq_ignore_ascii_case("any") || m.eq_ignore_ascii_case("or"))
+        .unwrap_or(false);
+    let ql = filter
+        .query
+        .as_deref()
+        .map(|s| s.trim().to_lowercase())
+        .unwrap_or_default();
+    let slot_l = filter
+        .slot
+        .as_deref()
+        .map(|s| s.trim().to_lowercase())
+        .unwrap_or_default();
+    let limit = filter.limit.unwrap_or(200);
+
+    for cp in chars {
+        for item in cp.current.equipment {
+            total_inventory_count += 1;
+            let norm_tags = crate::models::normalize_item_tags(&item.tags);
+            let group = crate::models::primary_item_group(
+                &norm_tags,
+                item.slot.as_deref(),
+                &item.name,
+            );
+            for t in &norm_tags {
+                *tag_facets.entry(t.clone()).or_insert(0) += 1;
+            }
+            *group_counts.entry(group.clone()).or_insert(0) += 1;
+
+            if let Some(eq) = filter.equipped {
+                if item.equipped != eq {
+                    continue;
+                }
+            }
+            if let Some(hs) = filter.has_sizing {
+                let sized = !item.garment_measurements.is_empty()
+                    || !item.garment_cut.trim().is_empty()
+                    || !item.garment_taper.trim().is_empty();
+                if sized != hs {
+                    continue;
+                }
+            }
+            if !slot_l.is_empty() {
+                let s_ok = item
+                    .slot
+                    .as_deref()
+                    .map(|s| s.to_lowercase().contains(&slot_l))
+                    .unwrap_or(false);
+                if !s_ok {
+                    continue;
+                }
+            }
+            if !ql.is_empty() {
+                let matched_q = item.name.to_lowercase().contains(&ql)
+                    || item.description.to_lowercase().contains(&ql)
+                    || item
+                        .slot
+                        .as_deref()
+                        .map(|s| s.to_lowercase().contains(&ql))
+                        .unwrap_or(false)
+                    || norm_tags.iter().any(|t| t.contains(&ql))
+                    || group.to_lowercase().contains(&ql)
+                    || item.garment_cut.to_lowercase().contains(&ql)
+                    || item.garment_taper.to_lowercase().contains(&ql);
+                if !matched_q {
+                    continue;
+                }
+            }
+            if !wanted_tags.is_empty() {
+                let ok = if match_any {
+                    wanted_tags
+                        .iter()
+                        .any(|w| norm_tags.iter().any(|t| t == w || t.contains(w)))
+                } else {
+                    wanted_tags
+                        .iter()
+                        .all(|w| norm_tags.iter().any(|t| t == w || t.contains(w)))
+                };
+                if !ok {
+                    continue;
+                }
+            }
+            if !excl_tags.is_empty()
+                && excl_tags
+                    .iter()
+                    .any(|x| norm_tags.iter().any(|t| t == x))
+            {
+                continue;
+            }
+
+            if hits.len() < limit {
+                hits.push(InventorySearchHit {
+                    character_id: cp.baseline.id.clone(),
+                    character_name: cp.baseline.name.clone(),
+                    primary_group: group,
+                    item,
+                });
+            }
+        }
+    }
+
+    Ok(InventorySearchResult {
+        count: hits.len(),
+        total_inventory_count,
+        tag_facets,
+        group_counts,
+        items: hits,
+    })
 }
 
 pub fn search_histories_filtered(
@@ -1608,6 +1866,7 @@ pub fn event_type_slug(p: &EventPayload) -> &'static str {
         EventPayload::ItemAcquired { .. } => "item_acquired",
         EventPayload::ItemRemoved { .. } => "item_removed",
         EventPayload::ItemEquipped { .. } => "item_equipped",
+        EventPayload::ItemTagsUpdated { .. } => "item_tags_updated",
         EventPayload::SkillUpdated { .. } => "skill_updated",
         EventPayload::TechniqueUpdated { .. } => "technique_updated",
         EventPayload::GoalUpdated { .. } => "goal_updated",
