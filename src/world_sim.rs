@@ -199,10 +199,56 @@ impl PartialOrd for PathNode {
 pub fn base_speed_kmh(transport_mode: &str) -> f64 {
     match transport_mode.trim().to_lowercase().as_str() {
         "mount" | "horse" | "riding" => 8.0,
-        "cart" | "wagon" | "caravan" => 4.2,
-        "boat" | "riverboat" | "ship" => 7.0,
-        "flying" | "sword-flight" | "airship" => 35.0,
+        "wheeled" | "carriage" | "coach" | "vehicle" => 7.0,
+        "cart" | "wagon" | "caravan" => 4.5,
+        "water" | "boat" | "riverboat" | "ship" => 7.0,
+        "air" | "flying" | "sword-flight" | "airship" | "shuttle" => 35.0,
+        "fast_transit" => 20.0,
         _ => 4.5, // foot
+    }
+}
+
+pub fn effective_travel_speed_kmh(transport_mode: &str, custom_speed_kmh: Option<f64>) -> f64 {
+    custom_speed_kmh
+        .filter(|v| v.is_finite() && *v >= 0.5)
+        .unwrap_or_else(|| base_speed_kmh(transport_mode))
+}
+
+/// Parses a map grid's `cell_scale_label` (e.g. "5 km", "100 m", "10 miles") into kilometers per cell.
+/// Returns `None` for non-planetary scales (e.g. "1 AU", "1 parsec").
+pub fn grid_cell_scale_km(cell_scale_label: &str) -> Option<f64> {
+    let lower = cell_scale_label.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return None;
+    }
+    let mut num_buf = String::new();
+    let mut seen_digit = false;
+    for ch in lower.chars() {
+        if ch.is_ascii_digit() || (ch == '.' && seen_digit) {
+            num_buf.push(ch);
+            seen_digit = true;
+        } else if seen_digit {
+            break;
+        }
+    }
+    let val: f64 = num_buf.parse().ok()?;
+    if val <= 0.0 {
+        return None;
+    }
+    if lower.contains("km") || lower.contains("kilometer") || lower.contains("kilometre") {
+        Some(val)
+    } else if lower.contains("mile") || lower.ends_with(" mi") || lower.contains(" mi ") {
+        Some(val * 1.60934)
+    } else if lower.contains("league") {
+        Some(val * 4.828)
+    } else if lower.contains("li") && !lower.contains("mile") {
+        Some(val * 0.5)
+    } else if lower.contains("ft") || lower.contains("feet") || lower.contains("foot") {
+        Some(val * 0.0003048)
+    } else if lower.ends_with('m') || lower.contains(" m ") || lower.contains("meter") || lower.contains("metre") {
+        Some(val / 1000.0)
+    } else {
+        None
     }
 }
 
@@ -391,6 +437,8 @@ fn default_quality() -> String {
 pub struct EncumbranceReport {
     pub character_id: String,
     pub total_weight_kg: f64,
+    #[serde(default)]
+    pub stored_weight_kg: f64,
     pub carry_capacity_kg: f64,
     pub ratio: f64,
     /// "light" | "moderate" | "heavy" | "overloaded"
@@ -398,10 +446,129 @@ pub struct EncumbranceReport {
     pub travel_speed_multiplier: f64,
     pub physical_check_penalty: i64,
     pub item_weights: Vec<(String, f64)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stored_item_weights: Vec<(String, f64)>,
 }
 
-/// Heuristic fallback item weight (in kg) when an item does not have an explicit `ItemEconomics` entry.
+fn has_word(hay: &str, kw: &str) -> bool {
+    let hb = hay.as_bytes();
+    let kb = kw.as_bytes();
+    if kb.is_empty() || kb.len() > hb.len() {
+        return false;
+    }
+    let mut start = 0usize;
+    while let Some(rel) = hay[start..].find(kw) {
+        let idx = start + rel;
+        let left_ok = idx == 0 || !hb[idx - 1].is_ascii_alphanumeric();
+        let right_idx = idx + kb.len();
+        let right_ok = right_idx >= hb.len() || !hb[right_idx].is_ascii_alphanumeric();
+        if left_ok && right_ok {
+            return true;
+        }
+        start = idx + 1;
+    }
+    false
+}
+
+/// Returns true when an unequipped item is marked as stored/stashed (e.g. left at an inn, camp, chest, or vault)
+/// so it is excluded from active carried encumbrance while remaining tracked under `stored_weight_kg`.
+pub fn is_item_stored(it: &crate::models::Item) -> bool {
+    if it.equipped {
+        return false;
+    }
+    if it.tags.iter().any(|t| {
+        matches!(
+            t.trim().to_ascii_lowercase().as_str(),
+            "stored" | "stashed" | "lodging" | "camp-storage" | "chest" | "vault" | "bank" | "baggage"
+        )
+    }) {
+        return true;
+    }
+    let nl = it.description.to_ascii_lowercase();
+    nl.contains("[stored]")
+        || nl.contains("[stashed]")
+        || nl.contains("stored at")
+        || nl.contains("stashed at")
+        || nl.contains("left at")
+}
+
+/// Parses an explicit weight/volume stated in an item's description (e.g. `"6 kg dried meat"`,
+/// `"500 g salt"`, `"1.5 kg dried vegetables"`, `"500 ml cooking oil"`, `"approximately 2.2 kg"`).
+/// When `quantity > 1` and the description does NOT say `"each"` / `"per"`, divides the total stated
+/// weight by `quantity` so `unit_weight * quantity` reproduces the exact stated stack weight.
+pub fn parse_explicit_weight_from_description(desc: &str, quantity: i64) -> Option<f64> {
+    let lower = desc.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let len = bytes.len();
+    let mut i = 0usize;
+    let per_unit_hint = lower.contains("each") || lower.contains("per ");
+    while i < len {
+        if bytes[i].is_ascii_digit() {
+            // Skip numbers attached to preceding letters (e.g. "m2")
+            if i > 0 && bytes[i - 1].is_ascii_alphanumeric() {
+                i += 1;
+                continue;
+            }
+            let num_start = i;
+            let mut seen_dot = false;
+            while i < len
+                && (bytes[i].is_ascii_digit() || (bytes[i] == b'.' && !seen_dot))
+            {
+                if bytes[i] == b'.' {
+                    seen_dot = true;
+                }
+                i += 1;
+            }
+            let val: f64 = match lower[num_start..i].parse::<f64>() {
+                Ok(v) if v > 0.0 && v.is_finite() => v,
+                _ => continue,
+            };
+            let mut u = i;
+            while u < len && bytes[u].is_ascii_whitespace() {
+                u += 1;
+            }
+            let u_start = u;
+            while u < len && bytes[u].is_ascii_alphabetic() {
+                u += 1;
+            }
+            let unit = &lower[u_start..u];
+            let kg_opt = match unit {
+                "kg" | "kgs" | "kilogram" | "kilograms" | "kilo" | "kilos" => Some(val),
+                "g" | "gm" | "gms" | "gram" | "grams" => Some(val / 1000.0),
+                "mg" => Some(val / 1_000_000.0),
+                "lb" | "lbs" | "pound" | "pounds" => Some(val * 0.453592),
+                "oz" | "ounce" | "ounces" => Some(val * 0.0283495),
+                "jin" | "catty" | "catties" => Some(val * 0.5),
+                "liang" => Some(val * 0.05),
+                "ml" | "milliliter" | "milliliters" | "millilitre" | "millilitres" => {
+                    Some(val / 1000.0)
+                }
+                "l" | "liter" | "liters" | "litre" | "litres" => Some(val),
+                _ => None,
+            };
+            if let Some(total_kg) = kg_opt {
+                let qty = quantity.max(1) as f64;
+                let unit_kg = if qty > 1.0 && !per_unit_hint {
+                    total_kg / qty
+                } else {
+                    total_kg
+                };
+                return Some((unit_kg * 1000.0).round() / 1000.0);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Word-boundary heuristic fallback item weight (in kg) when an item does not have an explicit `ItemEconomics` entry.
+/// Honors any explicit weight/volume stated in `it.description` first, then checks light/ammo/cordage/consumable
+/// tiers before heavy weapon/armor/ore tiers so tagged items like `Hunting Arrows` or `Tailored Workwear Set` are never misweighed.
 pub fn estimate_item_weight_kg(it: &crate::models::Item) -> f64 {
+    if let Some(explicit_kg) = parse_explicit_weight_from_description(&it.description, it.quantity) {
+        return explicit_kg;
+    }
     let mut hay = it.name.to_ascii_lowercase();
     if let Some(ref sl) = it.slot {
         hay.push(' ');
@@ -411,20 +578,89 @@ pub fn estimate_item_weight_kg(it: &crate::models::Item) -> f64 {
         hay.push(' ');
         hay.push_str(&t.to_ascii_lowercase());
     }
-    if hay.contains("plate") || hay.contains("heavy armor") || hay.contains("anvil") {
+    let any = |words: &[&str]| words.iter().any(|w| has_word(&hay, w));
+
+    // 1. Ammunition & projectiles (must precede weapon/bow checks!)
+    if any(&[
+        "arrow", "arrows", "bolt", "bolts", "dart", "darts", "bullet", "bullets", "quarrel",
+        "quarrels", "ammo", "ammunition", "sling stone", "sling stones",
+    ]) {
+        0.04
+    }
+    // 2. Cordage, strings, papers, coins & tiny trinkets (must precede bow/gear checks!)
+    else if any(&[
+        "bowstring", "cordage", "twine", "string", "thread", "ribbon", "coin", "cash", "tael",
+        "scroll", "letter", "slip", "vouch", "ring", "pill", "pills", "needle", "needles",
+        "talisman", "talismans", "stamp", "key", "keys", "feather",
+    ]) {
+        0.05
+    }
+    // 3. Small medical/herbal salves, sachets, powders, bandages, spices & tea
+    else if any(&[
+        "sachet", "salve", "ointment", "paste", "powder", "bandage", "bandages", "spice",
+        "spices", "seasoning", "tea", "ginger", "mushroom", "mushrooms", "herb", "herbs",
+        "packet", "vial", "potion", "medicine", "rehydration", "salt", "dried vegetables",
+        "incense",
+    ]) {
+        0.10
+    }
+    // 4. Individual buns, cakes, dried rations & roasted beans
+    else if any(&[
+        "bun", "buns", "cake", "cakes", "biscuit", "biscuits", "jerky", "dried meat",
+        "roasted beans", "bread", "fruit",
+    ]) {
+        0.15
+    }
+    // 5. Small containers, grain bags, splints, gloves, knives, books & small gear
+    else if any(&[
+        "cooking oil", "oil", "flask", "canteen", "grain", "grains", "rice", "flour", "splint",
+        "splinting", "gloves", "belt", "pouch", "leg-wraps", "thin cord", "knife", "dagger",
+        "flint", "jade disk", "book", "handbook", "manual",
+    ]) {
+        0.35
+    }
+    // 6. Heavy armor & anvils
+    else if any(&["plate armor", "full plate", "heavy armor", "anvil"]) {
         18.0
-    } else if hay.contains("chainmail") || hay.contains("scale mail") || hay.contains("medium armor") || hay.contains("timber") || hay.contains("beam") {
+    }
+    // 7. Medium armor & timber
+    else if any(&["chainmail", "scale mail", "medium armor", "timber", "beam"]) {
         10.0
-    } else if hay.contains("greatsword") || hay.contains("halberd") || hay.contains("maul") || hay.contains("heavy weapon") || hay.contains("ingot") || hay.contains("ore") {
+    }
+    // 8. Heavy weapons, ingots & raw ore (word-bounded so "tailored" NEVER matches "ore"!)
+    else if any(&["greatsword", "halberd", "maul", "heavy weapon", "ingot", "ore"]) {
         4.5
-    } else if hay.contains("leather armor") || hay.contains("brigandine") || hay.contains("shield") || hay.contains("tool kit") || hay.contains("carpenter") {
+    }
+    // 9. Light armor, shields & full craft tool kits
+    else if any(&[
+        "leather armor", "brigandine", "shield", "tool kit", "tool roll", "carpenter",
+    ]) {
         3.5
-    } else if hay.contains("sword") || hay.contains("saber") || hay.contains("axe") || hay.contains("hatchet") || hay.contains("spear") || hay.contains("bow") || hay.contains("rifle") || hay.contains("hammer") || hay.contains("saw") || hay.contains("weapon") || hay.contains("bedroll") || hay.contains("blanket") {
+    }
+    // 10. Heavy cookware (iron pots, cauldrons, kettles)
+    else if any(&["iron pot", "cooking pot", "cauldron", "kettle", "skillet", "wok"]) {
+        2.2
+    }
+    // 11. Full outfits, heavy outerwear, boots & bedding
+    else if any(&[
+        "clothing set", "workwear set", "tailored attire", "attire", "outfit", "garment set",
+        "uniform", "cloak", "boots", "bedroll", "blanket",
+    ]) {
         1.4
-    } else if hay.contains("jacket") || hay.contains("coat") || hay.contains("robe") || hay.contains("tunic") || hay.contains("trousers") || hay.contains("pants") || hay.contains("boots") || hay.contains("cloak") || hay.contains("clothing") || hay.contains("apparel") {
+    }
+    // 12. Standard weapons & handheld tools
+    else if any(&[
+        "sword", "saber", "axe", "hatchet", "spear", "bow", "longbow", "shortbow", "crossbow",
+        "rifle", "hammer", "saw", "weapon",
+    ]) {
+        1.4
+    }
+    // 13. Individual garments
+    else if any(&[
+        "jacket", "coat", "robe", "tunic", "trousers", "pants", "clothing", "apparel", "skirt",
+        "dress", "shirt", "shoes",
+    ]) {
         0.8
-    } else if hay.contains("coin") || hay.contains("cash") || hay.contains("tael") || hay.contains("scroll") || hay.contains("letter") || hay.contains("slip") || hay.contains("ring") || hay.contains("pill") || hay.contains("needle") {
-        0.08
     } else {
         0.5
     }
@@ -448,7 +684,9 @@ pub fn compute_encumbrance(
     let capacity_kg = (20.0 + (str_stat.max(1) as f64) * 2.5).max(15.0);
 
     let mut total = 0.0f64;
+    let mut stored_total = 0.0f64;
     let mut breakdown = Vec::new();
+    let mut stored_breakdown = Vec::new();
     for it in &proj.current.equipment {
         let key = slugify(&it.name);
         let unit_w = econ_map
@@ -456,10 +694,16 @@ pub fn compute_encumbrance(
             .map(|e| e.weight_kg)
             .unwrap_or_else(|| estimate_item_weight_kg(it));
         let w = (unit_w * it.quantity.max(1) as f64 * 100.0).round() / 100.0;
-        total += w;
-        breakdown.push((format!("{} x{}", it.name, it.quantity), w));
+        if is_item_stored(it) {
+            stored_total += w;
+            stored_breakdown.push((format!("{} x{}", it.name, it.quantity), w));
+        } else {
+            total += w;
+            breakdown.push((format!("{} x{}", it.name, it.quantity), w));
+        }
     }
     total = (total * 100.0).round() / 100.0;
+    stored_total = (stored_total * 100.0).round() / 100.0;
     let ratio = ((total / capacity_kg) * 100.0).round() / 100.0;
     let (tier, spd, pen) = if ratio <= 0.5 {
         ("light", 1.0, 0)
@@ -473,12 +717,14 @@ pub fn compute_encumbrance(
     EncumbranceReport {
         character_id: proj.baseline.id.clone(),
         total_weight_kg: total,
+        stored_weight_kg: stored_total,
         carry_capacity_kg: capacity_kg,
         ratio,
         load_tier: tier.to_string(),
         travel_speed_multiplier: spd,
         physical_check_penalty: pen,
         item_weights: breakdown,
+        stored_item_weights: stored_breakdown,
     }
 }
 
@@ -1803,4 +2049,99 @@ pub fn format_grid_neighborhood_lines(
         lines.push(format!("- **Bearings to Nearby Landmarks/Places:** {}", top.join(" | ")));
     }
     lines
+}
+
+#[cfg(test)]
+mod encumbrance_tests {
+    use super::*;
+    use crate::models::{CharacterBaseline, CharacterCurrent, CharacterProjection, Item};
+
+    fn mk_item(name: &str, qty: i64, equipped: bool, tags: &[&str], desc: &str) -> Item {
+        Item {
+            name: name.to_string(),
+            quantity: qty,
+            equipped,
+            slot: None,
+            durability: None,
+            tags: tags.iter().map(|s| s.to_string()).collect(),
+            description: desc.to_string(),
+            garment_cut: String::new(),
+            garment_taper: String::new(),
+            garment_measurements: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_word_boundary_item_weight_estimates_and_stored_exclusion() {
+        // Arrows tagged "weapon" must NOT weigh 1.4 kg each!
+        let arrows = mk_item("Hunting Arrows", 30, false, &["arrows", "hunting", "weapon"], "");
+        assert!((estimate_item_weight_kg(&arrows) - 0.04).abs() < 1e-6);
+
+        // "Tailored" must NOT match "ore" (4.5 kg)!
+        let tailored = mk_item("Tailored Workwear Set", 1, true, &["clothing", "sized-apparel"], "");
+        assert!((estimate_item_weight_kg(&tailored) - 1.4).abs() < 1e-6);
+
+        // "Bowstring" must NOT match "bow" (1.4 kg)!
+        let bstr = mk_item("Bowstring Cordage", 1, false, &["bowstring", "cordage", "gear"], "");
+        assert!((estimate_item_weight_kg(&bstr) - 0.05).abs() < 1e-6);
+
+        // Small medical sachets, buns, and iron pots get realistic weights
+        let salve = mk_item("Cold-relief sachet", 1, false, &["medicine"], "");
+        assert!((estimate_item_weight_kg(&salve) - 0.10).abs() < 1e-6);
+        let buns = mk_item("Steamed buns", 4, false, &["food", "consumable"], "");
+        assert!((estimate_item_weight_kg(&buns) - 0.15).abs() < 1e-6);
+        let pot = mk_item("Medium Iron Cooking Pot with Lid", 1, false, &["camping", "cooking", "ironware"], "");
+        assert!((estimate_item_weight_kg(&pot) - 2.2).abs() < 1e-6);
+        let raw_ore = mk_item("Raw Iron Ore", 1, false, &["mining"], "");
+        assert!((estimate_item_weight_kg(&raw_ore) - 4.5).abs() < 1e-6);
+
+        // Explicit weights in item descriptions must ALWAYS override keyword heuristics!
+        let meat = mk_item("Dried meat", 6, false, &["food", "ration"], "6 kg dried meat purchased from Old Xu.");
+        assert!((estimate_item_weight_kg(&meat) - 1.0).abs() < 1e-6);
+        let salt = mk_item("Salt", 1, false, &["food", "seasoning"], "500 g salt.");
+        assert!((estimate_item_weight_kg(&salt) - 0.5).abs() < 1e-6);
+        let veg = mk_item("Dried vegetables", 1, false, &["food"], "1.5 kg dried vegetables.");
+        assert!((estimate_item_weight_kg(&veg) - 1.5).abs() < 1e-6);
+        let oil = mk_item("Cooking oil", 1, false, &["food"], "500 ml cooking oil.");
+        assert!((estimate_item_weight_kg(&oil) - 0.5).abs() < 1e-6);
+        let tea = mk_item("Tea", 1, false, &["food"], "200 g tea.");
+        assert!((estimate_item_weight_kg(&tea) - 0.2).abs() < 1e-6);
+
+        // Stored items are excluded from carried load and tracked separately
+        let stored_bedroll = mk_item("Bedroll", 1, false, &["camping", "stored"], "Left at inn room");
+        let baseline: CharacterBaseline = serde_json::from_value(serde_json::json!({
+            "id": "pc-1",
+            "name": "Test PC",
+            "kind": "pc"
+        }))
+        .unwrap();
+        let current = CharacterCurrent {
+            id: "pc-1".into(),
+            name: "Test PC".into(),
+            alive_status: "Active".into(),
+            current_location: None,
+            stats: BTreeMap::from([("Strength".to_string(), 12)]),
+            resources: BTreeMap::new(),
+            conditions: Vec::new(),
+            equipment: vec![tailored, arrows, bstr, stored_bedroll],
+            skills: Vec::new(),
+            techniques: Vec::new(),
+            active_goals: Vec::new(),
+            completed_goals: Vec::new(),
+            last_event_seq: 0,
+            last_world_time: String::new(),
+        };
+        let proj = CharacterProjection {
+            baseline,
+            current,
+            event_log: Vec::new(),
+        };
+        let rep = compute_encumbrance(&proj, &BTreeMap::new());
+        // Carried: 1.4 (tailored) + 1.2 (30 arrows) + 0.05 (bowstring) = 2.65 kg
+        assert!((rep.total_weight_kg - 2.65).abs() < 1e-6, "Got carried {}", rep.total_weight_kg);
+        assert!((rep.stored_weight_kg - 1.4).abs() < 1e-6, "Got stored {}", rep.stored_weight_kg);
+        assert_eq!(rep.load_tier, "light");
+        assert_eq!(rep.physical_check_penalty, 0);
+        assert_eq!(rep.stored_item_weights.len(), 1);
+    }
 }

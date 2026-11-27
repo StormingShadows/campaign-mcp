@@ -1,9 +1,9 @@
 use crate::autonomy::{
     ActorAutonomyBrief, ActorBelief, ActorKnowledgeBrief, AutonomyCommitRequest, AutonomyDossier,
     CharacterJob, CharacterOutfit, CharacterProficiency, CharacterProfileExt, CharacterTitle,
-    CharacterTrait, FactionMember, FactionRecord, KnowledgeClaim, KnowledgeRecordView,
-    KnowledgeSearchFilter, NpcEngagement, NpcTripState, PhysicalMarker, StatTrainingEntry,
-    StructuredGoal,
+    CharacterTrait, FactionMember, FactionRecord, GridPosition, KnowledgeClaim,
+    KnowledgeRecordView, KnowledgeSearchFilter, NpcEngagement, NpcMobilityProfile, NpcTripState,
+    PhysicalMarker, StatTrainingEntry, StructuredGoal, TravelConveyance,
 };
 use crate::compiler::{compile_all_docs, prune_orphaned_docs, CompileReport};
 use crate::context::{assemble_scene_context, SceneContextPacket, SceneContextRequest};
@@ -36,10 +36,11 @@ use crate::search::{
     TextSearchFilter,
 };
 use crate::world_sim::{
-    compute_encumbrance, compute_shortest_route, evaluate_market_prices,
-    format_grid_neighborhood_lines, generate_seasonal_weather, reputation_tier_label,
-    synthesize_routes_from_places, travel_injury_factor, CharacterProgressionTrack,
-    CraftingProject, CrimeRecord, EncumbranceReport, InjuryRecord, ItemEconomics,
+    base_speed_kmh, compute_encumbrance, compute_shortest_route, effective_travel_speed_kmh,
+    evaluate_market_prices, format_grid_neighborhood_lines, generate_seasonal_weather,
+    grid_cell_scale_km, reputation_tier_label, synthesize_routes_from_places, travel_injury_factor,
+    CharacterProgressionTrack, CraftingProject, CrimeRecord, EncumbranceReport, InjuryRecord,
+    ItemEconomics,
     JurisdictionRecord, MapGrid, MapGridCell, MarketPriceReport, PlaceSpatialExt,
     ProgressionLadder, ReputationStanding, SettlementMarket, TravelPlan, TravelRoute,
 };
@@ -7796,6 +7797,17 @@ impl CampaignEngine {
         xp_delta: u64,
         reason: &str,
     ) -> Result<(serde_json::Value, WorldEvent)> {
+        self.advance_progression_xp_vis(character_id, track_id, xp_delta, reason, "public")
+    }
+
+    pub fn advance_progression_xp_vis(
+        &self,
+        character_id: &str,
+        track_id: &str,
+        xp_delta: u64,
+        reason: &str,
+        visibility: &str,
+    ) -> Result<(serde_json::Value, WorldEvent)> {
         let cid = resolve_character_id(&self.db, character_id)?;
         let tid = slugify(track_id);
         let mut track = self
@@ -7934,7 +7946,11 @@ impl CampaignEngine {
                 EventCausalMeta {
                     actor_id: Some(cid.clone()),
                     causal_event_ids: vec![],
-                    visibility: "public".to_string(),
+                    visibility: if visibility.trim().is_empty() {
+                        "public".to_string()
+                    } else {
+                        visibility.trim().to_string()
+                    },
                 },
             )?;
 
@@ -10412,6 +10428,168 @@ impl CampaignEngine {
         Some((inferred.to_string(), purposes))
     }
 
+    fn append_event_vis(
+        &self,
+        visibility: &str,
+        location_id: Option<String>,
+        affected_entities: Vec<String>,
+        summary: String,
+        payload: EventPayload,
+    ) -> Result<WorldEvent> {
+        let mut meta = EventCausalMeta::default();
+        meta.visibility = if visibility.trim().is_empty() {
+            "public".to_string()
+        } else {
+            visibility.trim().to_string()
+        };
+        self.db
+            .append_event_causal(location_id, affected_entities, summary, payload, meta)
+    }
+
+    fn move_character_vis(
+        &self,
+        character_id: &str,
+        to_place_id: &str,
+        travel_notes: &str,
+        visibility: &str,
+    ) -> Result<(CharacterProjection, WorldEvent)> {
+        let cid = resolve_character_id(&self.db, character_id)?;
+        let pid = resolve_place_id(&self.db, to_place_id).unwrap_or_else(|_| slugify(to_place_id));
+        let proj = load_character_projection(&self.db, &cid, None)?;
+        let from_place = proj.current.current_location.clone();
+
+        let mut affected = vec![cid.clone(), pid.clone()];
+        if let Some(ref fp) = from_place {
+            affected.push(fp.clone());
+        }
+        let summary = format!(
+            "{} traveled from {} to {}{}",
+            proj.baseline.name,
+            from_place.as_deref().unwrap_or("unknown"),
+            pid,
+            if travel_notes.is_empty() {
+                String::new()
+            } else {
+                format!(" ({travel_notes})")
+            }
+        );
+
+        let ev = self.append_event_vis(
+            visibility,
+            Some(pid.clone()),
+            affected,
+            summary,
+            EventPayload::CharacterMoved {
+                character_id: cid.clone(),
+                from_place,
+                to_place: pid,
+                travel_notes: travel_notes.to_string(),
+            },
+        )?;
+        self.maybe_compile()?;
+        Ok((load_character_projection(&self.db, &cid, None)?, ev))
+    }
+
+    fn adjust_hours_for_conveyance(hours_f: f64, m: &NpcMobilityProfile) -> u64 {
+        let base = base_speed_kmh(&m.travel_speed_mode).max(0.5);
+        let eff = effective_travel_speed_kmh(
+            &m.travel_speed_mode,
+            m.conveyance.as_ref().and_then(|c| c.speed_kmh),
+        );
+        let speed_ratio = (eff / base).clamp(0.25, 10.0);
+        let offroad_factor = if m.conveyance.as_ref().is_some_and(|c| c.offroad_capable) {
+            0.9
+        } else {
+            1.0
+        };
+        ((hours_f / speed_ratio) * offroad_factor).ceil().max(2.0) as u64
+    }
+
+    fn estimate_grid_travel_hours(
+        from_xy: (i32, i32),
+        to_xy: (i32, i32),
+        cell_km: f64,
+        terrain: &str,
+        m: &NpcMobilityProfile,
+    ) -> u64 {
+        let dist_cells = (((to_xy.0 - from_xy.0) as f64).hypot((to_xy.1 - from_xy.1) as f64)).max(1.0);
+        let dist_km = dist_cells * cell_km.max(0.1);
+        let speed_kmh = effective_travel_speed_kmh(
+            &m.travel_speed_mode,
+            m.conveyance.as_ref().and_then(|c| c.speed_kmh),
+        );
+        let terrain_pen = match terrain.to_ascii_lowercase().as_str() {
+            "mountain" | "swamp" | "marsh" => {
+                if m.conveyance.as_ref().is_some_and(|c| c.offroad_capable) {
+                    0.8
+                } else {
+                    0.55
+                }
+            }
+            "forest" | "wilderness" => {
+                if m.conveyance.as_ref().is_some_and(|c| c.offroad_capable) {
+                    0.9
+                } else {
+                    0.75
+                }
+            }
+            _ => 1.0,
+        };
+        // Account for ~10h daily traveling pace on multi-day overland journeys
+        let moving_h = dist_km / (speed_kmh * terrain_pen).max(0.5);
+        let rest_days = (moving_h / 10.0).floor();
+        (moving_h + rest_days * 10.0).ceil().max(2.0) as u64
+    }
+
+    fn resolve_place_parent_settlement(
+        &self,
+        place_id: &str,
+        all_places: &std::collections::BTreeMap<String, PlaceProjection>,
+        routes: &[TravelRoute],
+        all_grids: &[MapGrid],
+    ) -> String {
+        if let Some(p) = all_places.get(place_id) {
+            if let Some(ref parent) = p.baseline.parent_place {
+                if !parent.trim().is_empty() {
+                    return parent.clone();
+                }
+            }
+        }
+        // Check if place appears on a settlement map grid whose parent_place_id is a settlement
+        for g in all_grids {
+            if g.scale_kind.eq_ignore_ascii_case("settlement") {
+                if let Some(ref parent) = g.parent_place_id {
+                    if let Ok(cells) = self.db.list_map_cells(&g.id) {
+                        if cells.iter().any(|c| c.place_id.as_deref() == Some(place_id)) {
+                            return parent.clone();
+                        }
+                    }
+                }
+            }
+        }
+        // Fallback: check short local routes (<= 2.0 km) to a settlement
+        for r in routes {
+            if r.distance_km <= 2.0 {
+                let other = if r.from_place_id == place_id {
+                    Some(r.to_place_id.as_str())
+                } else if r.bidirectional && r.to_place_id == place_id {
+                    Some(r.from_place_id.as_str())
+                } else {
+                    None
+                };
+                if let Some(oid) = other {
+                    if all_places
+                        .get(oid)
+                        .is_some_and(|op| op.baseline.place_type.eq_ignore_ascii_case("settlement"))
+                    {
+                        return oid.to_string();
+                    }
+                }
+            }
+        }
+        place_id.to_string()
+    }
+
     pub fn configure_npc_mobility(
         &self,
         character_id: &str,
@@ -10429,6 +10607,119 @@ impl CampaignEngine {
             m.mobility_mode = mode.trim().to_lowercase();
             if m.mobility_mode != "stationary" && args.get("prominent").is_none() {
                 m.prominent = true;
+            }
+        }
+        if let Some(vis) = args.get("visibility").and_then(|v| v.as_str()) {
+            let v = vis.trim().to_lowercase();
+            if matches!(v.as_str(), "public" | "gm_secret") {
+                m.visibility = v;
+            }
+        }
+        if let Some(role) = args.get("narrative_role").and_then(|v| v.as_str()) {
+            let r = role.trim().to_lowercase();
+            m.narrative_role = r.clone();
+            if !r.is_empty() {
+                if args.get("prominent").is_none() && m.mobility_mode != "stationary" {
+                    m.prominent = true;
+                }
+                if args.get("gm_convergence_alert").is_none() {
+                    m.gm_convergence_alert = true;
+                }
+            }
+        }
+        if let Some(strat) = args.get("roam_strategy").and_then(|v| v.as_str()) {
+            let s = strat.trim().to_lowercase();
+            if matches!(s.as_str(), "circuit" | "weighted_random" | "map_roam") {
+                m.roam_strategy = s;
+            }
+        }
+        if let Some(gid) = args.get("roam_grid_id").and_then(|v| v.as_str()) {
+            let trimmed = gid.trim();
+            m.roam_grid_id = if trimmed.is_empty() {
+                None
+            } else {
+                Some(slugify(trimmed))
+            };
+        }
+        if let Some(arr) = args.get("roam_terrains").and_then(|v| v.as_array()) {
+            m.roam_terrains = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.trim().to_lowercase()))
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+        if let Some(w) = args.get("wild_roam_chance").and_then(|v| v.as_u64()) {
+            m.wild_roam_chance = (w.min(100)) as u8;
+        }
+        if let Some(b) = args.get("pc_proximity_bias").and_then(|v| v.as_u64()) {
+            m.pc_proximity_bias = (b.min(100)) as u8;
+        }
+        if let Some(a) = args.get("gm_convergence_alert").and_then(|v| v.as_bool()) {
+            m.gm_convergence_alert = a;
+        }
+        if let Some(r_km) = args.get("convergence_radius_km").and_then(|v| v.as_f64()) {
+            if r_km.is_finite() {
+                m.convergence_radius_km = r_km.clamp(1.0, 500.0);
+            }
+        }
+        if let Some(alias) = args.get("incognito_alias").and_then(|v| v.as_str()) {
+            let t = alias.trim();
+            m.incognito_alias = if t.is_empty() { None } else { Some(t.to_string()) };
+        }
+        if let Some(conv_val) = args.get("conveyance") {
+            if conv_val.is_null() {
+                m.conveyance = None;
+            } else if let Some(obj) = conv_val.as_object() {
+                let mut cur = m.conveyance.clone().unwrap_or(TravelConveyance {
+                    label: String::new(),
+                    speed_kmh: None,
+                    offroad_capable: false,
+                    signature: "discreet".to_string(),
+                });
+                if let Some(lbl) = obj.get("label").and_then(|v| v.as_str()) {
+                    cur.label = lbl.trim().to_string();
+                }
+                if let Some(spd) = obj.get("speed_kmh") {
+                    cur.speed_kmh = spd.as_f64().filter(|v| v.is_finite() && *v >= 0.5);
+                }
+                if let Some(off) = obj.get("offroad_capable").and_then(|v| v.as_bool()) {
+                    cur.offroad_capable = off;
+                }
+                if let Some(sig) = obj.get("signature").and_then(|v| v.as_str()) {
+                    let s = sig.trim().to_lowercase();
+                    if matches!(s.as_str(), "conspicuous" | "discreet" | "clandestine") {
+                        cur.signature = s;
+                    }
+                }
+                m.conveyance = Some(cur);
+            }
+        } else if let Some(lbl) = args.get("conveyance_label").and_then(|v| v.as_str()) {
+            let trimmed = lbl.trim();
+            if trimmed.is_empty() {
+                m.conveyance = None;
+            } else {
+                let mut cur = m.conveyance.clone().unwrap_or(TravelConveyance {
+                    label: String::new(),
+                    speed_kmh: None,
+                    offroad_capable: false,
+                    signature: "discreet".to_string(),
+                });
+                cur.label = trimmed.to_string();
+                if let Some(spd) = args.get("conveyance_speed_kmh").and_then(|v| v.as_f64()) {
+                    if spd.is_finite() && spd >= 0.5 {
+                        cur.speed_kmh = Some(spd);
+                    }
+                }
+                if let Some(off) = args.get("conveyance_offroad").and_then(|v| v.as_bool()) {
+                    cur.offroad_capable = off;
+                }
+                if let Some(sig) = args.get("conveyance_signature").and_then(|v| v.as_str()) {
+                    let s = sig.trim().to_lowercase();
+                    if matches!(s.as_str(), "conspicuous" | "discreet" | "clandestine") {
+                        cur.signature = s;
+                    }
+                }
+                m.conveyance = Some(cur);
             }
         }
         if let Some(home) = args.get("home_place_id").and_then(|v| v.as_str()) {
@@ -10481,17 +10772,39 @@ impl CampaignEngine {
             m.current_status = st.trim().to_lowercase();
             if m.current_status == "at_home" {
                 m.active_trip = None;
+                m.current_grid_pos = None;
+                m.current_excursion_note = None;
+                m.excursions_since_home = 0;
             }
+        }
+        if let Some(gp_val) = args.get("current_grid_pos") {
+            if gp_val.is_null() {
+                m.current_grid_pos = None;
+            } else if let Ok(gp) = serde_json::from_value::<GridPosition>(gp_val.clone()) {
+                m.current_grid_pos = Some(gp);
+            }
+        }
+        if let Some(note) = args.get("current_excursion_note").and_then(|v| v.as_str()) {
+            let t = note.trim();
+            m.current_excursion_note = if t.is_empty() { None } else { Some(t.to_string()) };
         }
 
         let now = self.db.get_campaign_meta()?.clock.format_short();
         profile.updated_at_world_time = now;
         self.db.upsert_character_profile(&profile)?;
+        let vis = profile.mobility.visibility.clone();
         let summary = format!(
-            "Configured mobility for {} [prominent={}, mode={}, home={}, stops={}]",
+            "Configured mobility for {} [prominent={}, mode={}, role={}, vis={}, strategy={}, home={}, stops={}]",
             proj.baseline.name,
             profile.mobility.prominent,
             profile.mobility.mobility_mode,
+            if profile.mobility.narrative_role.is_empty() {
+                "none"
+            } else {
+                profile.mobility.narrative_role.as_str()
+            },
+            vis,
+            profile.mobility.roam_strategy,
             profile
                 .mobility
                 .home_place_id
@@ -10499,7 +10812,8 @@ impl CampaignEngine {
                 .unwrap_or("none"),
             profile.mobility.preferred_destinations.len()
         );
-        let ev = self.db.append_event(
+        let ev = self.append_event_vis(
+            &vis,
             proj.current.current_location,
             vec![cid.clone()],
             summary.clone(),
@@ -10526,8 +10840,33 @@ impl CampaignEngine {
         stay_duration_days: Option<u32>,
         transport_mode: Option<&str>,
     ) -> Result<serde_json::Value> {
+        self.dispatch_npc_trip_ext(
+            character_id,
+            destination_place_id,
+            purpose,
+            details,
+            stay_duration_days,
+            transport_mode,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_npc_trip_ext(
+        &self,
+        character_id: &str,
+        destination_place_id: &str,
+        purpose: &str,
+        details: &str,
+        stay_duration_days: Option<u32>,
+        transport_mode: Option<&str>,
+        target_grid_pos: Option<GridPosition>,
+        uncharted_label: Option<&str>,
+        visibility_override: Option<&str>,
+    ) -> Result<serde_json::Value> {
         let cid = resolve_character_id(&self.db, character_id)?;
-        let dest = resolve_place_id(&self.db, destination_place_id)?;
         let proj = load_character_projection(&self.db, &cid, None)?;
         if !Self::npc_is_mobile_alive(&proj) {
             bail!(
@@ -10543,9 +10882,6 @@ impl CampaignEngine {
             .clone()
             .or_else(|| proj.baseline.initial_location.clone())
             .ok_or_else(|| anyhow!("Character '{}' has no current location to depart from", cid))?;
-        if origin == dest {
-            bail!("'{}' is already at '{}'", proj.baseline.name, dest);
-        }
 
         let meta = self.db.get_campaign_meta()?;
         let all_places = load_all_place_projections(&self.db, None)?;
@@ -10556,42 +10892,187 @@ impl CampaignEngine {
             .filter(|s| !s.is_empty())
             .map(|s| s.to_lowercase())
             .unwrap_or_else(|| profile.mobility.travel_speed_mode.clone());
+        let vis = visibility_override
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_lowercase())
+            .unwrap_or_else(|| profile.mobility.visibility.clone());
 
-        let (legs, _km, hours_f) = compute_shortest_route(
-            &routes,
-            &origin,
-            &dest,
-            &mode,
-            &meta.clock.season,
-            &meta.clock.global_weather,
-            1.0,
-            false,
-        )
-        .ok_or_else(|| {
-            anyhow!(
-                "No open travel route exists from '{origin}' to '{dest}' (all connecting routes may be blocked/destroyed)"
-            )
-        })?;
+        let clean_uncharted = uncharted_label
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
 
-        let mut detour_note = String::new();
-        let direct_closed = routes.iter().any(|r| {
-            ((r.from_place_id == origin && r.to_place_id == dest)
-                || (r.bidirectional && r.from_place_id == dest && r.to_place_id == origin))
-                && (r.status.eq_ignore_ascii_case("blocked")
-                    || r.status.eq_ignore_ascii_case("destroyed"))
-        });
-        if direct_closed {
-            detour_note = format!("Detoured around closed direct road {origin} -> {dest}");
-        }
+        let (dest, waypoints, travel_hours, detour_note, resolved_grid_pos) =
+            if let Some(mut gp) = target_grid_pos {
+                let grid = self
+                    .db
+                    .get_map_grid(&slugify(&gp.grid_id))?
+                    .ok_or_else(|| anyhow!("Map grid '{}' not found", gp.grid_id))?;
+                gp.grid_id = grid.id.clone();
+                let cells = self.db.list_map_cells(&grid.id)?;
+                if let Some(cell) = cells.iter().find(|c| c.x == gp.x && c.y == gp.y) {
+                    if gp.terrain.trim().is_empty() {
+                        gp.terrain = cell.terrain.clone();
+                    }
+                    if gp.label.trim().is_empty() {
+                        gp.label = cell.label.clone();
+                    }
+                }
+                if gp.terrain.trim().is_empty() {
+                    gp.terrain = grid.default_terrain.clone();
+                }
+                let cell_km = grid_cell_scale_km(&grid.cell_scale_label).unwrap_or(5.0);
+                let all_grids = self.db.list_map_grids().unwrap_or_default();
+                let origin_settlement =
+                    self.resolve_place_parent_settlement(&origin, &all_places, &routes, &all_grids);
+                let from_xy = profile
+                    .mobility
+                    .current_grid_pos
+                    .as_ref()
+                    .filter(|cur| cur.grid_id == grid.id)
+                    .map(|cur| (cur.x, cur.y))
+                    .or_else(|| {
+                        cells
+                            .iter()
+                            .find(|c| {
+                                c.place_id.as_deref() == Some(origin.as_str())
+                                    || c.place_id.as_deref() == Some(origin_settlement.as_str())
+                            })
+                            .map(|c| (c.x, c.y))
+                    })
+                    .unwrap_or(((grid.width / 2) as i32, (grid.height / 2) as i32));
+                let hours = Self::estimate_grid_travel_hours(
+                    from_xy,
+                    (gp.x, gp.y),
+                    cell_km,
+                    &gp.terrain,
+                    &profile.mobility,
+                );
+                let anchor_dest = if !destination_place_id.trim().is_empty() {
+                    resolve_place_id(&self.db, destination_place_id)
+                        .unwrap_or_else(|_| slugify(destination_place_id))
+                } else {
+                    format!("wild:{}:{}:{}", gp.grid_id, gp.x, gp.y)
+                };
+                (anchor_dest, Vec::new(), hours, String::new(), Some(gp))
+            } else if let Some(ref ul) = clean_uncharted {
+                let speed = effective_travel_speed_kmh(
+                    &mode,
+                    profile.mobility.conveyance.as_ref().and_then(|c| c.speed_kmh),
+                );
+                let est_h = ((120.0 / speed.max(1.0)).ceil() as u64).clamp(6, 72);
+                let anchor_dest = if !destination_place_id.trim().is_empty() {
+                    resolve_place_id(&self.db, destination_place_id)
+                        .unwrap_or_else(|_| slugify(destination_place_id))
+                } else {
+                    format!("uncharted:{}", slugify(ul))
+                };
+                (anchor_dest, Vec::new(), est_h, String::new(), None)
+            } else {
+                let dest = resolve_place_id(&self.db, destination_place_id)?;
+                if origin == dest && profile.mobility.current_grid_pos.is_none() {
+                    bail!("'{}' is already at '{}'", proj.baseline.name, dest);
+                }
+                if let Some((legs, _km, hours_f)) = compute_shortest_route(
+                    &routes,
+                    &origin,
+                    &dest,
+                    &mode,
+                    &meta.clock.season,
+                    &meta.clock.global_weather,
+                    1.0,
+                    false,
+                ) {
+                    let mut detour_note = String::new();
+                    let direct_closed = routes.iter().any(|r| {
+                        ((r.from_place_id == origin && r.to_place_id == dest)
+                            || (r.bidirectional
+                                && r.from_place_id == dest
+                                && r.to_place_id == origin))
+                            && (r.status.eq_ignore_ascii_case("blocked")
+                                || r.status.eq_ignore_ascii_case("destroyed"))
+                    });
+                    if direct_closed {
+                        detour_note = format!("Detoured around closed direct road {origin} -> {dest}");
+                    }
+                    let travel_hours = Self::adjust_hours_for_conveyance(hours_f, &profile.mobility);
+                    let waypoints: Vec<String> =
+                        legs.iter().map(|l| l.to_place_id.clone()).collect();
+                    (dest, waypoints, travel_hours, detour_note, None)
+                } else if let Some(ref gid) = profile.mobility.roam_grid_id {
+                    // Fallback: map-grid overland travel for speculative/unrouted settlements on the same regional map
+                    let grid = self
+                        .db
+                        .get_map_grid(gid)?
+                        .ok_or_else(|| anyhow!("No open travel route from '{origin}' to '{dest}'"))?;
+                    let cells = self.db.list_map_cells(&grid.id)?;
+                    let all_grids = self.db.list_map_grids().unwrap_or_default();
+                    let origin_s = self.resolve_place_parent_settlement(
+                        &origin,
+                        &all_places,
+                        &routes,
+                        &all_grids,
+                    );
+                    let dest_s = self.resolve_place_parent_settlement(
+                        &dest,
+                        &all_places,
+                        &routes,
+                        &all_grids,
+                    );
+                    let from_xy = profile
+                        .mobility
+                        .current_grid_pos
+                        .as_ref()
+                        .filter(|cur| cur.grid_id == grid.id)
+                        .map(|cur| (cur.x, cur.y))
+                        .or_else(|| {
+                            cells
+                                .iter()
+                                .find(|c| {
+                                    c.place_id.as_deref() == Some(origin.as_str())
+                                        || c.place_id.as_deref() == Some(origin_s.as_str())
+                                })
+                                .map(|c| (c.x, c.y))
+                        });
+                    let to_cell = cells.iter().find(|c| {
+                        c.place_id.as_deref() == Some(dest.as_str())
+                            || c.place_id.as_deref() == Some(dest_s.as_str())
+                    });
+                    if let (Some(fxy), Some(tc)) = (from_xy, to_cell) {
+                        let cell_km = grid_cell_scale_km(&grid.cell_scale_label).unwrap_or(5.0);
+                        let hours = Self::estimate_grid_travel_hours(
+                            fxy,
+                            (tc.x, tc.y),
+                            cell_km,
+                            &tc.terrain,
+                            &profile.mobility,
+                        );
+                        (
+                            dest,
+                            Vec::new(),
+                            hours,
+                            "Overland transit via regional map".to_string(),
+                            None,
+                        )
+                    } else {
+                        bail!(
+                            "No open travel route exists from '{origin}' to '{dest}' (all connecting routes may be blocked/destroyed)"
+                        );
+                    }
+                } else {
+                    bail!(
+                        "No open travel route exists from '{origin}' to '{dest}' (all connecting routes may be blocked/destroyed)"
+                    );
+                }
+            };
 
-        let travel_hours = (hours_f.ceil() as u64).max(2);
         let now_h = meta.clock.total_hours();
         let eta_h = now_h + (travel_hours as i64);
         let eta_clock = meta.clock.clock_after_hours(travel_hours);
         let stay_days = stay_duration_days.unwrap_or(profile.mobility.stay_duration_days.max(1));
         let ret_h = eta_h + (stay_days as i64) * 24;
         let ret_clock = eta_clock.clock_after_hours((stay_days as u64) * 24);
-        let waypoints: Vec<String> = legs.iter().map(|l| l.to_place_id.clone()).collect();
         let clean_purpose = if purpose.trim().is_empty() {
             "business".to_string()
         } else {
@@ -10612,6 +11093,9 @@ impl CampaignEngine {
             return_after_world_time: ret_clock.format_short(),
             transport_mode: mode.clone(),
             detour_note: detour_note.clone(),
+            visibility: vis.clone(),
+            target_grid_pos: resolved_grid_pos.clone(),
+            uncharted_label: clean_uncharted.clone(),
         };
 
         if profile.mobility.home_place_id.is_none() {
@@ -10623,14 +11107,28 @@ impl CampaignEngine {
         profile.updated_at_world_time = meta.clock.format_short();
         self.db.upsert_character_profile(&profile)?;
 
+        let dest_disp = if let Some(ref gp) = resolved_grid_pos {
+            format!("grid `{}` ({},{}) [{}]", gp.grid_id, gp.x, gp.y, gp.terrain)
+        } else if let Some(ref ul) = clean_uncharted {
+            format!("uncharted: {ul}")
+        } else {
+            dest.clone()
+        };
+        let conv_disp = profile
+            .mobility
+            .conveyance
+            .as_ref()
+            .filter(|c| !c.label.trim().is_empty())
+            .map(|c| c.label.trim().to_string())
+            .unwrap_or_else(|| mode.clone());
         let summary = format!(
-            "{} departed {} for {} ({}, ~{}h by {}, ETA {}){}{}",
+            "{} departed {} for {} ({}, ~{}h via {}, ETA {}){}{}",
             proj.baseline.name,
             origin,
-            dest,
+            dest_disp,
             clean_purpose,
             travel_hours,
-            mode,
+            conv_disp,
             trip.eta_world_time,
             if details.trim().is_empty() {
                 String::new()
@@ -10643,12 +11141,18 @@ impl CampaignEngine {
                 format!(" [{detour_note}]")
             }
         );
-        let ev = self.db.append_event(
+        let ev = self.append_event_vis(
+            &vis,
             Some(origin.clone()),
             vec![cid.clone(), origin, dest],
             summary.clone(),
             EventPayload::NarrativeEvent {
-                title: format!("Departure: {} ({})", proj.baseline.name, clean_purpose),
+                title: format!(
+                    "{}Departure: {} ({})",
+                    if vis == "gm_secret" { "[Covert] " } else { "" },
+                    proj.baseline.name,
+                    clean_purpose
+                ),
                 details: summary.clone(),
                 tags: vec!["npc_movement".into(), clean_purpose],
             },
@@ -10658,6 +11162,7 @@ impl CampaignEngine {
             "event_seq": ev.seq,
             "summary": summary,
             "character_id": cid,
+            "visibility": vis,
             "trip": trip
         }))
     }
@@ -10677,186 +11182,356 @@ impl CampaignEngine {
             .active_trip
             .clone()
             .ok_or_else(|| anyhow!("No active trip to resolve on '{cid}'"))?;
+        let is_covert =
+            trip.visibility.eq_ignore_ascii_case("gm_secret") || profile.mobility.is_covert();
+        let vis = if is_covert { "gm_secret" } else { "public" };
+        let is_wild_or_uncharted =
+            trip.target_grid_pos.is_some() || trip.uncharted_label.is_some();
         let dest = trip.destination_place_id.clone();
-        let dest_name = all_places
-            .get(&dest)
-            .map(|p| p.baseline.name.clone())
-            .unwrap_or_else(|| dest.clone());
-
-        // Move traveler + entourage into destination
-        let move_reason = format!(
-            "Arrived for {}{}",
-            trip.purpose,
-            if trip.details.is_empty() {
-                String::new()
+        let dest_name = if let Some(ref gp) = trip.target_grid_pos {
+            if !gp.label.trim().is_empty() {
+                format!("{} ({},{})", gp.label.trim(), gp.x, gp.y)
             } else {
-                format!(" ({})", trip.details)
+                format!("{} wilds ({},{})", gp.terrain, gp.x, gp.y)
             }
-        );
-        let _ = self.move_character(cid, &dest, &move_reason);
-        for eid in &profile.mobility.entourage_ids {
-            if all_chars
-                .get(eid)
-                .map(Self::npc_is_mobile_alive)
-                .unwrap_or(false)
-            {
-                let _ = self.move_character(eid, &dest, &format!("Accompanying {proj_name}"));
-            }
-        }
+        } else if let Some(ref ul) = trip.uncharted_label {
+            ul.clone()
+        } else {
+            all_places
+                .get(&dest)
+                .map(|p| p.baseline.name.clone())
+                .unwrap_or_else(|| dest.clone())
+        };
 
         let mut engagement_opt = None;
         let mut rumor_shared: Option<String> = None;
 
         if trip.purpose.eq_ignore_ascii_case("return_home") {
+            let move_reason = format!("Returned home to {dest_name}");
+            let _ = self.move_character_vis(cid, &dest, &move_reason, vis);
+            for eid in &profile.mobility.entourage_ids {
+                if all_chars
+                    .get(eid)
+                    .map(Self::npc_is_mobile_alive)
+                    .unwrap_or(false)
+                {
+                    let _ = self.move_character_vis(
+                        eid,
+                        &dest,
+                        &format!("Accompanying {proj_name}"),
+                        vis,
+                    );
+                }
+            }
             profile.mobility.current_status = "at_home".to_string();
             profile.mobility.active_trip = None;
+            profile.mobility.current_grid_pos = None;
+            profile.mobility.current_excursion_note = None;
+            profile.mobility.excursions_since_home = 0;
             profile.mobility.last_trip_ended_total_hours = Some(now_h);
-        } else {
-            profile.mobility.current_status = "visiting".to_string();
-            // Find counterparts present at destination for organic business / networking engagement
-            let counterparts: Vec<(&String, &CharacterProjection)> = all_chars
-                .iter()
-                .filter(|(other_id, other_p)| {
-                    other_id.as_str() != cid
-                        && !profile.mobility.entourage_ids.contains(*other_id)
-                        && Self::npc_is_mobile_alive(other_p)
-                        && other_p.current.current_location.as_deref() == Some(dest.as_str())
-                })
-                .take(2)
-                .collect();
-
-            let cp_ids: Vec<String> = counterparts.iter().map(|(id, _)| (*id).clone()).collect();
-            let cp_names: Vec<String> = counterparts
-                .iter()
-                .map(|(_, p)| p.baseline.name.clone())
-                .collect();
-
-            let eng_summary = if !cp_names.is_empty() {
-                format!(
-                    "{proj_name} arrived in {dest_name} for {} and networked with {}",
-                    trip.purpose,
-                    cp_names.join(" & ")
-                )
+        } else if is_wild_or_uncharted {
+            // Wilderness or uncharted frontier foray: DO NOT fabricate canon places on the map!
+            profile.mobility.current_status = "roaming_wild".to_string();
+            profile.mobility.current_grid_pos = trip.target_grid_pos.clone();
+            profile.mobility.excursions_since_home =
+                profile.mobility.excursions_since_home.saturating_add(1);
+            let conv_note = profile
+                .mobility
+                .conveyance
+                .as_ref()
+                .filter(|c| !c.label.trim().is_empty())
+                .map(|c| format!(" ({})", c.label.trim()))
+                .unwrap_or_default();
+            let note = if trip.details.is_empty() {
+                format!("{} in {dest_name}{conv_note}", trip.purpose)
             } else {
-                format!(
-                    "{proj_name} arrived in {dest_name} to conduct {} business",
-                    trip.purpose
-                )
+                format!("{} in {dest_name}{conv_note} — {}", trip.purpose, trip.details)
             };
+            profile.mobility.current_excursion_note = Some(note.clone());
 
+            let eng_summary = format!("{proj_name} halted at {dest_name} for {}", trip.purpose);
             let eng = NpcEngagement {
                 world_time: now_str.to_string(),
                 place_id: dest.clone(),
                 purpose: trip.purpose.clone(),
-                counterparts: cp_ids.clone(),
+                counterparts: Vec::new(),
                 summary: eng_summary.clone(),
-                visibility: "public".to_string(),
+                visibility: vis.to_string(),
             };
             profile.mobility.recent_engagements.push(eng.clone());
             if profile.mobility.recent_engagements.len() > 10 {
                 let drop_n = profile.mobility.recent_engagements.len() - 10;
                 profile.mobility.recent_engagements.drain(0..drop_n);
             }
-
-            // Record mirrored engagement on counterparts + organic rumor propagation (1 public claim max)
-            let traveler_beliefs = self.db.list_beliefs_for_actor(cid).unwrap_or_default();
-            let all_claims = self.db.list_knowledge_claims().unwrap_or_default();
-            for cp_id in &cp_ids {
-                if let Ok(mut cp_prof) = self.get_character_profile(cp_id) {
-                    cp_prof.mobility.recent_engagements.push(NpcEngagement {
-                        world_time: now_str.to_string(),
-                        place_id: dest.clone(),
-                        purpose: trip.purpose.clone(),
-                        counterparts: vec![cid.to_string()],
-                        summary: eng_summary.clone(),
-                        visibility: "public".to_string(),
-                    });
-                    if cp_prof.mobility.recent_engagements.len() > 10 {
-                        let drop_n = cp_prof.mobility.recent_engagements.len() - 10;
-                        cp_prof.mobility.recent_engagements.drain(0..drop_n);
-                    }
-                    cp_prof.updated_at_world_time = now_str.to_string();
-                    let _ = self.db.upsert_character_profile(&cp_prof);
+            let _ = self.append_event_vis(
+                vis,
+                None,
+                vec![cid.to_string()],
+                eng_summary.clone(),
+                EventPayload::NarrativeEvent {
+                    title: format!(
+                        "{}Excursion Halted: {proj_name} @ {dest_name}",
+                        if is_covert { "[Covert] " } else { "" }
+                    ),
+                    details: note,
+                    tags: vec!["npc_movement".into(), "roaming_wild".into(), trip.purpose.clone()],
+                },
+            );
+            engagement_opt = Some(eng);
+        } else {
+            // Move traveler + entourage into destination place
+            let move_reason = format!(
+                "Arrived for {}{}",
+                trip.purpose,
+                if trip.details.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", trip.details)
                 }
-
-                // Propagate up to 1 non-concealed public claim the traveler knows that the counterpart doesn't
-                if rumor_shared.is_none() && !traveler_beliefs.is_empty() {
-                    let cp_known: std::collections::BTreeSet<String> = self
-                        .db
-                        .list_beliefs_for_actor(cp_id)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|b| b.claim_id)
-                        .collect();
-                    for tb in &traveler_beliefs {
-                        if tb.concealing || tb.confidence < 55 || cp_known.contains(&tb.claim_id) {
-                            continue;
-                        }
-                        if let Some(cl) = all_claims.iter().find(|c| {
-                            c.id == tb.claim_id
-                                && c.superseded_by_id.is_none()
-                                && c.visibility != "gm_secret"
-                        }) {
-                            let propagated = ActorBelief {
-                                claim_id: cl.id.clone(),
-                                actor_id: cp_id.clone(),
-                                perceived_claim: if tb.perceived_claim.is_empty() {
-                                    cl.claim.clone()
-                                } else {
-                                    tb.perceived_claim.clone()
-                                },
-                                stance: "believes".to_string(),
-                                confidence: tb.confidence.saturating_sub(10).max(40),
-                                source: format!("networked_with:{cid}"),
-                                source_trustworthy: Some(true),
-                                concealing: false,
-                                outdated: tb.outdated,
-                                learned_at_world_time: now_str.to_string(),
-                                notes: format!("Exchanged during {} in {dest_name}", trip.purpose),
-                            };
-                            if self.db.upsert_actor_belief(&propagated).is_ok() {
-                                rumor_shared = Some(format!(
-                                    "{proj_name} shared '{}' with {cp_id} in {dest_name}",
-                                    cl.subject
-                                ));
-                            }
-                            break;
-                        }
+            );
+            let _ = self.move_character_vis(cid, &dest, &move_reason, vis);
+            for eid in &profile.mobility.entourage_ids {
+                if all_chars
+                    .get(eid)
+                    .map(Self::npc_is_mobile_alive)
+                    .unwrap_or(false)
+                {
+                    let _ = self.move_character_vis(
+                        eid,
+                        &dest,
+                        &format!("Accompanying {proj_name}"),
+                        vis,
+                    );
+                }
+            }
+            // Update current_grid_pos if this destination is anchored on roam_grid_id
+            if let Some(ref gid) = profile.mobility.roam_grid_id {
+                if let Ok(cells) = self.db.list_map_cells(gid) {
+                    let all_grids = self.db.list_map_grids().unwrap_or_default();
+                    let routes = self.all_world_routes_merged(all_places);
+                    let dest_s = self.resolve_place_parent_settlement(
+                        &dest,
+                        all_places,
+                        &routes,
+                        &all_grids,
+                    );
+                    if let Some(c) = cells.iter().find(|c| {
+                        c.place_id.as_deref() == Some(dest.as_str())
+                            || c.place_id.as_deref() == Some(dest_s.as_str())
+                    }) {
+                        profile.mobility.current_grid_pos = Some(GridPosition {
+                            grid_id: gid.clone(),
+                            x: c.x,
+                            y: c.y,
+                            terrain: c.terrain.clone(),
+                            label: if c.label.is_empty() {
+                                dest_name.clone()
+                            } else {
+                                c.label.clone()
+                            },
+                        });
                     }
                 }
             }
 
-            let mut involved = vec![cid.to_string(), dest.clone()];
-            involved.extend(cp_ids.iter().cloned());
-            let _ = self.db.append_event(
-                Some(dest.clone()),
-                involved,
-                eng_summary.clone(),
-                EventPayload::NarrativeEvent {
-                    title: format!("Arrival & Networking: {proj_name} in {dest_name}"),
-                    details: eng_summary,
-                    tags: vec!["npc_movement".into(), trip.purpose.clone()],
-                },
-            );
-            engagement_opt = Some(eng);
+            profile.mobility.current_status = "visiting".to_string();
+            profile.mobility.excursions_since_home =
+                profile.mobility.excursions_since_home.saturating_add(1);
+            profile.mobility.current_excursion_note = Some(format!(
+                "Visiting {dest_name} for {}",
+                trip.purpose
+            ));
+
+            if is_covert {
+                // Covert / incognito visits do NOT broadcast public networking engagements or rumors
+                let alias_note = profile
+                    .mobility
+                    .incognito_alias
+                    .as_deref()
+                    .map(|a| format!(" (incognito as '{a}')"))
+                    .unwrap_or_default();
+                let eng_summary = format!(
+                    "{proj_name} arrived discreetly in {dest_name}{alias_note} for {}",
+                    trip.purpose
+                );
+                let eng = NpcEngagement {
+                    world_time: now_str.to_string(),
+                    place_id: dest.clone(),
+                    purpose: trip.purpose.clone(),
+                    counterparts: Vec::new(),
+                    summary: eng_summary.clone(),
+                    visibility: "gm_secret".to_string(),
+                };
+                profile.mobility.recent_engagements.push(eng.clone());
+                if profile.mobility.recent_engagements.len() > 10 {
+                    let drop_n = profile.mobility.recent_engagements.len() - 10;
+                    profile.mobility.recent_engagements.drain(0..drop_n);
+                }
+                let _ = self.append_event_vis(
+                    "gm_secret",
+                    Some(dest.clone()),
+                    vec![cid.to_string(), dest.clone()],
+                    eng_summary.clone(),
+                    EventPayload::NarrativeEvent {
+                        title: format!("[Covert] Arrival: {proj_name} in {dest_name}"),
+                        details: eng_summary,
+                        tags: vec!["npc_movement".into(), "covert".into(), trip.purpose.clone()],
+                    },
+                );
+                engagement_opt = Some(eng);
+            } else {
+                // Find counterparts present at destination for organic business / networking engagement
+                let counterparts: Vec<(&String, &CharacterProjection)> = all_chars
+                    .iter()
+                    .filter(|(other_id, other_p)| {
+                        other_id.as_str() != cid
+                            && !profile.mobility.entourage_ids.contains(*other_id)
+                            && Self::npc_is_mobile_alive(other_p)
+                            && other_p.current.current_location.as_deref() == Some(dest.as_str())
+                    })
+                    .take(2)
+                    .collect();
+
+                let cp_ids: Vec<String> = counterparts.iter().map(|(id, _)| (*id).clone()).collect();
+                let cp_names: Vec<String> = counterparts
+                    .iter()
+                    .map(|(_, p)| p.baseline.name.clone())
+                    .collect();
+
+                let eng_summary = if !cp_names.is_empty() {
+                    format!(
+                        "{proj_name} arrived in {dest_name} for {} and networked with {}",
+                        trip.purpose,
+                        cp_names.join(" & ")
+                    )
+                } else {
+                    format!(
+                        "{proj_name} arrived in {dest_name} to conduct {} business",
+                        trip.purpose
+                    )
+                };
+
+                let eng = NpcEngagement {
+                    world_time: now_str.to_string(),
+                    place_id: dest.clone(),
+                    purpose: trip.purpose.clone(),
+                    counterparts: cp_ids.clone(),
+                    summary: eng_summary.clone(),
+                    visibility: "public".to_string(),
+                };
+                profile.mobility.recent_engagements.push(eng.clone());
+                if profile.mobility.recent_engagements.len() > 10 {
+                    let drop_n = profile.mobility.recent_engagements.len() - 10;
+                    profile.mobility.recent_engagements.drain(0..drop_n);
+                }
+
+                // Record mirrored engagement on counterparts + organic rumor propagation (1 public claim max)
+                let traveler_beliefs = self.db.list_beliefs_for_actor(cid).unwrap_or_default();
+                let all_claims = self.db.list_knowledge_claims().unwrap_or_default();
+                for cp_id in &cp_ids {
+                    if let Ok(mut cp_prof) = self.get_character_profile(cp_id) {
+                        cp_prof.mobility.recent_engagements.push(NpcEngagement {
+                            world_time: now_str.to_string(),
+                            place_id: dest.clone(),
+                            purpose: trip.purpose.clone(),
+                            counterparts: vec![cid.to_string()],
+                            summary: eng_summary.clone(),
+                            visibility: "public".to_string(),
+                        });
+                        if cp_prof.mobility.recent_engagements.len() > 10 {
+                            let drop_n = cp_prof.mobility.recent_engagements.len() - 10;
+                            cp_prof.mobility.recent_engagements.drain(0..drop_n);
+                        }
+                        cp_prof.updated_at_world_time = now_str.to_string();
+                        let _ = self.db.upsert_character_profile(&cp_prof);
+                    }
+
+                    // Propagate up to 1 non-concealed public claim the traveler knows that the counterpart doesn't
+                    if rumor_shared.is_none() && !traveler_beliefs.is_empty() {
+                        let cp_known: std::collections::BTreeSet<String> = self
+                            .db
+                            .list_beliefs_for_actor(cp_id)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|b| b.claim_id)
+                            .collect();
+                        for tb in &traveler_beliefs {
+                            if tb.concealing || tb.confidence < 55 || cp_known.contains(&tb.claim_id)
+                            {
+                                continue;
+                            }
+                            if let Some(cl) = all_claims.iter().find(|c| {
+                                c.id == tb.claim_id
+                                    && c.superseded_by_id.is_none()
+                                    && c.visibility != "gm_secret"
+                            }) {
+                                let propagated = ActorBelief {
+                                    claim_id: cl.id.clone(),
+                                    actor_id: cp_id.clone(),
+                                    perceived_claim: if tb.perceived_claim.is_empty() {
+                                        cl.claim.clone()
+                                    } else {
+                                        tb.perceived_claim.clone()
+                                    },
+                                    stance: "believes".to_string(),
+                                    confidence: tb.confidence.saturating_sub(10).max(40),
+                                    source: format!("networked_with:{cid}"),
+                                    source_trustworthy: Some(true),
+                                    concealing: false,
+                                    outdated: tb.outdated,
+                                    learned_at_world_time: now_str.to_string(),
+                                    notes: format!(
+                                        "Exchanged during {} in {dest_name}",
+                                        trip.purpose
+                                    ),
+                                };
+                                if self.db.upsert_actor_belief(&propagated).is_ok() {
+                                    rumor_shared = Some(format!(
+                                        "{proj_name} shared '{}' with {cp_id} in {dest_name}",
+                                        cl.subject
+                                    ));
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                let mut involved = vec![cid.to_string(), dest.clone()];
+                involved.extend(cp_ids.iter().cloned());
+                let _ = self.db.append_event(
+                    Some(dest.clone()),
+                    involved,
+                    eng_summary.clone(),
+                    EventPayload::NarrativeEvent {
+                        title: format!("Arrival & Networking: {proj_name} in {dest_name}"),
+                        details: eng_summary,
+                        tags: vec!["npc_movement".into(), trip.purpose.clone()],
+                    },
+                );
+                engagement_opt = Some(eng);
+            }
         }
 
         profile.updated_at_world_time = now_str.to_string();
         self.db.upsert_character_profile(profile)?;
 
         Ok(serde_json::json!({
-            "event": if trip.purpose == "return_home" { "returned_home" } else { "arrived" },
+            "event": if trip.purpose == "return_home" { "returned_home" } else if is_wild_or_uncharted { "roaming_wild" } else { "arrived" },
             "character_id": cid,
             "name": proj_name,
             "destination": dest,
+            "destination_name": dest_name,
+            "visibility": vis,
             "purpose": trip.purpose,
+            "grid_pos": profile.mobility.current_grid_pos,
             "engagement": engagement_opt,
             "rumor_shared": rumor_shared
         }))
     }
 
-    /// Simulates prominent NPC business travel, diplomatic/networking circuits, arrivals, departures,
-    /// route-disruption detours/stranding, and organic rumor propagation across elapsed in-world hours.
+    /// Simulates prominent NPC business travel, diplomatic/networking circuits, covert/map-aware roaming,
+    /// arrivals, departures, route-disruption detours/stranding, and organic rumor propagation across elapsed in-world hours.
     pub fn tick_npc_movements(
         &self,
         elapsed_hours: u64,
@@ -10868,23 +11543,10 @@ impl CampaignEngine {
         let now_h = meta.clock.total_hours();
         let now_str = meta.clock.format_short();
         let all_places = load_all_place_projections(&self.db, None)?;
-        if all_places.len() < 2 {
-            return Ok(serde_json::json!({
-                "events_count": 0,
-                "events": [],
-                "note": "Need at least 2 connected places for NPC travel."
-            }));
-        }
         let routes = self.all_world_routes_merged(&all_places);
-        if routes.is_empty() {
-            return Ok(serde_json::json!({
-                "events_count": 0,
-                "events": [],
-                "note": "No travel routes defined between places yet."
-            }));
-        }
-
+        let all_grids = self.db.list_map_grids().unwrap_or_default();
         let all_chars = load_all_character_projections(&self.db, None)?;
+
         let mut faction_leaders = std::collections::BTreeSet::new();
         for fac in self.db.list_factions().unwrap_or_default() {
             for m in &fac.members {
@@ -10907,11 +11569,21 @@ impl CampaignEngine {
             .map(|s| resolve_character_id(&self.db, s).unwrap_or_else(|_| slugify(s)))
             .collect();
 
+        // Precompute PC settlement anchors for optional soft `pc_proximity_bias`
+        let pc_locations: Vec<String> = all_chars
+            .values()
+            .filter(|cp| cp.baseline.kind.eq_ignore_ascii_case("pc"))
+            .filter_map(|cp| cp.current.current_location.clone())
+            .collect();
+        let pc_settlements: Vec<String> = pc_locations
+            .iter()
+            .map(|loc| self.resolve_place_parent_settlement(loc, &all_places, &routes, &all_grids))
+            .collect();
+
         // Collect all eligible prominent / active-trip NPCs
         let mut candidates: Vec<(String, String, Vec<String>)> = Vec::new();
         for (cid, proj) in &all_chars {
             if !scope_set.is_empty() && !scope_set.contains(cid) {
-                // Even when scoped, always finish arrivals for NPCs already in transit or visiting!
                 let prof = self.get_character_profile(cid)?;
                 if prof.mobility.active_trip.is_none() && !prof.mobility.prominent {
                     continue;
@@ -10944,6 +11616,12 @@ impl CampaignEngine {
                 Some(h) => h,
                 None => continue,
             };
+            let vis = profile.mobility.visibility.clone();
+            let is_covert = profile.mobility.is_covert();
+            let is_map_or_weighted = matches!(
+                profile.mobility.roam_strategy.as_str(),
+                "map_roam" | "weighted_random"
+            );
 
             // PHASE A: Complete in-transit trips whose ETA has arrived
             if profile.mobility.current_status == "in_transit" {
@@ -10964,8 +11642,11 @@ impl CampaignEngine {
                 }
             }
 
-            // PHASE B: End visits whose stay duration has elapsed -> depart to next stop or home
-            if profile.mobility.current_status == "visiting" {
+            // PHASE B: End visits or wild roams whose stay duration has elapsed -> chain or return home
+            let mut chained_to_phase_c = false;
+            if profile.mobility.current_status == "visiting"
+                || profile.mobility.current_status == "roaming_wild"
+            {
                 let due_to_leave = profile
                     .mobility
                     .active_trip
@@ -10973,160 +11654,275 @@ impl CampaignEngine {
                     .map(|t| t.return_after_total_hours <= now_h)
                     .unwrap_or(true);
                 if due_to_leave {
-                    let cur_loc = profile
-                        .mobility
-                        .active_trip
-                        .as_ref()
-                        .map(|t| t.destination_place_id.clone())
-                        .or_else(|| proj.current.current_location.clone())
-                        .unwrap_or_else(|| home_id.clone());
-
-                    // Decide next leg: next stop in business_circuit (if any unvisited) or return_home
-                    let mut next_dest = home_id.clone();
-                    let mut next_purpose = "return_home".to_string();
-                    let mut next_details = format!("Returning to {home_id}");
-
-                    if effective_mode == "business_circuit"
-                        && profile.mobility.preferred_destinations.len() >= 2
-                        && cur_loc != home_id
-                    {
-                        let next_idx = profile.mobility.circuit_cursor + 1;
-                        if next_idx < profile.mobility.preferred_destinations.len() {
-                            let cand = profile.mobility.preferred_destinations[next_idx].clone();
-                            if cand != cur_loc {
-                                profile.mobility.circuit_cursor = next_idx;
-                                next_dest = cand;
-                                next_purpose = purposes
-                                    .get(next_idx % purposes.len().max(1))
-                                    .cloned()
-                                    .unwrap_or_else(|| "business".to_string());
-                                next_details = "Continuing business circuit".to_string();
-                            }
-                        } else {
-                            profile.mobility.circuit_cursor = 0;
-                        }
-                    }
-
-                    if cur_loc == next_dest {
-                        profile.mobility.current_status = "at_home".to_string();
-                        profile.mobility.active_trip = None;
-                        profile.mobility.last_trip_ended_total_hours = Some(now_h);
-                        profile.updated_at_world_time = now_str.clone();
-                        self.db.upsert_character_profile(&profile)?;
-                    } else if let Some((legs, _km, hours_f)) = compute_shortest_route(
-                        &routes,
-                        &cur_loc,
-                        &next_dest,
-                        &profile.mobility.travel_speed_mode,
-                        &meta.clock.season,
-                        &meta.clock.global_weather,
-                        1.0,
-                        false,
-                    ) {
-                        let travel_h = (hours_f.ceil() as u64).max(2);
-                        let dep_h = profile
-                            .mobility
-                            .active_trip
-                            .as_ref()
-                            .map(|t| t.return_after_total_hours.min(now_h))
-                            .unwrap_or(now_h);
-                        let eta_h = dep_h + (travel_h as i64);
-                        let stay_d = profile.mobility.stay_duration_days.max(1);
-                        let eta_delta = (eta_h - now_h).max(0) as u64;
-                        let eta_clock = meta.clock.clock_after_hours(eta_delta);
-                        let ret_clock = eta_clock.clock_after_hours((stay_d as u64) * 24);
-                        let trip = NpcTripState {
-                            origin_place_id: cur_loc.clone(),
-                            destination_place_id: next_dest.clone(),
-                            route_waypoints: legs.iter().map(|l| l.to_place_id.clone()).collect(),
-                            purpose: next_purpose.clone(),
-                            details: next_details,
-                            departed_at_world_time: now_str.clone(),
-                            departed_total_hours: dep_h,
-                            eta_world_time: eta_clock.format_short(),
-                            eta_total_hours: eta_h,
-                            return_after_total_hours: eta_h + (stay_d as i64) * 24,
-                            return_after_world_time: ret_clock.format_short(),
-                            transport_mode: profile.mobility.travel_speed_mode.clone(),
-                            detour_note: String::new(),
-                        };
-                        profile.mobility.current_status = "in_transit".to_string();
-                        profile.mobility.active_trip = Some(trip);
-                        profile.updated_at_world_time = now_str.clone();
-                        self.db.upsert_character_profile(&profile)?;
-
-                        if eta_h <= now_h {
-                            if let Ok(ev_json) = self.resolve_npc_arrival(
-                                cid,
-                                &proj.baseline.name,
-                                &mut profile,
-                                now_h,
-                                &now_str,
-                                &all_chars,
-                                &all_places,
-                            ) {
-                                events_out.push(ev_json);
-                            }
-                        } else {
-                            events_out.push(serde_json::json!({
-                                "event": "departed",
-                                "character_id": cid,
-                                "name": proj.baseline.name,
-                                "from": cur_loc,
-                                "to": next_dest,
-                                "purpose": next_purpose,
-                                "eta": eta_clock.format_short()
-                            }));
-                        }
+                    let was_wild = profile.mobility.current_status == "roaming_wild";
+                    // For map_roam / weighted_random: chain up to 2 excursions before returning home to maintain cover
+                    if is_map_or_weighted && profile.mobility.excursions_since_home < 2 {
+                        chained_to_phase_c = true;
                     } else {
-                        // All routes back home are blocked/destroyed -> figure is stranded!
-                        profile.mobility.current_status = "stranded".to_string();
-                        if let Some(ref mut tr) = profile.mobility.active_trip {
-                            tr.detour_note = format!(
-                                "Stranded in {cur_loc}: no open route to {next_dest} (roads blocked/destroyed)"
-                            );
+                        let cur_loc = if was_wild {
+                            proj.current
+                                .current_location
+                                .clone()
+                                .unwrap_or_else(|| home_id.clone())
+                        } else {
+                            profile
+                                .mobility
+                                .active_trip
+                                .as_ref()
+                                .map(|t| t.destination_place_id.clone())
+                                .or_else(|| proj.current.current_location.clone())
+                                .unwrap_or_else(|| home_id.clone())
+                        };
+
+                        let mut next_dest = home_id.clone();
+                        let mut next_purpose = "return_home".to_string();
+                        let mut next_details = format!("Returning to {home_id}");
+
+                        if !was_wild
+                            && effective_mode == "business_circuit"
+                            && !is_map_or_weighted
+                            && profile.mobility.preferred_destinations.len() >= 2
+                            && cur_loc != home_id
+                        {
+                            let next_idx = profile.mobility.circuit_cursor + 1;
+                            if next_idx < profile.mobility.preferred_destinations.len() {
+                                let cand = profile.mobility.preferred_destinations[next_idx].clone();
+                                if cand != cur_loc {
+                                    profile.mobility.circuit_cursor = next_idx;
+                                    next_dest = cand;
+                                    next_purpose = purposes
+                                        .get(next_idx % purposes.len().max(1))
+                                        .cloned()
+                                        .unwrap_or_else(|| "business".to_string());
+                                    next_details = "Continuing business circuit".to_string();
+                                }
+                            } else {
+                                profile.mobility.circuit_cursor = 0;
+                            }
                         }
-                        profile.updated_at_world_time = now_str.clone();
-                        self.db.upsert_character_profile(&profile)?;
-                        let note = format!(
-                            "{} is stranded in {cur_loc} — route to {next_dest} is severed",
-                            proj.baseline.name
-                        );
-                        let _ = self.db.append_event(
-                            Some(cur_loc.clone()),
-                            vec![cid.clone(), cur_loc.clone(), next_dest.clone()],
-                            note.clone(),
-                            EventPayload::NarrativeEvent {
-                                title: format!("Traveler Stranded: {}", proj.baseline.name),
-                                details: note.clone(),
-                                tags: vec!["npc_movement".into(), "stranded".into()],
-                            },
-                        );
-                        events_out.push(serde_json::json!({
-                            "event": "stranded",
-                            "character_id": cid,
-                            "name": proj.baseline.name,
-                            "at": cur_loc,
-                            "intended_destination": next_dest,
-                            "note": note
-                        }));
+
+                        if !was_wild && cur_loc == next_dest {
+                            profile.mobility.current_status = "at_home".to_string();
+                            profile.mobility.active_trip = None;
+                            profile.mobility.current_grid_pos = None;
+                            profile.mobility.current_excursion_note = None;
+                            profile.mobility.excursions_since_home = 0;
+                            profile.mobility.last_trip_ended_total_hours = Some(now_h);
+                            profile.updated_at_world_time = now_str.clone();
+                            self.db.upsert_character_profile(&profile)?;
+                        } else {
+                            // Compute return/next-leg travel hours via Dijkstra OR regional map grid fallback
+                            let route_res = if !was_wild {
+                                compute_shortest_route(
+                                    &routes,
+                                    &cur_loc,
+                                    &next_dest,
+                                    &profile.mobility.travel_speed_mode,
+                                    &meta.clock.season,
+                                    &meta.clock.global_weather,
+                                    1.0,
+                                    false,
+                                )
+                                .map(|(legs, _km, hours_f)| {
+                                    (
+                                        legs.iter().map(|l| l.to_place_id.clone()).collect::<Vec<_>>(),
+                                        Self::adjust_hours_for_conveyance(hours_f, &profile.mobility),
+                                    )
+                                })
+                            } else {
+                                None
+                            };
+
+                            let overland_fallback = if route_res.is_none()
+                                && (was_wild || is_map_or_weighted)
+                            {
+                                let mut est_h = None;
+                                if let Some(ref gid) = profile.mobility.roam_grid_id {
+                                    if let (Ok(Some(grid)), Ok(cells)) =
+                                        (self.db.get_map_grid(gid), self.db.list_map_cells(gid))
+                                    {
+                                        let dest_s = self.resolve_place_parent_settlement(
+                                            &next_dest,
+                                            &all_places,
+                                            &routes,
+                                            &all_grids,
+                                        );
+                                        let to_xy = cells
+                                            .iter()
+                                            .find(|c| {
+                                                c.place_id.as_deref() == Some(next_dest.as_str())
+                                                    || c.place_id.as_deref()
+                                                        == Some(dest_s.as_str())
+                                            })
+                                            .map(|c| (c.x, c.y));
+                                        let from_xy = profile
+                                            .mobility
+                                            .current_grid_pos
+                                            .as_ref()
+                                            .filter(|g| g.grid_id == grid.id)
+                                            .map(|g| (g.x, g.y))
+                                            .or_else(|| {
+                                                let cur_s = self.resolve_place_parent_settlement(
+                                                    &cur_loc,
+                                                    &all_places,
+                                                    &routes,
+                                                    &all_grids,
+                                                );
+                                                cells
+                                                    .iter()
+                                                    .find(|c| {
+                                                        c.place_id.as_deref()
+                                                            == Some(cur_loc.as_str())
+                                                            || c.place_id.as_deref()
+                                                                == Some(cur_s.as_str())
+                                                    })
+                                                    .map(|c| (c.x, c.y))
+                                            });
+                                        if let (Some(fxy), Some(txy)) = (from_xy, to_xy) {
+                                            let cell_km =
+                                                grid_cell_scale_km(&grid.cell_scale_label)
+                                                    .unwrap_or(5.0);
+                                            est_h = Some(Self::estimate_grid_travel_hours(
+                                                fxy,
+                                                txy,
+                                                cell_km,
+                                                "road",
+                                                &profile.mobility,
+                                            ));
+                                        }
+                                    }
+                                }
+                                Some((Vec::new(), est_h.unwrap_or(18)))
+                            } else {
+                                None
+                            };
+
+                            if let Some((waypoints, travel_h)) = route_res.or(overland_fallback) {
+                                let dep_h = profile
+                                    .mobility
+                                    .active_trip
+                                    .as_ref()
+                                    .map(|t| t.return_after_total_hours.min(now_h))
+                                    .unwrap_or(now_h);
+                                let eta_h = dep_h + (travel_h as i64);
+                                let stay_d = profile.mobility.stay_duration_days.max(1);
+                                let eta_delta = (eta_h - now_h).max(0) as u64;
+                                let eta_clock = meta.clock.clock_after_hours(eta_delta);
+                                let ret_clock =
+                                    eta_clock.clock_after_hours((stay_d as u64) * 24);
+                                let trip = NpcTripState {
+                                    origin_place_id: cur_loc.clone(),
+                                    destination_place_id: next_dest.clone(),
+                                    route_waypoints: waypoints,
+                                    purpose: next_purpose.clone(),
+                                    details: next_details,
+                                    departed_at_world_time: now_str.clone(),
+                                    departed_total_hours: dep_h,
+                                    eta_world_time: eta_clock.format_short(),
+                                    eta_total_hours: eta_h,
+                                    return_after_total_hours: eta_h + (stay_d as i64) * 24,
+                                    return_after_world_time: ret_clock.format_short(),
+                                    transport_mode: profile.mobility.travel_speed_mode.clone(),
+                                    detour_note: String::new(),
+                                    visibility: vis.clone(),
+                                    target_grid_pos: None,
+                                    uncharted_label: None,
+                                };
+                                profile.mobility.current_status = "in_transit".to_string();
+                                profile.mobility.active_trip = Some(trip);
+                                profile.updated_at_world_time = now_str.clone();
+                                self.db.upsert_character_profile(&profile)?;
+
+                                if eta_h <= now_h {
+                                    if let Ok(ev_json) = self.resolve_npc_arrival(
+                                        cid,
+                                        &proj.baseline.name,
+                                        &mut profile,
+                                        now_h,
+                                        &now_str,
+                                        &all_chars,
+                                        &all_places,
+                                    ) {
+                                        events_out.push(ev_json);
+                                    }
+                                } else {
+                                    events_out.push(serde_json::json!({
+                                        "event": "departed",
+                                        "character_id": cid,
+                                        "name": proj.baseline.name,
+                                        "from": cur_loc,
+                                        "to": next_dest,
+                                        "purpose": next_purpose,
+                                        "visibility": vis,
+                                        "eta": eta_clock.format_short()
+                                    }));
+                                }
+                            } else {
+                                // All routes back home are blocked/destroyed -> figure is stranded!
+                                profile.mobility.current_status = "stranded".to_string();
+                                if let Some(ref mut tr) = profile.mobility.active_trip {
+                                    tr.detour_note = format!(
+                                        "Stranded in {cur_loc}: no open route to {next_dest} (roads blocked/destroyed)"
+                                    );
+                                }
+                                profile.updated_at_world_time = now_str.clone();
+                                self.db.upsert_character_profile(&profile)?;
+                                let note = format!(
+                                    "{} is stranded in {cur_loc} — route to {next_dest} is severed",
+                                    proj.baseline.name
+                                );
+                                let _ = self.append_event_vis(
+                                    &vis,
+                                    Some(cur_loc.clone()),
+                                    vec![cid.clone(), cur_loc.clone(), next_dest.clone()],
+                                    note.clone(),
+                                    EventPayload::NarrativeEvent {
+                                        title: format!("Traveler Stranded: {}", proj.baseline.name),
+                                        details: note.clone(),
+                                        tags: vec!["npc_movement".into(), "stranded".into()],
+                                    },
+                                );
+                                events_out.push(serde_json::json!({
+                                    "event": "stranded",
+                                    "character_id": cid,
+                                    "name": proj.baseline.name,
+                                    "at": cur_loc,
+                                    "intended_destination": next_dest,
+                                    "visibility": vis,
+                                    "note": note
+                                }));
+                            }
+                        }
                     }
                 }
             }
 
-            // PHASE C: Prominent figures at home whose cadence window has elapsed embark on business/networking travel
-            if profile.mobility.current_status == "at_home" || profile.mobility.current_status == "stranded" {
+            // PHASE C: Prominent figures at home (or chaining a roam) embark on travel
+            if chained_to_phase_c
+                || profile.mobility.current_status == "at_home"
+                || profile.mobility.current_status == "stranded"
+            {
                 let cadence_h = (profile.mobility.trip_cadence_days.max(1) as i64) * 24;
-                // Deterministic stagger so prominent NPCs spread out naturally instead of all leaving the same hour
                 let h_mix = seed
+                    .wrapping_add((now_h as u64).wrapping_mul(0x517C_C1B7_2722_0A95))
                     .wrapping_add((idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
-                    .wrapping_add(cid.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64)));
-                let should_depart = match profile.mobility.last_trip_ended_total_hours {
-                    Some(last_h) => (now_h - last_h) >= cadence_h,
-                    None => {
-                        // First-ever trip: departs if elapsed_hours >= stagger window (at most cadence_h)
-                        let stagger = (h_mix % (cadence_h.max(24) as u64)).min(48) as i64;
-                        (elapsed_hours as i64) >= stagger || profile.mobility.prominent
+                    .wrapping_add(
+                        (profile.mobility.excursions_since_home as u64)
+                            .wrapping_mul(0x94D0_49BB_1331_11EB),
+                    )
+                    .wrapping_add(
+                        cid.bytes()
+                            .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64)),
+                    );
+                let should_depart = if chained_to_phase_c {
+                    true
+                } else {
+                    match profile.mobility.last_trip_ended_total_hours {
+                        Some(last_h) => (now_h - last_h) >= cadence_h,
+                        None => {
+                            let stagger = (h_mix % (cadence_h.max(24) as u64)).min(48) as i64;
+                            (elapsed_hours as i64) >= stagger || profile.mobility.prominent
+                        }
                     }
                 };
 
@@ -11136,86 +11932,346 @@ impl CampaignEngine {
                         .current_location
                         .clone()
                         .unwrap_or_else(|| home_id.clone());
+                    let purpose = purposes
+                        .get((h_mix as usize) % purposes.len().max(1))
+                        .cloned()
+                        .unwrap_or_else(|| "business".to_string());
+                    let stay_d = profile.mobility.stay_duration_days.max(1);
 
-                    // Build ranked destination candidates
-                    let mut dest_pool: Vec<String> = Vec::new();
-                    if !profile.mobility.preferred_destinations.is_empty() {
-                        let cur_i = profile.mobility.circuit_cursor % profile.mobility.preferred_destinations.len();
-                        for offset in 0..profile.mobility.preferred_destinations.len() {
-                            let p = &profile.mobility.preferred_destinations[(cur_i + offset) % profile.mobility.preferred_destinations.len()];
-                            if p != &origin && !dest_pool.contains(p) {
-                                dest_pool.push(p.clone());
-                            }
-                        }
-                    } else {
-                        // For networking_envoy: prioritize places currently hosting other alive NPCs!
-                        if effective_mode == "networking_envoy" {
-                            for (oid, op) in &all_chars {
-                                if oid != cid && Self::npc_is_mobile_alive(op) {
-                                    if let Some(ref oloc) = op.current.current_location {
-                                        if oloc != &origin && !dest_pool.contains(oloc) {
-                                            dest_pool.push(oloc.clone());
-                                        }
+                    // Decide whether this excursion is a wilderness / uncharted foray
+                    let roll_wild = (h_mix % 100) < (profile.mobility.wild_roam_chance as u64);
+                    let mut chosen_trip: Option<(
+                        String,
+                        Vec<String>,
+                        u64,
+                        String,
+                        Option<GridPosition>,
+                        Option<String>,
+                    )> = None;
+
+                    if is_map_or_weighted && roll_wild {
+                        if let Some(ref gid) = profile.mobility.roam_grid_id {
+                            if let (Ok(Some(grid)), Ok(cells)) =
+                                (self.db.get_map_grid(gid), self.db.list_map_cells(gid))
+                            {
+                                let allowed_terrains: Vec<String> =
+                                    if profile.mobility.roam_terrains.is_empty() {
+                                        vec![
+                                            "forest".into(),
+                                            "mountain".into(),
+                                            "plains".into(),
+                                            "road".into(),
+                                            "swamp".into(),
+                                            "wilderness".into(),
+                                        ]
+                                    } else {
+                                        profile.mobility.roam_terrains.clone()
+                                    };
+                                let cell_km =
+                                    grid_cell_scale_km(&grid.cell_scale_label).unwrap_or(5.0);
+                                let origin_s = self.resolve_place_parent_settlement(
+                                    &origin,
+                                    &all_places,
+                                    &routes,
+                                    &all_grids,
+                                );
+                                let from_xy = profile
+                                    .mobility
+                                    .current_grid_pos
+                                    .as_ref()
+                                    .filter(|g| g.grid_id == grid.id)
+                                    .map(|g| (g.x, g.y))
+                                    .or_else(|| {
+                                        cells
+                                            .iter()
+                                            .find(|c| {
+                                                c.place_id.as_deref() == Some(origin.as_str())
+                                                    || c.place_id.as_deref()
+                                                        == Some(origin_s.as_str())
+                                            })
+                                            .map(|c| (c.x, c.y))
+                                    })
+                                    .unwrap_or(((grid.width / 2) as i32, (grid.height / 2) as i32));
+
+                                let eligible: Vec<&MapGridCell> = cells
+                                    .iter()
+                                    .filter(|c| {
+                                        let t = c.terrain.to_ascii_lowercase();
+                                        c.place_id.is_none()
+                                            && t != "water"
+                                            && t != "ocean"
+                                            && allowed_terrains.iter().any(|at| t.contains(at))
+                                            && (c.x != from_xy.0 || c.y != from_xy.1)
+                                    })
+                                    .collect();
+
+                                // Soft PC regional gravity without teleporting
+                                let bias_hit = profile.mobility.pc_proximity_bias > 0
+                                    && ((h_mix >> 11) % 100)
+                                        < (profile.mobility.pc_proximity_bias as u64);
+                                let mut picked_cell: Option<&MapGridCell> = None;
+                                if bias_hit && !pc_settlements.is_empty() {
+                                    let pc_xys: Vec<(i32, i32)> = cells
+                                        .iter()
+                                        .filter(|c| {
+                                            c.place_id.as_deref().is_some_and(|pid| {
+                                                pc_locations.iter().any(|p| p == pid)
+                                                    || pc_settlements.iter().any(|p| p == pid)
+                                            })
+                                        })
+                                        .map(|c| (c.x, c.y))
+                                        .collect();
+                                    let near_pc: Vec<&MapGridCell> = eligible
+                                        .iter()
+                                        .copied()
+                                        .filter(|c| {
+                                            pc_xys.iter().any(|(px, py)| {
+                                                let d = ((c.x - px) as f64).hypot((c.y - py) as f64)
+                                                    * cell_km;
+                                                (5.0..=45.0).contains(&d)
+                                            })
+                                        })
+                                        .collect();
+                                    if !near_pc.is_empty() {
+                                        picked_cell =
+                                            Some(near_pc[((h_mix >> 7) as usize) % near_pc.len()]);
                                     }
+                                }
+                                if picked_cell.is_none() && !eligible.is_empty() {
+                                    picked_cell =
+                                        Some(eligible[((h_mix >> 7) as usize) % eligible.len()]);
+                                }
+
+                                if let Some(c) = picked_cell {
+                                    let travel_h = Self::estimate_grid_travel_hours(
+                                        from_xy,
+                                        (c.x, c.y),
+                                        cell_km,
+                                        &c.terrain,
+                                        &profile.mobility,
+                                    );
+                                    let gp = GridPosition {
+                                        grid_id: grid.id.clone(),
+                                        x: c.x,
+                                        y: c.y,
+                                        terrain: c.terrain.clone(),
+                                        label: c.label.clone(),
+                                    };
+                                    chosen_trip = Some((
+                                        format!("wild:{}:{}:{}", grid.id, c.x, c.y),
+                                        Vec::new(),
+                                        travel_h,
+                                        String::new(),
+                                        Some(gp),
+                                        None,
+                                    ));
                                 }
                             }
                         }
-                        // Add all other places in the world (filtered by real Dijkstra reachability below!)
-                        for pid in all_places.keys() {
-                            if pid != &origin && !dest_pool.contains(pid) {
-                                dest_pool.push(pid.clone());
-                            }
-                        }
-                    }
-
-                    // Filter to reachable destinations via Dijkstra
-                    let mut reachable: Vec<(String, Vec<String>, u64, String)> = Vec::new();
-                    for cand in &dest_pool {
-                        if let Some((legs, _km, hours_f)) = compute_shortest_route(
-                            &routes,
-                            &origin,
-                            cand,
-                            &profile.mobility.travel_speed_mode,
-                            &meta.clock.season,
-                            &meta.clock.global_weather,
-                            1.0,
-                            false,
-                        ) {
-                            let direct_closed = routes.iter().any(|r| {
-                                ((r.from_place_id == origin && r.to_place_id == *cand)
-                                    || (r.bidirectional && r.from_place_id == *cand && r.to_place_id == origin))
-                                    && (r.status.eq_ignore_ascii_case("blocked")
-                                        || r.status.eq_ignore_ascii_case("destroyed"))
-                            });
-                            let detour = if direct_closed {
-                                format!("Detoured around closed road {origin} -> {cand}")
-                            } else {
-                                String::new()
-                            };
-                            reachable.push((
-                                cand.clone(),
-                                legs.iter().map(|l| l.to_place_id.clone()).collect(),
-                                (hours_f.ceil() as u64).max(2),
-                                detour,
+                        // Fallback to uncharted frontier excursion (keeps map canon-honest!)
+                        if chosen_trip.is_none() {
+                            let frontier_labels = [
+                                "Uncharted mountain valley",
+                                "Unnamed border market road",
+                                "Remote woodland ridge",
+                                "Quiet river-bend crossing",
+                            ];
+                            let ul = frontier_labels
+                                [((h_mix >> 5) as usize) % frontier_labels.len()]
+                            .to_string();
+                            let spd = effective_travel_speed_kmh(
+                                &profile.mobility.travel_speed_mode,
+                                profile.mobility.conveyance.as_ref().and_then(|c| c.speed_kmh),
+                            );
+                            let travel_h = ((100.0 / spd.max(1.0)).ceil() as u64).clamp(6, 48);
+                            chosen_trip = Some((
+                                format!("uncharted:{}", slugify(&ul)),
+                                Vec::new(),
+                                travel_h,
+                                String::new(),
+                                None,
+                                Some(ul),
                             ));
                         }
                     }
 
-                    if !reachable.is_empty() {
-                        let pick_idx = if !profile.mobility.preferred_destinations.is_empty()
-                            || effective_mode == "networking_envoy"
-                        {
-                            0
+                    // Otherwise pick a named hub / settlement destination
+                    if chosen_trip.is_none() {
+                        let mut dest_pool: Vec<String> = Vec::new();
+                        if !profile.mobility.preferred_destinations.is_empty() {
+                            let cur_i = profile.mobility.circuit_cursor
+                                % profile.mobility.preferred_destinations.len();
+                            for offset in 0..profile.mobility.preferred_destinations.len() {
+                                let p = &profile.mobility.preferred_destinations
+                                    [(cur_i + offset) % profile.mobility.preferred_destinations.len()];
+                                if p != &origin && !dest_pool.contains(p) {
+                                    dest_pool.push(p.clone());
+                                }
+                            }
                         } else {
-                            (h_mix as usize) % reachable.len()
-                        };
-                        let (dest, waypoints, travel_h, detour_note) = reachable.remove(pick_idx);
-                        let purpose = purposes
-                            .get((h_mix as usize) % purposes.len().max(1))
-                            .cloned()
-                            .unwrap_or_else(|| "business".to_string());
-                        let stay_d = profile.mobility.stay_duration_days.max(1);
-                        // Depart partway through the elapsed window if elapsed_hours > travel_h so arrivals feel natural
+                            // If map_roam has a roam_grid_id, prefer named places actually anchored on that regional map!
+                            if is_map_or_weighted {
+                                if let Some(ref gid) = profile.mobility.roam_grid_id {
+                                    if let Ok(cells) = self.db.list_map_cells(gid) {
+                                        for c in cells {
+                                            if let Some(pid) = c.place_id {
+                                                if pid != origin
+                                                    && pid != home_id
+                                                    && all_places.get(&pid).is_some_and(|pl| {
+                                                        !matches!(
+                                                            pl.baseline
+                                                                .place_type
+                                                                .to_ascii_lowercase()
+                                                                .as_str(),
+                                                            "continent" | "region"
+                                                        )
+                                                    })
+                                                    && !dest_pool.contains(&pid)
+                                                {
+                                                    dest_pool.push(pid);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if effective_mode == "networking_envoy" {
+                                for (oid, op) in &all_chars {
+                                    if oid != cid && Self::npc_is_mobile_alive(op) {
+                                        if let Some(ref oloc) = op.current.current_location {
+                                            if oloc != &origin && !dest_pool.contains(oloc) {
+                                                dest_pool.push(oloc.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if dest_pool.is_empty() {
+                                for (pid, pl) in &all_places {
+                                    if pid != &origin
+                                        && !matches!(
+                                            pl.baseline.place_type.to_ascii_lowercase().as_str(),
+                                            "continent" | "region"
+                                        )
+                                        && !dest_pool.contains(pid)
+                                    {
+                                        dest_pool.push(pid.clone());
+                                    }
+                                }
+                            }
+                        }
+
+                        // Filter to reachable via Dijkstra OR overland on roam_grid_id (for speculative/unrouted maps)
+                        let mut reachable: Vec<(String, Vec<String>, u64, String)> = Vec::new();
+                        let grid_cache = profile.mobility.roam_grid_id.as_ref().and_then(|gid| {
+                            let g = self.db.get_map_grid(gid).ok().flatten()?;
+                            let cs = self.db.list_map_cells(&g.id).ok()?;
+                            let ckm = grid_cell_scale_km(&g.cell_scale_label).unwrap_or(5.0);
+                            let os = self.resolve_place_parent_settlement(
+                                &origin,
+                                &all_places,
+                                &routes,
+                                &all_grids,
+                            );
+                            let fxy = profile
+                                .mobility
+                                .current_grid_pos
+                                .as_ref()
+                                .filter(|gp| gp.grid_id == g.id)
+                                .map(|gp| (gp.x, gp.y))
+                                .or_else(|| {
+                                    cs.iter()
+                                        .find(|c| {
+                                            c.place_id.as_deref() == Some(origin.as_str())
+                                                || c.place_id.as_deref() == Some(os.as_str())
+                                        })
+                                        .map(|c| (c.x, c.y))
+                                });
+                            Some((cs, ckm, fxy))
+                        });
+
+                        for cand in &dest_pool {
+                            if let Some((legs, _km, hours_f)) = compute_shortest_route(
+                                &routes,
+                                &origin,
+                                cand,
+                                &profile.mobility.travel_speed_mode,
+                                &meta.clock.season,
+                                &meta.clock.global_weather,
+                                1.0,
+                                false,
+                            ) {
+                                let direct_closed = routes.iter().any(|r| {
+                                    ((r.from_place_id == origin && r.to_place_id == *cand)
+                                        || (r.bidirectional
+                                            && r.from_place_id == *cand
+                                            && r.to_place_id == origin))
+                                        && (r.status.eq_ignore_ascii_case("blocked")
+                                            || r.status.eq_ignore_ascii_case("destroyed"))
+                                });
+                                let detour = if direct_closed {
+                                    format!("Detoured around closed road {origin} -> {cand}")
+                                } else {
+                                    String::new()
+                                };
+                                reachable.push((
+                                    cand.clone(),
+                                    legs.iter().map(|l| l.to_place_id.clone()).collect(),
+                                    Self::adjust_hours_for_conveyance(hours_f, &profile.mobility),
+                                    detour,
+                                ));
+                            } else if is_map_or_weighted {
+                                if let Some((ref cs, ckm, Some(fxy))) = grid_cache {
+                                    if let Some(tc) =
+                                        cs.iter().find(|c| c.place_id.as_deref() == Some(cand.as_str()))
+                                    {
+                                        let travel_h = Self::estimate_grid_travel_hours(
+                                            fxy,
+                                            (tc.x, tc.y),
+                                            ckm,
+                                            &tc.terrain,
+                                            &profile.mobility,
+                                        );
+                                        reachable.push((
+                                            cand.clone(),
+                                            Vec::new(),
+                                            travel_h,
+                                            String::new(),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+
+                        if !reachable.is_empty() {
+                            let bias_hit = is_map_or_weighted
+                                && profile.mobility.pc_proximity_bias > 0
+                                && ((h_mix >> 11) % 100)
+                                    < (profile.mobility.pc_proximity_bias as u64);
+                            let pick_idx = if bias_hit {
+                                reachable
+                                    .iter()
+                                    .position(|(c, _, _, _)| {
+                                        pc_locations.contains(c) || pc_settlements.contains(c)
+                                    })
+                                    .unwrap_or_else(|| (h_mix as usize) % reachable.len())
+                            } else if !is_map_or_weighted
+                                && (!profile.mobility.preferred_destinations.is_empty()
+                                    || effective_mode == "networking_envoy")
+                            {
+                                0
+                            } else {
+                                (h_mix as usize) % reachable.len()
+                            };
+                            let (dest, waypoints, travel_h, detour_note) =
+                                reachable.remove(pick_idx);
+                            chosen_trip = Some((dest, waypoints, travel_h, detour_note, None, None));
+                        }
+                    }
+
+                    if let Some((dest, waypoints, travel_h, detour_note, target_gp, uncharted_lbl)) =
+                        chosen_trip
+                    {
                         let dep_offset = if elapsed_hours > travel_h {
                             (elapsed_hours - travel_h).min(elapsed_hours / 2)
                         } else {
@@ -11230,14 +12286,19 @@ impl CampaignEngine {
                         };
                         let ret_h = eta_h + (stay_d as i64) * 24;
                         let ret_clock = eta_clock.clock_after_hours((stay_d as u64) * 24);
-                        let details = format!("Scheduled {effective_mode} trip ({purpose})");
+                        let role_tag = if profile.mobility.narrative_role.is_empty() {
+                            effective_mode.as_str()
+                        } else {
+                            profile.mobility.narrative_role.as_str()
+                        };
+                        let details = format!("Scheduled {role_tag} excursion ({purpose})");
 
                         let trip = NpcTripState {
                             origin_place_id: origin.clone(),
                             destination_place_id: dest.clone(),
                             route_waypoints: waypoints,
                             purpose: purpose.clone(),
-                            details: details.clone(),
+                            details,
                             departed_at_world_time: now_str.clone(),
                             departed_total_hours: dep_h,
                             eta_world_time: eta_clock.format_short(),
@@ -11246,6 +12307,9 @@ impl CampaignEngine {
                             return_after_world_time: ret_clock.format_short(),
                             transport_mode: profile.mobility.travel_speed_mode.clone(),
                             detour_note: detour_note.clone(),
+                            visibility: vis.clone(),
+                            target_grid_pos: target_gp.clone(),
+                            uncharted_label: uncharted_lbl.clone(),
                         };
 
                         profile.mobility.prominent = true;
@@ -11254,26 +12318,45 @@ impl CampaignEngine {
                         profile.updated_at_world_time = now_str.clone();
                         self.db.upsert_character_profile(&profile)?;
 
+                        let dest_disp = if let Some(ref gp) = target_gp {
+                            format!("grid `{}` ({},{}) [{}]", gp.grid_id, gp.x, gp.y, gp.terrain)
+                        } else if let Some(ref ul) = uncharted_lbl {
+                            format!("uncharted: {ul}")
+                        } else {
+                            dest.clone()
+                        };
+                        let conv_disp = profile
+                            .mobility
+                            .conveyance
+                            .as_ref()
+                            .filter(|c| !c.label.trim().is_empty())
+                            .map(|c| c.label.trim().to_string())
+                            .unwrap_or_else(|| profile.mobility.travel_speed_mode.clone());
                         let dep_summary = format!(
-                            "{} departed {} for {} ({}, ~{}h by {}){}",
+                            "{} departed {} for {} ({}, ~{}h via {}){}",
                             proj.baseline.name,
                             origin,
-                            dest,
+                            dest_disp,
                             purpose,
                             travel_h,
-                            profile.mobility.travel_speed_mode,
+                            conv_disp,
                             if detour_note.is_empty() {
                                 String::new()
                             } else {
                                 format!(" [{detour_note}]")
                             }
                         );
-                        let _ = self.db.append_event(
+                        let _ = self.append_event_vis(
+                            &vis,
                             Some(origin.clone()),
                             vec![cid.clone(), origin.clone(), dest.clone()],
                             dep_summary.clone(),
                             EventPayload::NarrativeEvent {
-                                title: format!("Business/Networking Departure: {}", proj.baseline.name),
+                                title: format!(
+                                    "{}Departure: {}",
+                                    if is_covert { "[Covert] " } else { "Business/Networking " },
+                                    proj.baseline.name
+                                ),
                                 details: dep_summary,
                                 tags: vec!["npc_movement".into(), purpose.clone()],
                             },
@@ -11298,7 +12381,9 @@ impl CampaignEngine {
                                 "name": proj.baseline.name,
                                 "from": origin,
                                 "to": dest,
+                                "destination_display": dest_disp,
                                 "purpose": purpose,
+                                "visibility": vis,
                                 "eta": eta_clock.format_short(),
                                 "detour_note": detour_note
                             }));
@@ -11320,6 +12405,10 @@ impl CampaignEngine {
     }
 
     pub fn list_npc_movements(&self) -> Result<serde_json::Value> {
+        self.list_npc_movements_filtered(true)
+    }
+
+    pub fn list_npc_movements_filtered(&self, include_gm_secrets: bool) -> Result<serde_json::Value> {
         let meta = self.db.get_campaign_meta()?;
         let all_chars = load_all_character_projections(&self.db, None)?;
         let all_places = load_all_place_projections(&self.db, None)?;
@@ -11346,6 +12435,9 @@ impl CampaignEngine {
                 continue;
             }
             let prof = self.get_character_profile(cid)?;
+            if prof.mobility.is_covert() && !include_gm_secrets {
+                continue;
+            }
             let inferred = Self::infer_npc_mobility_mode(proj, &prof, &faction_leaders, true);
             let is_prominent = prof.mobility.prominent || inferred.is_some();
             let effective_mode = inferred
@@ -11353,6 +12445,9 @@ impl CampaignEngine {
                 .map(|(m, _)| m.clone())
                 .unwrap_or_else(|| prof.mobility.mobility_mode.clone());
             for eng in &prof.mobility.recent_engagements {
+                if eng.visibility.eq_ignore_ascii_case("gm_secret") && !include_gm_secrets {
+                    continue;
+                }
                 recent_engagements.push(serde_json::json!({
                     "character_id": cid,
                     "name": proj.baseline.name,
@@ -11360,7 +12455,8 @@ impl CampaignEngine {
                     "place_id": eng.place_id,
                     "purpose": eng.purpose,
                     "counterparts": eng.counterparts,
-                    "summary": eng.summary
+                    "summary": eng.summary,
+                    "visibility": eng.visibility
                 }));
             }
             figures.push(serde_json::json!({
@@ -11381,13 +12477,21 @@ impl CampaignEngine {
             .values()
             .map(|p| serde_json::json!({ "id": p.baseline.id, "name": p.baseline.name, "place_type": p.baseline.place_type }))
             .collect();
+        let map_grids: Vec<serde_json::Value> = self
+            .db
+            .list_map_grids()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|g| serde_json::json!({ "id": g.id, "name": g.name, "scale_kind": g.scale_kind, "cell_scale_label": g.cell_scale_label }))
+            .collect();
 
         Ok(serde_json::json!({
             "world_time": meta.clock.format_short(),
             "total_hours": meta.clock.total_hours(),
             "figures": figures,
             "recent_engagements": recent_engagements,
-            "places": places
+            "places": places,
+            "map_grids": map_grids
         }))
     }
 
@@ -12011,7 +13115,8 @@ impl CampaignEngine {
             if routine.enabled { "enabled" } else { "disabled" },
             proj.baseline.name
         );
-        let ev = self.db.append_event(
+        let ev = self.append_event_vis(
+            &routine.visibility,
             proj.current.current_location,
             vec![cid, routine.id.clone()],
             summary.clone(),
@@ -12273,6 +13378,10 @@ impl CampaignEngine {
                 }
             }
 
+            let is_secret_routine = r.visibility.eq_ignore_ascii_case("gm_secret");
+            let routine_sig_vis = if is_secret_routine { "gm_secret" } else { "player" };
+            let routine_ev_vis = if is_secret_routine { "gm_secret" } else { "public" };
+
             if let Some(reason_msg) = guard_fail {
                 r.paused_reason = reason_msg.clone();
                 r.last_tick_total_hours = Some(anchor + (cycles * cadence) as i64);
@@ -12289,7 +13398,7 @@ impl CampaignEngine {
                     entity_ids: vec![cid],
                     location_id: proj.current.current_location,
                     suggested_actions: vec!["Address the blocking condition/location/funds to resume routine ticks.".to_string()],
-                    visibility: "player".to_string(),
+                    visibility: routine_sig_vis.to_string(),
                     status: "active".to_string(),
                     source_event_seq: None,
                     created_at_world_time: now_str.to_string(),
@@ -12362,7 +13471,13 @@ impl CampaignEngine {
             for (track_id, xp_per) in &r.progression_xp {
                 let total_xp = xp_per.saturating_mul(eff_cycles);
                 if total_xp > 0 {
-                    if let Ok((resp, _)) = self.advance_progression_xp(&cid, track_id, total_xp, &reason_tag) {
+                    if let Ok((resp, _)) = self.advance_progression_xp_vis(
+                        &cid,
+                        track_id,
+                        total_xp,
+                        &reason_tag,
+                        routine_ev_vis,
+                    ) {
                         let stg = resp["track"]["sub_stage_label"]
                             .as_str()
                             .filter(|s| !s.is_empty())
@@ -12423,18 +13538,24 @@ impl CampaignEngine {
 
             if !applied_parts.is_empty() {
                 let digest = format!(
-                    "{} — Routine '{}' x{} cycle(s): {}",
+                    "{}{} — Routine '{}' x{} cycle(s): {}",
+                    if is_secret_routine { "[GM SECRET] " } else { "" },
                     proj.baseline.name,
                     r.name,
                     eff_cycles,
                     applied_parts.join(", ")
                 );
-                let ev = self.db.append_event(
+                let ev = self.append_event_vis(
+                    routine_ev_vis,
                     proj.current.current_location.clone(),
                     vec![cid.clone(), r.id.clone()],
                     digest.clone(),
                     EventPayload::NarrativeEvent {
-                        title: format!("Routine Completed: {}", r.name),
+                        title: format!(
+                            "{}Routine Completed: {}",
+                            if is_secret_routine { "[GM SECRET] " } else { "" },
+                            r.name
+                        ),
                         details: digest.clone(),
                         tags: vec!["routine".into(), r.category.clone()],
                     },
@@ -12450,7 +13571,7 @@ impl CampaignEngine {
                     entity_ids: vec![cid],
                     location_id: proj.current.current_location,
                     suggested_actions: vec![],
-                    visibility: "player".to_string(),
+                    visibility: routine_sig_vis.to_string(),
                     status: "active".to_string(),
                     source_event_seq: Some(ev.seq),
                     created_at_world_time: now_str.to_string(),

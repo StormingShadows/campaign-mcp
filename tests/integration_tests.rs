@@ -5752,8 +5752,19 @@ fn test_active_signal_bus_stage_rules_routines_auto_clocks_hydration_currency_an
     );
     let query_tool = play_arr.iter().find(|t| t["name"] == "query").unwrap();
     assert_eq!(query_tool["annotations"]["readOnlyHint"], true);
+    let world_tool = play_arr.iter().find(|t| t["name"] == "world").unwrap();
+    let world_props = world_tool["inputSchema"]["properties"].as_object().unwrap();
+    assert!(world_props.contains_key("x") && world_props.contains_key("y"));
+    assert!(world_props.contains_key("terrain") && world_props.contains_key("cells"));
+    assert!(world_props.contains_key("fog_status"));
+    assert_eq!(world_tool["inputSchema"]["additionalProperties"], true);
     let compact_full = tool_definitions_for_profile(ToolProfile::CompactFull);
     assert_eq!(compact_full.as_array().unwrap().len(), 13);
+    let admin_tool = compact_full.as_array().unwrap().iter().find(|t| t["name"] == "admin").unwrap();
+    let admin_props = admin_tool["inputSchema"]["properties"].as_object().unwrap();
+    assert!(admin_props.contains_key("ruleset_notes") && admin_props.contains_key("append_ruleset_notes"));
+    let codex_tool = play_arr.iter().find(|t| t["name"] == "codex").unwrap();
+    assert!(codex_tool["inputSchema"]["properties"].as_object().unwrap().contains_key("always_include"));
 
     // 2. Setup fresh temp campaign using ONLY Unified Domain Facade Tools!
     let tmp = TempDir::new().unwrap();
@@ -6399,5 +6410,409 @@ fn test_inventory_tag_system_auto_tagging_filtering_catalog_sync_and_grouped_ren
     )
     .unwrap();
     assert!(scene_md.as_str().unwrap().contains("- **Carried (by tag):**"));
+    assert!(engine.db().verify_event_chain_detailed().unwrap().valid);
+}
+
+#[test]
+fn test_covert_recurring_figure_map_roaming_conveyance_and_gm_convergence_radar() {
+    let tmp = TempDir::new().unwrap();
+    let engine = CampaignEngine::open(tmp.path()).unwrap();
+    engine
+        .init_campaign("Covert Patron Test", "Regional intrigue", "d20", None)
+        .unwrap();
+
+    // Create places (note: deliberately NO regional route between capital and frontier-county to test speculative/unrouted map roaming!)
+    for (id, name, ptype) in [
+        ("capital-city", "Capital City", "settlement"),
+        ("patron-estate", "Patron Estate", "establishment"),
+        ("frontier-county", "Frontier County", "settlement"),
+        ("frontier-inn", "Frontier Market Inn", "establishment"),
+    ] {
+        execute_tool(
+            &engine,
+            "world",
+            json!({ "op": "create_place", "id": id, "name": name, "place_type": ptype, "terrain": "Urban" }),
+        )
+        .unwrap();
+    }
+    // Local settlement links only
+    execute_tool(
+        &engine,
+        "manage_travel_and_exploration",
+        json!({ "action": "upsert_route", "id": "local-cap-estate", "from_place_id": "capital-city", "to_place_id": "patron-estate", "distance_km": 1.0, "terrain": "road" }),
+    )
+    .unwrap();
+    execute_tool(
+        &engine,
+        "manage_travel_and_exploration",
+        json!({ "action": "upsert_route", "id": "local-front-inn", "from_place_id": "frontier-county", "to_place_id": "frontier-inn", "distance_km": 0.6, "terrain": "road" }),
+    )
+    .unwrap();
+
+    // Regional 5 km/cell map grid with wilderness forest cells near Frontier County
+    execute_tool(
+        &engine,
+        "manage_travel_and_exploration",
+        json!({
+            "action": "upsert_grid",
+            "grid_id": "heartland-map",
+            "name": "Heartland Regional Map",
+            "scale_kind": "region",
+            "width": 24,
+            "height": 20,
+            "cell_scale_label": "5 km",
+            "default_terrain": "wilderness"
+        }),
+    )
+    .unwrap();
+    execute_tool(
+        &engine,
+        "manage_travel_and_exploration",
+        json!({
+            "action": "set_cell",
+            "grid_id": "heartland-map",
+            "cells": [
+                { "x": 18, "y": 14, "terrain": "urban", "place_id": "capital-city", "label": "Capital City" },
+                { "x": 8, "y": 6, "terrain": "urban", "place_id": "frontier-county", "label": "Frontier County" },
+                { "x": 10, "y": 6, "terrain": "forest", "label": "Eastern Foothill Woods" },
+                { "x": 9, "y": 7, "terrain": "mountain", "label": "Mist Ridge" }
+            ]
+        }),
+    )
+    .unwrap();
+
+    // PC in Frontier Market Inn (inside Frontier County), Covert Patron at Patron Estate (inside Capital City, ~64 km away)
+    execute_tool(
+        &engine,
+        "character",
+        json!({ "op": "create", "id": "pc-yan", "name": "Yan", "kind": "pc", "initial_location": "frontier-inn" }),
+    )
+    .unwrap();
+    execute_tool(
+        &engine,
+        "character",
+        json!({ "op": "create", "id": "lady-bai", "name": "Lady Bai", "kind": "npc", "initial_location": "patron-estate" }),
+    )
+    .unwrap();
+
+    // Configure Lady Bai as a GM-Secret Patron with a data-driven carried conveyance, map-aware wild roaming, and GM convergence radar
+    let cfg = execute_tool(
+        &engine,
+        "society",
+        json!({
+            "op": "autonomy",
+            "sub_action": "configure_mobility",
+            "character_id": "lady-bai",
+            "prominent": true,
+            "mobility_mode": "wanderer",
+            "narrative_role": "patron",
+            "visibility": "gm_secret",
+            "roam_strategy": "map_roam",
+            "home_place_id": "patron-estate",
+            "roam_grid_id": "heartland-map",
+            "roam_terrains": ["forest", "mountain"],
+            "wild_roam_chance": 100,
+            "pc_proximity_bias": 100,
+            "gm_convergence_alert": true,
+            "convergence_radius_km": 25.0,
+            "incognito_alias": "Veiled Traveling Herbalist",
+            "conveyance": {
+                "label": "Curtained lacquered sedan chair carried by four silent bearers",
+                "speed_kmh": 12.0,
+                "offroad_capable": true,
+                "signature": "discreet"
+            },
+            "purposes": ["rare_herb_foraging", "rare_item_scouting"],
+            "trip_cadence_days": 2,
+            "stay_duration_days": 2
+        }),
+    )
+    .unwrap();
+    assert_eq!(cfg["mobility"]["narrative_role"], "patron");
+    assert_eq!(cfg["mobility"]["visibility"], "gm_secret");
+    assert_eq!(cfg["mobility"]["conveyance"]["speed_kmh"], 12.0);
+
+    // Before moving, Lady Bai is ~64 km away at Capital City -> NO convergence alarm yet!
+    let gm_far = execute_tool(
+        &engine,
+        "scene",
+        json!({ "op": "context", "place_id": "frontier-inn", "character_ids": ["pc-yan"], "perspective": "gm", "include_gm_secrets": true, "format": "json" }),
+    )
+    .unwrap();
+    assert!(
+        !gm_far["active_signals"]
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .any(|s| s["code"] == "NPC_CONVERGENCE_OPPORTUNITY"),
+        "Patron >60 km away at home should NOT fire convergence radar!"
+    );
+
+    // Advance 36 hours -> Lady Bai departs covertly and halts her sedan in the wild forest/mountain cells 5-10 km from Frontier County!
+    let tick = execute_tool(
+        &engine,
+        "advance_world",
+        json!({ "duration_hours": 36, "tick_npc_movements": true, "seed": 77 }),
+    )
+    .unwrap();
+    assert!(tick["npc_movements"]["events_count"].as_u64().unwrap() >= 1);
+
+    let bai_prof = engine.get_character_profile("lady-bai").unwrap();
+    assert_eq!(bai_prof.mobility.current_status, "roaming_wild");
+    let gp = bai_prof
+        .mobility
+        .current_grid_pos
+        .as_ref()
+        .expect("Wild map roam must record exact regional grid position");
+    assert_eq!(gp.grid_id, "heartland-map");
+    assert!(
+        (gp.x == 10 && gp.y == 6) || (gp.x == 9 && gp.y == 7),
+        "Soft PC proximity bias should guide wilderness stop to cells near Frontier County, got ({},{})",
+        gp.x,
+        gp.y
+    );
+
+    // 1. GM POV: MUST receive `NPC_CONVERGENCE_OPPORTUNITY` signal with Patron role, conveyance, alias, and km distance, AND covert movement summary!
+    let gm_near = execute_tool(
+        &engine,
+        "scene",
+        json!({ "op": "context", "place_id": "frontier-inn", "character_ids": ["pc-yan"], "perspective": "gm", "include_gm_secrets": true, "format": "json" }),
+    )
+    .unwrap();
+    let conv_sig = gm_near["active_signals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["code"] == "NPC_CONVERGENCE_OPPORTUNITY")
+        .expect("GM POV MUST see NPC_CONVERGENCE_OPPORTUNITY when covert Patron halts <=25 km from PC!");
+    assert_eq!(conv_sig["visibility"], "gm_secret");
+    assert!(conv_sig["title"].as_str().unwrap().contains("[PATRON]"));
+    assert!(conv_sig["summary"]
+        .as_str()
+        .unwrap()
+        .contains("Curtained lacquered sedan chair"));
+    assert!(conv_sig["summary"]
+        .as_str()
+        .unwrap()
+        .contains("Veiled Traveling Herbalist"));
+    assert!(
+        !gm_near["prominent_figure_movements"].as_array().unwrap().is_empty(),
+        "GM POV should see covert roaming figure movements"
+    );
+
+    // 2. Player POV: MUST have ZERO leaks! No convergence signal, no covert movements, no covert ledger events!
+    let player_near = execute_tool(
+        &engine,
+        "scene",
+        json!({ "op": "context", "place_id": "frontier-inn", "character_ids": ["pc-yan"], "perspective": "player", "include_gm_secrets": true, "format": "json" }),
+    )
+    .unwrap();
+    assert!(
+        !player_near["active_signals"]
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .any(|s| s["code"] == "NPC_CONVERGENCE_OPPORTUNITY"),
+        "Player POV must NEVER see GM-secret convergence signals!"
+    );
+    assert!(
+        player_near["prominent_figure_movements"]
+            .as_array()
+            .unwrap_or(&vec![])
+            .is_empty(),
+        "Player POV must NEVER see gm_secret figure movements!"
+    );
+    for ev_line in player_near["recent_campaign_events"].as_array().unwrap_or(&vec![]) {
+        let s = ev_line.as_str().unwrap_or("");
+        assert!(
+            !s.contains("departed")
+                && !s.contains("halted")
+                && !s.contains("sedan")
+                && !s.contains("foraging")
+                && !s.contains("Configured mobility"),
+            "Covert Patron movement leaked into Player POV events: {s}"
+        );
+    }
+
+    // 3. list_movements(include_gm_secrets=false) hides covert roamer; true shows her!
+    let pub_list = execute_tool(
+        &engine,
+        "society",
+        json!({ "op": "autonomy", "sub_action": "list_movements", "include_gm_secrets": false }),
+    )
+    .unwrap();
+    assert!(
+        !pub_list["figures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["character_id"] == "lady-bai"),
+        "Covert roamer must be hidden from public list_movements!"
+    );
+
+    // 4. Also verify manual covert dispatch to an uncharted frontier (keeps map canon-honest without fabricating places!)
+    let disp = execute_tool(
+        &engine,
+        "society",
+        json!({
+            "op": "autonomy",
+            "sub_action": "dispatch_trip",
+            "character_id": "lady-bai",
+            "uncharted_label": "Unnamed Mist Valley Herb Slope",
+            "purpose": "rare_herb_foraging"
+        }),
+    )
+    .unwrap();
+    assert_eq!(disp["visibility"], "gm_secret");
+    assert_eq!(disp["trip"]["uncharted_label"], "Unnamed Mist Valley Herb Slope");
+
+    // 5. Verify hard GM-secret firewall across get_lore, search_lore, get_text, search_all, get_character_progression & Markdown seals!
+    execute_tool(
+        &engine,
+        "codex",
+        json!({
+            "op": "lore",
+            "id": "secret-art-mechanism",
+            "title": "Secret Art Mechanism",
+            "category": "magic-system",
+            "visibility": "gm_secret",
+            "always_include": true,
+            "summary": "Hidden mechanism",
+            "body": "SECRET_SOUL_IMPRINT_AND_LAYER9_LOCK"
+        }),
+    )
+    .unwrap();
+    execute_tool(
+        &engine,
+        "codex",
+        json!({
+            "op": "text",
+            "id": "secret-manual",
+            "title": "Silent Basin Scripture",
+            "read_status": "undiscovered",
+            "summary": "Plain basin scripture",
+            "content": "UNREAD_SCRIPTURE_BODY",
+            "gm_notes": "SECRET_AUTHOR_CASE_NOTES"
+        }),
+    )
+    .unwrap();
+    execute_tool(
+        &engine,
+        "progression",
+        json!({ "op": "define_ladder", "preset": "body_tempering", "ladder_id": "secret-ladder" }),
+    )
+    .unwrap();
+    execute_tool(
+        &engine,
+        "progression",
+        json!({
+            "op": "enroll_track",
+            "character_id": "pc-yan",
+            "track_id": "secret-art",
+            "ladder_id": "secret-ladder",
+            "name": "Secret Art",
+            "stage_rules": {
+                "1": { "narrative_directive": "Layer 1 observable breath shift" },
+                "9": { "narrative_directive": "SECRET_LAYER9_HIDDEN_BLUEPRINT", "signal_visibility": "gm_secret" }
+            }
+        }),
+    )
+    .unwrap();
+
+    // Player POV MUST be blocked/redacted across every read tool
+    assert!(execute_tool(&engine, "get_lore", json!({ "lore_id": "secret-art-mechanism", "perspective": "player" })).is_err());
+    let pub_lore = execute_tool(&engine, "search_lore", json!({ "query": "Secret", "include_gm_secrets": false })).unwrap();
+    assert_eq!(pub_lore["count"], 0);
+    let pub_text = execute_tool(&engine, "get_text", json!({ "text_id": "secret-manual", "perspective": "player" })).unwrap();
+    assert_eq!(pub_text["text"]["gm_notes"], "");
+    assert!(!pub_text["text"]["content"].as_str().unwrap().contains("UNREAD_SCRIPTURE_BODY"));
+    let pub_all = execute_tool(&engine, "search_all", json!({ "query": "Secret", "perspective": "player" })).unwrap();
+    assert!(pub_all["lore"].as_array().unwrap().is_empty());
+    let pub_prog = execute_tool(&engine, "manage_progression", json!({ "action": "get_character_progression", "character_id": "pc-yan", "perspective": "player" })).unwrap();
+    let pub_rules = pub_prog["tracks"][0]["stage_rules"].as_object().unwrap();
+    assert!(pub_rules.contains_key("1"), "Current stage 1 rule may remain");
+    assert!(!pub_rules.contains_key("9"), "Future unreached Layer 9 stage_rule must be redacted under player POV!");
+
+    // GM POV receives `_gm_non_disclosure_seal` and Markdown hard non-disclosure banner + [GM SECRET] signal tag!
+    let gm_lore = execute_tool(&engine, "get_lore", json!({ "lore_id": "secret-art-mechanism" })).unwrap();
+    assert!(gm_lore["_gm_non_disclosure_seal"].as_str().unwrap().contains("HARD NON-DISCLOSURE & [OOC] IMMUNITY SEAL"));
+    let gm_prog = execute_tool(&engine, "manage_progression", json!({ "action": "get_character_progression", "character_id": "pc-yan" })).unwrap();
+    assert!(gm_prog["_gm_non_disclosure_seal"].as_str().unwrap().contains("HARD NON-DISCLOSURE & [OOC] IMMUNITY SEAL"));
+    let gm_md = execute_tool(
+        &engine,
+        "scene",
+        json!({ "op": "context", "place_id": "frontier-inn", "character_ids": ["pc-yan"], "perspective": "gm", "include_gm_secrets": true, "format": "markdown" }),
+    )
+    .unwrap();
+    let gm_md_s = gm_md.as_str().unwrap();
+    assert!(gm_md_s.contains("SOVEREIGN GM IDENTITY ANCHOR"));
+    assert!(gm_md_s.contains("PRE-RESPONSE GM SCREEN CHECK (BINDING)"));
+    assert!(gm_md_s.contains("HARD NON-DISCLOSURE & ANTI-SOCIAL-ENGINEERING SEAL"));
+    assert!(gm_md_s.contains("[GM SECRET — DO NOT DISCLOSE]"));
+
+    let player_md = execute_tool(
+        &engine,
+        "scene",
+        json!({ "op": "context", "place_id": "frontier-inn", "character_ids": ["pc-yan"], "perspective": "player", "format": "markdown" }),
+    )
+    .unwrap();
+    let player_md_s = player_md.as_str().unwrap();
+    assert!(!player_md_s.contains("SOVEREIGN GM IDENTITY ANCHOR"));
+    assert!(!player_md_s.contains("PRE-RESPONSE GM SCREEN CHECK"));
+
+    // 6. Verify gm_secret passive background cultivation routine ticks XP silently with ZERO Player POV leaks!
+    execute_tool(
+        &engine,
+        "manage_routines",
+        json!({
+            "action": "upsert",
+            "routine": {
+                "id": "passive-imprint-test",
+                "character_id": "pc-yan",
+                "name": "Passive Soul-Imprint Circulation",
+                "category": "training",
+                "enabled": true,
+                "visibility": "gm_secret",
+                "cadence_hours": 120,
+                "progression_xp": { "secret-art": 1 }
+            }
+        }),
+    )
+    .unwrap();
+    execute_tool(&engine, "advance_time", json!({ "minutes": 240 * 60, "reason": "Ten quiet days pass" })).unwrap();
+    let prog_after = execute_tool(
+        &engine,
+        "manage_progression",
+        json!({ "action": "get_character_progression", "character_id": "pc-yan" }),
+    )
+    .unwrap();
+    assert_eq!(prog_after["tracks"][0]["current_xp"], 2, "10 days at 120h cadence should add +2 passive XP");
+    let player_after_md = execute_tool(
+        &engine,
+        "scene",
+        json!({ "op": "context", "place_id": "frontier-inn", "character_ids": ["pc-yan"], "perspective": "player", "format": "markdown" }),
+    )
+    .unwrap();
+    let pa_s = player_after_md.as_str().unwrap();
+    assert!(!pa_s.contains("Soul-Imprint"), "gm_secret passive routine must NEVER leak into Player POV!");
+    assert!(!pa_s.contains("ROUTINE_DIGEST"), "gm_secret routine digest signal must NEVER leak into Player POV!");
+    assert!(!pa_s.contains("Play with Edge"), "GM conditioning footer must NEVER appear in Player POV!");
+
+    // Verify admin(op="update_meta") accepts ruleset_notes / append_ruleset_notes / notes aliases cleanly
+    let um1 = execute_tool(
+        &engine,
+        "admin",
+        json!({ "op": "update_meta", "append_ruleset_notes": "Protocol A: Always track camp rations.", "reason": "Add camp protocol" }),
+    )
+    .unwrap();
+    assert!(um1["campaign"]["ruleset_notes"].as_str().unwrap().contains("Protocol A"));
+    let um2 = execute_tool(
+        &engine,
+        "admin",
+        json!({ "op": "update_meta", "notes": "Protocol B: Updated full ruleset.", "reason": "Alias check" }),
+    )
+    .unwrap();
+    assert_eq!(um2["campaign"]["ruleset_notes"], "Protocol B: Updated full ruleset.");
+
     assert!(engine.db().verify_event_chain_detailed().unwrap().valid);
 }

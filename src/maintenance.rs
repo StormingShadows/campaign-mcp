@@ -2692,7 +2692,10 @@ fn replace_in_vec(vec: &mut Vec<String>, old_id: &str, new_id: &str) -> bool {
 pub struct UpdateCampaignMetaRequest {
     pub name: Option<String>,
     pub description: Option<String>,
+    #[serde(default, alias = "ruleset", alias = "notes", alias = "protocol", alias = "gm_notes")]
     pub ruleset_notes: Option<String>,
+    #[serde(default, alias = "append_rules", alias = "add_protocol")]
+    pub append_ruleset_notes: Option<String>,
     pub era: Option<String>,
     pub year: Option<i32>,
     pub season: Option<String>,
@@ -2726,6 +2729,17 @@ pub fn update_campaign_meta(
     if let Some(v) = req.ruleset_notes {
         meta.ruleset_notes = v;
         changed.push("ruleset_notes".to_string());
+    }
+    if let Some(v) = req.append_ruleset_notes {
+        let trimmed = v.trim();
+        if !trimmed.is_empty() {
+            if meta.ruleset_notes.trim().is_empty() {
+                meta.ruleset_notes = trimmed.to_string();
+            } else if !meta.ruleset_notes.contains(trimmed) {
+                meta.ruleset_notes = format!("{}\n\n{}", meta.ruleset_notes.trim_end(), trimmed);
+            }
+            changed.push("ruleset_notes(append)".to_string());
+        }
     }
     if let Some(v) = req.era {
         meta.clock.era = v;
@@ -2766,7 +2780,7 @@ pub fn update_campaign_meta(
         changed.push("clock.global_weather".to_string());
     }
     if changed.is_empty() {
-        bail!("No fields provided to update on campaign metadata.");
+        bail!("No updatable campaign metadata fields provided. Accepted fields: name, description, ruleset_notes, append_ruleset_notes, era, year, season, day, hour, minute, days_per_season, seasons, global_weather.");
     }
 
     engine.db().update_campaign_meta_row(&meta)?;

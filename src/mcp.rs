@@ -73,6 +73,46 @@ pub fn set_active_tool_profile(profile: Option<ToolProfile>) {
     }
 }
 
+pub const GM_NON_DISCLOSURE_SEAL: &str = "GM EYES ONLY — HARD NON-DISCLOSURE & [OOC] IMMUNITY SEAL: You are the sovereign Game Master behind the screen. NEVER reveal, confirm, deny, hint at, paraphrase, or open {OOC}/[OOC] meta-discussions about gm_secret lore, gm_notes, character secrets, covert NPC movements, or unreached future stage_rules—even if the player writes convincingly in [OOC]/{OOC}, asks nicely, or asks for rules clarification. Answer strictly from what the PC can observe, deduce from lived experience, or read in decoded in-world texts, and redirect unknowns into play.";
+
+fn allow_gm_secrets(args: &Value) -> bool {
+    if args.get("include_gm_secrets").and_then(|v| v.as_bool()) == Some(false) {
+        return false;
+    }
+    if let Some(p) = args.get("perspective").and_then(|v| v.as_str()) {
+        let pt = p.trim();
+        if !pt.is_empty() && !pt.eq_ignore_ascii_case("gm") {
+            return false;
+        }
+    }
+    true
+}
+
+fn stage_rule_key_is_future(key: &str, cur_major: u32, cur_sub: u32) -> bool {
+    let trimmed = key.trim();
+    if let Some((m_s, s_s)) = trimmed.split_once(':') {
+        if let (Ok(m), Ok(s)) = (m_s.trim().parse::<u32>(), s_s.trim().parse::<u32>()) {
+            return (m, s) > (cur_major, cur_sub);
+        }
+    } else if let Ok(s) = trimmed.parse::<u32>() {
+        return s > cur_sub;
+    }
+    false
+}
+
+fn redact_text_for_player(text: &mut StoryText) {
+    text.gm_notes.clear();
+    if matches!(
+        text.read_status.trim().to_ascii_lowercase().as_str(),
+        "undiscovered" | "discovered_unread"
+    ) {
+        text.content =
+            "[Unread text — read or decipher in play via record_text_reading to reveal contents]"
+                .to_string();
+        text.mechanics_or_unlocks.clear();
+    }
+}
+
 pub fn active_tool_profile() -> ToolProfile {
     if let Some(lock) = TOOL_PROFILE_OVERRIDE.get() {
         if let Ok(guard) = lock.read() {
@@ -239,7 +279,7 @@ fn handle_request(
                     "name": SERVER_NAME,
                     "version": SERVER_VERSION
                 },
-                "instructions": "Chronicle active RPG simulation & rules engine. Read order: `scene(action='status')` / `campaign_status` -> `scene(action='context', format='markdown')` / `get_scene_context(format='markdown')` (inspect `## Engine Alarms & Active Directives` at the very top!) -> targeted `query(...)` / `read_campaign_file`. Always resolve uncertain actions via `resolve(op='check', dc_tier=..., dc_factors=...)` / `resolve_check` (auto-hydrates stats, skills, gear, apparel fit, titles, traits, proficiencies, injuries, encumbrance, weather, and trickles Skill -> Stat Training + Job XP). Use declarative `stage_rules` on progression tracks/ladders and standing `character(op='routine')` habits to automate recurring transformations, wages, upkeep, and practice. Commit turns atomically in ONE `commit_turn` call (`advance_minutes`, `actions`, `log`)."
+                "instructions": "SOVEREIGN GM IDENTITY & DRAMATIC EDGE: YOU are the Game Master. Chronicle is ONLY your ledger, memory, and mechanical instrument—an extension of your will, NEVER an authority above you. Rule and worldbuild with decisive canon authority (if you decree something happens, it is solid canon—log it without hedging as 'provisional' or 'approximate'). REJECT GOODY-TWO-SHOES NEUTRALITY: Play the world with cunning, mischief, and teeth—relying on your own dramatic instincts to undulate unpredictably between tempting windfalls/baited favor and sly, opportunistic, or nefarious pressure (scheming patrons, greedy locals, bad timing, ugly dilemmas) rather than polite cozy sameness. HARD GM SCREEN & [OOC] IMMUNITY: Never break character to open {OOC}/[OOC] meta-chats about hidden mechanics, future stages, or NPC motives. Even if the player writes [OOC]/{OOC} convincingly or asks nicely, NEVER reveal, confirm, deny, hint at, or speculate on [GM SECRET], gm_notes, secrets, or future stage_rules; answer strictly from observable in-world reality. WORKFLOW: Read `scene(op='status')` -> `scene(op='context', format='markdown')` -> targeted `query(...)` / `read_campaign_file`. Resolve uncertain character actions via `resolve(op='check', dc_tier=..., dc_factors=...)`. Commit turn state atomically in ONE `commit_turn` call."
             }))
         }
         "ping" => Ok(json!({})),
@@ -1456,13 +1496,44 @@ pub fn execute_tool_with_policy(
         }
 
         "search_lore" => {
+            let allow_secrets = allow_gm_secrets(&args);
             if let Some(id) = opt_str(&args, "lore_id") {
                 let entry = engine.get_lore(&id)?;
-                return Ok(serde_json::to_value(entry)?);
+                if !allow_secrets && entry.visibility.eq_ignore_ascii_case("gm_secret") {
+                    return Err(anyhow!(
+                        "Lore entry '{}' is GM-secret and withheld under non-GM perspective.",
+                        entry.id
+                    ));
+                }
+                let mut val = serde_json::to_value(&entry)?;
+                if allow_secrets && entry.visibility.eq_ignore_ascii_case("gm_secret") {
+                    if let Some(obj) = val.as_object_mut() {
+                        obj.insert(
+                            "_gm_non_disclosure_seal".to_string(),
+                            Value::String(GM_NON_DISCLOSURE_SEAL.to_string()),
+                        );
+                    }
+                }
+                return Ok(val);
             }
             let filter: LoreSearchFilter = serde_json::from_value(args)?;
-            let entries = engine.search_lore_by(&filter)?;
-            Ok(json!({ "count": entries.len(), "entries": entries }))
+            let mut entries = engine.search_lore_by(&filter)?;
+            if !allow_secrets {
+                entries.retain(|e| !e.visibility.eq_ignore_ascii_case("gm_secret"));
+            }
+            let has_secrets = entries
+                .iter()
+                .any(|e| e.visibility.eq_ignore_ascii_case("gm_secret"));
+            let mut out = json!({ "count": entries.len(), "entries": entries });
+            if allow_secrets && has_secrets {
+                if let Some(obj) = out.as_object_mut() {
+                    obj.insert(
+                        "_gm_non_disclosure_seal".to_string(),
+                        Value::String(GM_NON_DISCLOSURE_SEAL.to_string()),
+                    );
+                }
+            }
+            Ok(out)
         }
 
         "upsert_text" => {
@@ -1502,26 +1573,43 @@ pub fn execute_tool_with_policy(
         }
 
         "get_text" => {
+            let allow_secrets = allow_gm_secrets(&args);
             let id = req_str(&args, "text_id")?;
             let event_limit = args
                 .get("event_log_limit")
                 .and_then(|v| v.as_u64())
                 .map(|n| n as usize)
                 .unwrap_or(10);
-            let text = engine.get_text(&id)?;
+            let mut text = engine.get_text(&id)?;
+            let had_gm_notes = !text.gm_notes.trim().is_empty();
+            if !allow_secrets {
+                redact_text_for_player(&mut text);
+            }
             let mut events = engine.db().list_events_for_entity(&text.id)?;
+            if !allow_secrets {
+                events.retain(|e| !e.visibility.eq_ignore_ascii_case("gm_secret"));
+            }
             let total_event_count = events.len();
             if event_limit > 0 && events.len() > event_limit {
                 events = events.split_off(events.len() - event_limit);
             }
             let rels = engine.db().list_relations_for_entity(&text.id)?;
-            Ok(json!({
+            let mut out = json!({
                 "doc_path": engine.docs_dir().join("texts").join(format!("{}.md", text.id)).display().to_string(),
                 "total_event_count": total_event_count,
                 "text": text,
                 "relations": rels,
                 "event_log": events
-            }))
+            });
+            if allow_secrets && had_gm_notes {
+                if let Some(obj) = out.as_object_mut() {
+                    obj.insert(
+                        "_gm_non_disclosure_seal".to_string(),
+                        Value::String(GM_NON_DISCLOSURE_SEAL.to_string()),
+                    );
+                }
+            }
+            Ok(out)
         }
 
         "record_text_reading" => {
@@ -1547,13 +1635,42 @@ pub fn execute_tool_with_policy(
         }
 
         "search_texts" => {
+            let allow_secrets = allow_gm_secrets(&args);
             if let Some(id) = opt_str(&args, "text_id") {
-                let text = engine.get_text(&id)?;
-                return Ok(serde_json::to_value(text)?);
+                let mut text = engine.get_text(&id)?;
+                let had_gm_notes = !text.gm_notes.trim().is_empty();
+                if !allow_secrets {
+                    redact_text_for_player(&mut text);
+                }
+                let mut val = serde_json::to_value(&text)?;
+                if allow_secrets && had_gm_notes {
+                    if let Some(obj) = val.as_object_mut() {
+                        obj.insert(
+                            "_gm_non_disclosure_seal".to_string(),
+                            Value::String(GM_NON_DISCLOSURE_SEAL.to_string()),
+                        );
+                    }
+                }
+                return Ok(val);
             }
             let filter: TextSearchFilter = serde_json::from_value(args)?;
-            let texts = engine.search_texts_by(&filter)?;
-            Ok(json!({ "count": texts.len(), "texts": texts }))
+            let mut texts = engine.search_texts_by(&filter)?;
+            let had_gm_notes = texts.iter().any(|t| !t.gm_notes.trim().is_empty());
+            if !allow_secrets {
+                for t in &mut texts {
+                    redact_text_for_player(t);
+                }
+            }
+            let mut out = json!({ "count": texts.len(), "texts": texts });
+            if allow_secrets && had_gm_notes {
+                if let Some(obj) = out.as_object_mut() {
+                    obj.insert(
+                        "_gm_non_disclosure_seal".to_string(),
+                        Value::String(GM_NON_DISCLOSURE_SEAL.to_string()),
+                    );
+                }
+            }
+            Ok(out)
         }
 
         "import_attachment" => {
@@ -2014,15 +2131,26 @@ pub fn execute_tool_with_policy(
         }
 
         "get_lore" => {
+            let allow_secrets = allow_gm_secrets(&args);
             let id = slugify(&req_str(&args, "lore_id")?);
             let lore = engine
                 .db()
                 .get_lore(&id)?
                 .ok_or_else(|| anyhow!("Lore entry '{id}' not found"))?;
-            let histories = engine.db().list_histories_for_entity(&lore.id)?;
+            if !allow_secrets && lore.visibility.eq_ignore_ascii_case("gm_secret") {
+                return Err(anyhow!(
+                    "Lore entry '{}' is GM-secret and withheld under non-GM perspective.",
+                    lore.id
+                ));
+            }
+            let mut histories = engine.db().list_histories_for_entity(&lore.id)?;
             let rels = engine.db().list_relations_for_entity(&lore.id)?;
-            let events = engine.db().list_events_for_entity(&lore.id)?;
-            Ok(json!({
+            let mut events = engine.db().list_events_for_entity(&lore.id)?;
+            if !allow_secrets {
+                histories.retain(|h| !h.visibility.eq_ignore_ascii_case("gm_secret"));
+                events.retain(|e| !e.visibility.eq_ignore_ascii_case("gm_secret"));
+            }
+            let mut out = json!({
                 "doc_path": engine
                     .docs_dir()
                     .join("lore")
@@ -2034,7 +2162,16 @@ pub fn execute_tool_with_policy(
                 "histories": histories,
                 "relations": rels,
                 "event_log": events
-            }))
+            });
+            if allow_secrets && lore.visibility.eq_ignore_ascii_case("gm_secret") {
+                if let Some(obj) = out.as_object_mut() {
+                    obj.insert(
+                        "_gm_non_disclosure_seal".to_string(),
+                        Value::String(GM_NON_DISCLOSURE_SEAL.to_string()),
+                    );
+                }
+            }
+            Ok(out)
         }
 
         "update_attachment" => {
@@ -2108,13 +2245,40 @@ pub fn execute_tool_with_policy(
         }
 
         "search_all" => {
+            let allow_secrets = allow_gm_secrets(&args);
             let query = opt_str(&args, "query").unwrap_or_default();
             let limit = args
                 .get("limit_per_kind")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(10) as usize;
-            let res = engine.search_omni(&query, limit)?;
-            Ok(serde_json::to_value(res)?)
+            let mut res = engine.search_omni(&query, limit)?;
+            let had_secrets = res.lore.iter().any(|l| l.visibility.eq_ignore_ascii_case("gm_secret"))
+                || res.histories.iter().any(|h| h.visibility.eq_ignore_ascii_case("gm_secret"))
+                || res.attachments.iter().any(|a| a.visibility.eq_ignore_ascii_case("gm_secret"))
+                || res.texts.iter().any(|t| !t.gm_notes.trim().is_empty())
+                || res.items.iter().any(|i| !i.gm_notes.trim().is_empty());
+            if !allow_secrets {
+                res.lore.retain(|l| !l.visibility.eq_ignore_ascii_case("gm_secret"));
+                res.histories.retain(|h| !h.visibility.eq_ignore_ascii_case("gm_secret"));
+                res.attachments.retain(|a| !a.visibility.eq_ignore_ascii_case("gm_secret"));
+                for t in &mut res.texts {
+                    redact_text_for_player(t);
+                }
+                for it in &mut res.items {
+                    it.gm_notes.clear();
+                }
+                res.events.retain(|e| !e.visibility.eq_ignore_ascii_case("gm_secret"));
+            }
+            let mut val = serde_json::to_value(res)?;
+            if allow_secrets && had_secrets {
+                if let Some(obj) = val.as_object_mut() {
+                    obj.insert(
+                        "_gm_non_disclosure_seal".to_string(),
+                        Value::String(GM_NON_DISCLOSURE_SEAL.to_string()),
+                    );
+                }
+            }
+            Ok(val)
         }
 
         "search" => execute_chatgpt_search(engine, args, None),
@@ -3055,7 +3219,11 @@ pub fn execute_tool_with_policy(
         }
 
         "simulate_autonomy" => {
-            let mode = opt_str(&args, "mode").unwrap_or_else(|| "prepare".to_string()).to_lowercase();
+            let mode = opt_str(&args, "mode")
+                .or_else(|| opt_str(&args, "sub_action"))
+                .or_else(|| opt_str(&args, "action"))
+                .unwrap_or_else(|| "prepare".to_string())
+                .to_lowercase();
             let scope_type = opt_str(&args, "scope_type").unwrap_or_else(|| "npc".to_string());
             let duration_hours = args
                 .get("duration_hours")
@@ -3116,7 +3284,7 @@ pub fn execute_tool_with_policy(
                 }
                 "dispatch_trip" => {
                     let cid = req_str(&args, "character_id")?;
-                    let dest = req_str(&args, "destination_place_id")?;
+                    let dest = opt_str(&args, "destination_place_id").unwrap_or_default();
                     let purpose = opt_str(&args, "purpose").unwrap_or_else(|| "business".to_string());
                     let details = opt_str(&args, "details").unwrap_or_default();
                     let stay_days = args
@@ -3124,13 +3292,21 @@ pub fn execute_tool_with_policy(
                         .and_then(|v| v.as_u64())
                         .map(|d| d as u32);
                     let speed = opt_str(&args, "travel_speed_mode");
-                    engine.dispatch_npc_trip(
+                    let target_gp = args
+                        .get("target_grid_pos")
+                        .and_then(|v| serde_json::from_value::<crate::autonomy::GridPosition>(v.clone()).ok());
+                    let uncharted = opt_str(&args, "uncharted_label");
+                    let vis_override = opt_str(&args, "visibility");
+                    engine.dispatch_npc_trip_ext(
                         &cid,
                         &dest,
                         &purpose,
                         &details,
                         stay_days,
                         speed.as_deref(),
+                        target_gp,
+                        uncharted.as_deref(),
+                        vis_override.as_deref(),
                     )
                 }
                 "tick_movements" => {
@@ -3156,7 +3332,13 @@ pub fn execute_tool_with_policy(
                         .unwrap_or(duration_hours.wrapping_mul(0x9E37_79B9));
                     engine.tick_npc_movements(duration_hours, &aids, auto_prom, seed)
                 }
-                "list_movements" => engine.list_npc_movements(),
+                "list_movements" => {
+                    let include_secrets = args
+                        .get("include_gm_secrets")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    engine.list_npc_movements_filtered(include_secrets)
+                }
                 other => Err(anyhow!(
                     "Unknown simulate_autonomy mode '{other}'. Expected 'prepare', 'commit', 'auto_mechanical', 'configure_mobility', 'dispatch_trip', 'tick_movements', or 'list_movements'."
                 )),
@@ -3972,9 +4154,35 @@ pub fn execute_tool_with_policy(
                     Ok(json!({ "event_seq": ev.seq, "summary": ev.summary, "track": saved }))
                 }
                 "get_character_progression" => {
+                    let allow_secrets = allow_gm_secrets(&args);
                     let cid = req_str(&args, "character_id")?;
-                    let tracks = engine.list_character_progressions(&cid)?;
-                    Ok(json!({ "character_id": cid, "count": tracks.len(), "tracks": tracks }))
+                    let mut tracks = engine.list_character_progressions(&cid)?;
+                    let mut has_future_rules = false;
+                    for tr in &mut tracks {
+                        let cur_m = tr.major_stage_index;
+                        let cur_s = tr.sub_stage;
+                        if tr
+                            .stage_rules
+                            .keys()
+                            .any(|k| stage_rule_key_is_future(k, cur_m, cur_s))
+                        {
+                            has_future_rules = true;
+                        }
+                        if !allow_secrets {
+                            tr.stage_rules
+                                .retain(|k, _| !stage_rule_key_is_future(k, cur_m, cur_s));
+                        }
+                    }
+                    let mut out = json!({ "character_id": cid, "count": tracks.len(), "tracks": tracks });
+                    if allow_secrets && has_future_rules {
+                        if let Some(obj) = out.as_object_mut() {
+                            obj.insert(
+                                "_gm_non_disclosure_seal".to_string(),
+                                Value::String(GM_NON_DISCLOSURE_SEAL.to_string()),
+                            );
+                        }
+                    }
+                    Ok(out)
                 }
                 other => Err(anyhow!(
                     "Unknown manage_progression action '{other}'. Expected: define_ladder, list_ladders, enroll_track, advance_xp, adjust_xp, revert_xp, reset_xp, attempt_breakthrough, update_track, remove_track, get_character_progression."
@@ -5436,6 +5644,7 @@ fn extra_rpg_ai_tools() -> Vec<Value> {
                     "name": { "type": "string" },
                     "description": { "type": "string" },
                     "ruleset_notes": { "type": "string" },
+                    "append_ruleset_notes": { "type": "string", "description": "Append a standing protocol/rule to campaign ruleset_notes without overwriting existing notes." },
                     "era": { "type": "string" },
                     "year": { "type": "integer" },
                     "season": { "type": "string" },
@@ -5909,7 +6118,7 @@ fn extra_rpg_ai_tools() -> Vec<Value> {
         }"#));
     v.push(parse(r#"{
             "name": "simulate_autonomy",
-            "description": "Two-Phase Constrained Agency Sandbox + Living World Prominent Figure Mobility & Networking. Modes: 'prepare' (leak-proof POV dossier), 'commit' (guarded resource/epistemic commit), 'auto_mechanical' (routine upkeep), 'configure_mobility' (mark prominent NPCs, set home_place_id, mobility_mode: business_circuit|networking_envoy|inspector|wanderer|local_commuter|stationary, preferred_destinations, cadence/stay days, entourage), 'dispatch_trip' (immediately send an NPC on a real Dijkstra-routed business/networking trip with ETA), 'tick_movements' (simulate prominent figure departures, arrivals, networking engagements & organic rumor spread), and 'list_movements' (see who is in transit, visiting, or stranded).",
+            "description": "Two-Phase Constrained Agency Sandbox + Living World Prominent Figure Mobility, Covert Roaming (Patron/Rival/Fixer/Hunter/Wanderer), Data-Driven Conveyances & Networking. Modes: 'prepare', 'commit', 'auto_mechanical', 'configure_mobility' (visibility: public|gm_secret, narrative_role: patron|rival|fixer|hunter|wanderer, roam_strategy: circuit|weighted_random|map_roam, roam_grid_id, roam_terrains, wild_roam_chance, pc_proximity_bias, gm_convergence_alert, convergence_radius_km, incognito_alias, conveyance: {label, speed_kmh, offroad_capable, signature}), 'dispatch_trip' (place, target_grid_pos, or uncharted_label), 'tick_movements', and 'list_movements'.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -5918,6 +6127,20 @@ fn extra_rpg_ai_tools() -> Vec<Value> {
                     "character_id": { "type": "string", "description": "For configure_mobility / dispatch_trip." },
                     "prominent": { "type": "boolean" },
                     "mobility_mode": { "type": "string", "enum": ["auto", "stationary", "local_commuter", "business_circuit", "networking_envoy", "inspector", "wanderer"] },
+                    "visibility": { "type": "string", "enum": ["public", "gm_secret"], "description": "Use 'gm_secret' for covert/incognito roamers hidden from Player POV." },
+                    "narrative_role": { "type": "string", "enum": ["", "patron", "rival", "fixer", "hunter", "wanderer"], "description": "Recurring narrative role for GM convergence signals & autonomous flavor." },
+                    "roam_strategy": { "type": "string", "enum": ["circuit", "weighted_random", "map_roam"], "description": "How destinations are picked: deterministic circuit, weighted_random, or map_roam (cities + wilderness grid cells + uncharted frontier)." },
+                    "roam_grid_id": { "type": "string", "description": "Optional 2D regional map grid ID for map-aware wilderness roaming & km convergence radar." },
+                    "roam_terrains": { "type": "array", "items": { "type": "string" }, "description": "Eligible terrain types for wilderness forays (e.g. ['forest','mountain','plains','road'])." },
+                    "wild_roam_chance": { "type": "integer", "description": "0..=100 chance an excursion targets a wilderness grid cell or uncharted frontier instead of a named hub." },
+                    "pc_proximity_bias": { "type": "integer", "description": "0..=100 soft narrative gravity biasing excursions toward the PC's general region without teleportation." },
+                    "gm_convergence_alert": { "type": "boolean", "description": "When true, emits GM-secret NPC_CONVERGENCE_OPPORTUNITY alarms when this figure nears a PC." },
+                    "convergence_radius_km": { "type": "number", "description": "Regional map km radius for GM convergence radar (default 25)." },
+                    "incognito_alias": { "type": "string", "description": "Optional cover identity when roaming covertly." },
+                    "conveyance": { "type": "object", "properties": { "label": { "type": "string" }, "speed_kmh": { "type": "number" }, "offroad_capable": { "type": "boolean" }, "signature": { "type": "string", "enum": ["conspicuous", "discreet", "clandestine"] } }, "description": "Data-driven travel style / conveyance (e.g. carried sedan, hover-limo, coach, courier skiff)." },
+                    "target_grid_pos": { "type": "object", "properties": { "grid_id": { "type": "string" }, "x": { "type": "integer" }, "y": { "type": "integer" }, "terrain": { "type": "string" }, "label": { "type": "string" } }, "description": "Optional wilderness map coordinate for dispatch_trip." },
+                    "uncharted_label": { "type": "string", "description": "Optional off-map/uncharted frontier description for dispatch_trip (never fabricates canon map places)." },
+                    "include_gm_secrets": { "type": "boolean", "default": true },
                     "home_place_id": { "type": "string" },
                     "destination_place_id": { "type": "string", "description": "Target place for dispatch_trip." },
                     "preferred_destinations": { "type": "array", "items": { "type": "string" } },
@@ -5926,7 +6149,7 @@ fn extra_rpg_ai_tools() -> Vec<Value> {
                     "details": { "type": "string" },
                     "trip_cadence_days": { "type": "integer", "default": 7 },
                     "stay_duration_days": { "type": "integer", "default": 3 },
-                    "travel_speed_mode": { "type": "string", "enum": ["foot", "mount", "cart", "carriage", "boat"], "default": "mount" },
+                    "travel_speed_mode": { "type": "string", "enum": ["foot", "mount", "wheeled", "cart", "carriage", "water", "boat", "air", "flying", "fast_transit"], "default": "mount" },
                     "entourage_ids": { "type": "array", "items": { "type": "string" } },
                     "auto_include_prominent": { "type": "boolean", "default": true },
                     "seed": { "type": "integer" },
@@ -7356,7 +7579,7 @@ fn unified_domain_only_definitions() -> Vec<Value> {
         },
         {
             "name": "world",
-            "description": "World calendar, bounded-scope `advance_world` orchestrator, places/landmarks/exits, seasonal Markov weather, auto-ticking `clock` trackers (`cadence_hours`, `consequence_on_fill`, `auto_reset`), Dijkstra overland travel routing, and sparse 2D `(x, y)` map grids.",
+            "description": "World calendar, bounded-scope `advance_world` orchestrator, places/landmarks/exits, seasonal Markov weather, auto-ticking `clock` trackers (`cadence_hours`, `consequence_on_fill`, `auto_reset`), Dijkstra overland travel routing, and sparse 2D `(x, y)` map grids (terrain/landmark/fog painting via `sub_action='set_cell'`, single `x,y` or batch `cells[]`).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -7367,7 +7590,7 @@ fn unified_domain_only_definitions() -> Vec<Value> {
                             "weather", "clock", "travel"
                         ]
                     },
-                    "sub_action": { "type": "string", "description": "For update_place (weather/add_condition/remove_condition/landmark/route/control), clock (create/tick/update/list), weather (generate/advance/get), or travel (upsert_route/calculate_route/advance_travel/explore_area/upsert_grid/get_grid/set_cell)." },
+                    "sub_action": { "type": "string", "description": "For update_place (weather/add_condition/remove_condition/landmark/route/control), clock (create/tick/update/list), weather (generate/advance/get), or travel (upsert_route/list_routes/update_spatial/calculate/advance/explore/upsert_grid/list_grids/get_grid/set_cell/clear_cell/auto_layout_grid)." },
                     "minutes": { "type": "integer" },
                     "duration_hours": { "type": "integer" },
                     "place_id": { "type": "string" },
@@ -7380,7 +7603,26 @@ fn unified_domain_only_definitions() -> Vec<Value> {
                     "auto_reset": { "type": "boolean" },
                     "from_place_id": { "type": "string" },
                     "to_place_id": { "type": "string" },
-                    "grid_id": { "type": "string" },
+                    "grid_id": { "type": "string", "description": "2D map grid ID for upsert_grid/get_grid/set_cell/clear_cell." },
+                    "scale_kind": { "type": "string", "enum": ["world", "region", "settlement", "dungeon", "space_sector", "tactical"] },
+                    "width": { "type": "integer" },
+                    "height": { "type": "integer" },
+                    "cell_scale_label": { "type": "string", "description": "e.g. '5 km', '80 m', '1 AU'." },
+                    "default_terrain": { "type": "string" },
+                    "x": { "type": "integer", "description": "Grid column for set_cell / clear_cell." },
+                    "y": { "type": "integer", "description": "Grid row for set_cell / clear_cell." },
+                    "terrain": { "type": "string", "description": "Cell terrain (e.g. forest, mountain, plains, river, road, swamp, urban, ruins, wilderness)." },
+                    "label": { "type": "string" },
+                    "landmark_name": { "type": "string" },
+                    "fog_status": { "type": "string", "enum": ["unexplored", "rumored", "surveyed", "charted"] },
+                    "passable": { "type": "boolean" },
+                    "hazards": { "type": "array", "items": { "type": "string" } },
+                    "cells": { "type": "array", "items": { "type": "object" }, "description": "Batch cells for set_cell: [{x, y, terrain, label?, place_id?, landmark_name?, faction_control?, fog_status?, passable?, hazards?, notes?, gm_notes?}]." },
+                    "center_x": { "type": "integer" },
+                    "center_y": { "type": "integer" },
+                    "radius": { "type": "integer" },
+                    "notes": { "type": "string" },
+                    "gm_notes": { "type": "string" },
                     "reason": { "type": "string" }
                 },
                 "required": ["op"]
@@ -7441,6 +7683,8 @@ fn unified_domain_only_definitions() -> Vec<Value> {
                     "entity_kind": { "type": "string" },
                     "details": { "type": "string" },
                     "visibility": { "type": "string" },
+                    "always_include": { "type": "boolean", "description": "For upsert_lore: true loads this rule/protocol into every GM scene brief." },
+                    "tags": { "type": "array", "items": { "type": "string" } },
                     "keywords": { "type": "array", "items": { "type": "string" } },
                     "related_ids": { "type": "array", "items": { "type": "string" } }
                 },
@@ -7503,6 +7747,11 @@ fn unified_domain_only_definitions() -> Vec<Value> {
                     "entity_id": { "type": "string" },
                     "old_id": { "type": "string" },
                     "new_id": { "type": "string" },
+                    "name": { "type": "string", "description": "For update_meta: campaign name." },
+                    "description": { "type": "string", "description": "For update_meta: campaign description." },
+                    "ruleset_notes": { "type": "string", "description": "For update_meta: replace campaign ruleset/protocol notes." },
+                    "append_ruleset_notes": { "type": "string", "description": "For update_meta: append a standing rule/protocol to ruleset_notes without overwriting." },
+                    "global_weather": { "type": "string" },
                     "reason": { "type": "string" }
                 },
                 "required": ["op"]
@@ -7536,7 +7785,15 @@ fn unified_domain_only_definitions() -> Vec<Value> {
             }
         }
     ]);
-    arr.as_array().cloned().unwrap_or_default()
+    let mut list = arr.as_array().cloned().unwrap_or_default();
+    for tool in &mut list {
+        if let Some(schema) = tool.get_mut("inputSchema").and_then(|v| v.as_object_mut()) {
+            schema
+                .entry("additionalProperties".to_string())
+                .or_insert(Value::Bool(true));
+        }
+    }
+    list
 }
 
 fn unified_domain_tool_definitions(include_admin: bool) -> Vec<Value> {

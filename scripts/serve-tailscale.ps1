@@ -25,6 +25,7 @@ param(
     [int]$Port = 7878,
     [string]$OAuthSecret = "",
     [string]$BearerToken = "",
+    [string]$ToolProfile = "",
     [switch]$Build,
     [switch]$RotateSecret,
     [switch]$AllowLocalFileImport,
@@ -268,18 +269,27 @@ if (-not $DbExists) {
 }
 
 # 5. Configure Tailscale Funnel (public HTTPS -> 127.0.0.1:$Port) or Serve (tailnet-only)
+#    Stream output directly (never capture!) because on first-time setup Tailscale prints an
+#    interactive https://login.tailscale.com/f/funnel?... activation link and waits for you to open it!
 $tsMode = if ($TailscaleOnly) { "serve" } else { "funnel" }
 Write-Host "[chronicle-serve] Configuring Tailscale $tsMode -> http://127.0.0.1:$Port ..." -ForegroundColor Cyan
-$tsOut = & $TailscaleExe $tsMode --bg $Port 2>&1
-if ($LASTEXITCODE -ne 0) {
+Write-Host "  (First time? If Tailscale prints a login.tailscale.com URL below, open it in your browser to enable $tsMode.)" -ForegroundColor DarkGray
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+try {
+    & $TailscaleExe $tsMode --bg $Port
+    $tsExit = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $prevEap
+}
+if ($tsExit -ne 0) {
     Write-Host ""
-    Write-Host "Tailscale $tsMode failed. Output:" -ForegroundColor Red
-    Write-Host $tsOut
+    Write-Host "Tailscale $tsMode exited with code $tsExit." -ForegroundColor Red
     Write-Host ""
     Write-Host "One-time Tailscale setup checklist:" -ForegroundColor Yellow
     Write-Host "  1. Enable MagicDNS & HTTPS Certificates: https://login.tailscale.com/admin/dns"
     Write-Host "  2. If Tailscale printed a Funnel enablement URL above, open it once in your browser to allow Funnel."
-    Write-Host "  3. Re-run: .\scripts\serve-tailscale.ps1"
+    Write-Host "  3. Re-run: scripts\serve-tailscale.cmd"
     exit 1
 }
 
@@ -299,6 +309,12 @@ if ($BearerToken) {
 }
 if ($AllowLocalFileImport) {
     $chronArgs += "--allow-local-file-import"
+}
+if (-not $ToolProfile -and $saved.ContainsKey("CHRONICLE_TOOL_PROFILE")) {
+    $ToolProfile = $saved["CHRONICLE_TOOL_PROFILE"]
+}
+if ($ToolProfile) {
+    $chronArgs += @("--tool-profile", $ToolProfile)
 }
 
 $proc = $null
@@ -390,7 +406,13 @@ try {
     }
     if (-not $KeepFunnelOnExit) {
         Write-Host "[chronicle-serve] Disabling Tailscale $tsMode on HTTPS port 443..." -ForegroundColor DarkGray
-        & $TailscaleExe $tsMode --https=443 off 2>$null
+        $prevEap2 = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try {
+            & $TailscaleExe $tsMode --https=443 off 2>$null | Out-Null
+        } finally {
+            $ErrorActionPreference = $prevEap2
+        }
     }
     Invoke-SqliteCheckpoint $DbPath
     Write-Host "[chronicle-serve] Stopped cleanly." -ForegroundColor Green

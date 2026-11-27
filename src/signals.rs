@@ -1,7 +1,9 @@
 use crate::autonomy::evaluate_equipped_apparel_fit;
 use crate::db::CampaignDb;
 use crate::models::{slugify, CharacterProjection, PlaceProjection};
-use crate::world_sim::{compute_encumbrance, evaluate_market_prices, synthesize_routes_from_places};
+use crate::world_sim::{
+    compute_encumbrance, evaluate_market_prices, grid_cell_scale_km, synthesize_routes_from_places,
+};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -389,16 +391,21 @@ pub fn evaluate_live_signals(
                     enc.carry_capacity_kg
                 ),
                 summary: format!(
-                    "{} is carrying {:.1} kg (capacity {:.1} kg): travel speed x{:.2}, physical check penalty {:+}.",
+                    "{} is carrying {:.1} kg{} (capacity {:.1} kg): travel speed x{:.2}, physical check penalty {:+}.",
                     cp.baseline.name,
                     enc.total_weight_kg,
+                    if enc.stored_weight_kg > 0.0 {
+                        format!(" ({:.1} kg stored separately)", enc.stored_weight_kg)
+                    } else {
+                        String::new()
+                    },
                     enc.carry_capacity_kg,
                     enc.travel_speed_multiplier,
                     enc.physical_check_penalty
                 ),
                 entity_ids: vec![cid.clone()],
                 location_id: cp.current.current_location.clone(),
-                suggested_actions: vec!["Drop, stash, or transfer heavy cargo to clear movement penalties.".to_string()],
+                suggested_actions: vec!["Drop, stash, or tag items left at lodging/camp as 'stored' via character(op='equipment', sub_action='tag') to exclude them from carried load.".to_string()],
                 visibility: "player".to_string(),
                 status: "active".to_string(),
                 source_event_seq: None,
@@ -583,6 +590,322 @@ pub fn evaluate_live_signals(
         }
     }
 
+    // 6. Recurring Figure / Patron / Rival / Fixer Convergence Radar (strictly GM-secret!)
+    let mut watched_npcs: Vec<(&String, &CharacterProjection, crate::autonomy::CharacterProfileExt)> =
+        Vec::new();
+    for (cid, cp) in all_chars {
+        let st = cp.current.alive_status.to_ascii_lowercase();
+        if cp.baseline.kind.eq_ignore_ascii_case("pc")
+            || matches!(
+                st.as_str(),
+                "dead" | "deceased" | "incapacitated" | "imprisoned" | "missing" | "coma" | "unconscious"
+            )
+        {
+            continue;
+        }
+        if let Ok(Some(prof)) = db.get_character_profile(cid) {
+            if prof.mobility.gm_convergence_alert {
+                watched_npcs.push((cid, cp, prof));
+            }
+        }
+    }
+
+    if !watched_npcs.is_empty() {
+        let pcs: Vec<(&String, &CharacterProjection, String)> = all_chars
+            .iter()
+            .filter(|(_, cp)| cp.baseline.kind.eq_ignore_ascii_case("pc"))
+            .filter_map(|(id, cp)| {
+                cp.current
+                    .current_location
+                    .clone()
+                    .or_else(|| active_place_id.map(|s| s.to_string()))
+                    .map(|loc| (id, cp, loc))
+            })
+            .collect();
+
+        if !pcs.is_empty() {
+            let mut routes = db.list_travel_routes().unwrap_or_default();
+            if routes.is_empty() {
+                routes = synthesize_routes_from_places(all_places);
+            }
+            let grids = db.list_map_grids().unwrap_or_default();
+            let mut settlement_parent: BTreeMap<String, String> = BTreeMap::new();
+            let mut grid_place_xy: BTreeMap<String, BTreeMap<String, (i32, i32)>> =
+                BTreeMap::new();
+            let mut grid_scale_km: BTreeMap<String, f64> = BTreeMap::new();
+
+            for (pid, p) in all_places {
+                if let Some(ref parent) = p.baseline.parent_place {
+                    if !parent.trim().is_empty() {
+                        settlement_parent.insert(pid.clone(), parent.clone());
+                    }
+                }
+            }
+            for g in &grids {
+                if let Some(km) = grid_cell_scale_km(&g.cell_scale_label) {
+                    grid_scale_km.insert(g.id.clone(), km);
+                }
+                if let Ok(cells) = db.list_map_cells(&g.id) {
+                    let entry = grid_place_xy.entry(g.id.clone()).or_default();
+                    for c in &cells {
+                        if let Some(ref pid) = c.place_id {
+                            entry.insert(pid.clone(), (c.x, c.y));
+                            if g.scale_kind.eq_ignore_ascii_case("settlement") {
+                                if let Some(ref parent) = g.parent_place_id {
+                                    settlement_parent
+                                        .entry(pid.clone())
+                                        .or_insert_with(|| parent.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for r in &routes {
+                if r.distance_km <= 2.0 {
+                    if all_places.get(&r.to_place_id).is_some_and(|p| {
+                        p.baseline.place_type.eq_ignore_ascii_case("settlement")
+                    }) {
+                        settlement_parent
+                            .entry(r.from_place_id.clone())
+                            .or_insert_with(|| r.to_place_id.clone());
+                    }
+                    if r.bidirectional
+                        && all_places.get(&r.from_place_id).is_some_and(|p| {
+                            p.baseline.place_type.eq_ignore_ascii_case("settlement")
+                        })
+                    {
+                        settlement_parent
+                            .entry(r.to_place_id.clone())
+                            .or_insert_with(|| r.from_place_id.clone());
+                    }
+                }
+            }
+
+            let parent_of = |pid: &str| -> String {
+                settlement_parent
+                    .get(pid)
+                    .cloned()
+                    .unwrap_or_else(|| pid.to_string())
+            };
+
+            let compass_bearing = |dx: i32, dy: i32| -> &'static str {
+                if dx == 0 && dy == 0 {
+                    return "here";
+                }
+                let angle = (dy as f64).atan2(dx as f64).to_degrees();
+                // Map grid y increases southward
+                match angle {
+                    a if (-22.5..22.5).contains(&a) => "E",
+                    a if (22.5..67.5).contains(&a) => "SE",
+                    a if (67.5..112.5).contains(&a) => "S",
+                    a if (112.5..157.5).contains(&a) => "SW",
+                    a if !(-157.5..157.5).contains(&a) => "W",
+                    a if (-157.5..-112.5).contains(&a) => "NW",
+                    a if (-112.5..-67.5).contains(&a) => "N",
+                    _ => "NE",
+                }
+            };
+
+            for (npc_id, npc_proj, prof) in &watched_npcs {
+                let m = &prof.mobility;
+                let npc_loc = npc_proj.current.current_location.as_deref();
+                let npc_settlement = npc_loc.map(&parent_of);
+                let radius_km = m.convergence_radius_km.clamp(1.0, 500.0);
+
+                for (pc_id, pc_proj, pc_loc) in &pcs {
+                    let pc_settlement = parent_of(pc_loc);
+                    let mut match_sev: Option<&'static str> = None;
+                    let mut proximity_desc = String::new();
+                    let mut sig_loc: Option<String> = npc_loc.map(|s| s.to_string());
+
+                    // 1. Same exact place (when not currently roaming out in the wilds)
+                    if m.current_status != "roaming_wild" && npc_loc == Some(pc_loc.as_str()) {
+                        match_sev = Some("warning");
+                        proximity_desc = format!(
+                            "at the exact same location (`{pc_loc}`) as {}",
+                            pc_proj.baseline.name
+                        );
+                    }
+                    // 2. Same settlement / district
+                    else if m.current_status != "roaming_wild"
+                        && npc_settlement.as_deref() == Some(pc_settlement.as_str())
+                    {
+                        match_sev = Some("warning");
+                        proximity_desc = format!(
+                            "in the same settlement (`{pc_settlement}`) as {} (NPC at `{}`; PC at `{pc_loc}`)",
+                            pc_proj.baseline.name,
+                            npc_loc.unwrap_or("unknown")
+                        );
+                    }
+                    // 3. Regional 2D map grid distance <= convergence_radius_km
+                    else {
+                        let mut best_grid_match: Option<(f64, String, i32, i32, &'static str, String)> =
+                            None;
+                        for (gid, pmap) in &grid_place_xy {
+                            let Some(&ckm) = grid_scale_km.get(gid) else {
+                                continue;
+                            };
+                            let pc_xy = pmap
+                                .get(pc_loc)
+                                .or_else(|| pmap.get(&pc_settlement))
+                                .copied();
+                            let Some((px, py)) = pc_xy else {
+                                continue;
+                            };
+                            let npc_xy_and_label: Option<((i32, i32), String)> =
+                                if let Some(ref gp) = m.current_grid_pos {
+                                    if gp.grid_id == *gid {
+                                        let lbl = if !gp.label.trim().is_empty() {
+                                            gp.label.clone()
+                                        } else {
+                                            format!("{} wilds", gp.terrain)
+                                        };
+                                        Some(((gp.x, gp.y), lbl))
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    npc_loc
+                                        .and_then(|nl| pmap.get(nl).copied())
+                                        .or_else(|| {
+                                            npc_settlement
+                                                .as_deref()
+                                                .and_then(|ns| pmap.get(ns).copied())
+                                        })
+                                        .map(|xy| {
+                                            (
+                                                xy,
+                                                npc_loc
+                                                    .unwrap_or(pc_settlement.as_str())
+                                                    .to_string(),
+                                            )
+                                        })
+                                };
+
+                            if let Some(((nx, ny), nlabel)) = npc_xy_and_label {
+                                let dist_km = ((nx - px) as f64).hypot((ny - py) as f64) * ckm;
+                                if dist_km <= radius_km {
+                                    let bearing = compass_bearing(nx - px, ny - py);
+                                    if best_grid_match
+                                        .as_ref()
+                                        .is_none_or(|(best_d, ..)| dist_km < *best_d)
+                                    {
+                                        best_grid_match = Some((
+                                            dist_km,
+                                            gid.clone(),
+                                            nx,
+                                            ny,
+                                            bearing,
+                                            nlabel,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Some((dist_km, gid, nx, ny, bearing, nlabel)) = best_grid_match {
+                            match_sev = Some(if dist_km <= 12.0 { "warning" } else { "info" });
+                            proximity_desc = format!(
+                                "~{:.0} km {bearing} of {} on `{gid}` at ({nx},{ny}) [{nlabel}]",
+                                dist_km.round(),
+                                pc_proj.baseline.name
+                            );
+                            sig_loc = Some(pc_loc.clone());
+                        } else if m.current_status != "roaming_wild" {
+                            // 4. 1 passable route hop away from PC's place or settlement
+                            let one_hop = routes.iter().any(|r| {
+                                if !r.is_passable() {
+                                    return false;
+                                }
+                                let n_matches = |id: &str| {
+                                    npc_loc == Some(id) || npc_settlement.as_deref() == Some(id)
+                                };
+                                let p_matches = |id: &str| id == pc_loc || id == pc_settlement;
+                                (n_matches(&r.from_place_id) && p_matches(&r.to_place_id))
+                                    || (r.bidirectional
+                                        && n_matches(&r.to_place_id)
+                                        && p_matches(&r.from_place_id))
+                            });
+                            if one_hop {
+                                match_sev = Some("info");
+                                proximity_desc = format!(
+                                    "one route hop from {} (NPC at `{}`; PC at `{pc_loc}`)",
+                                    pc_proj.baseline.name,
+                                    npc_loc.unwrap_or("unknown")
+                                );
+                            }
+                        }
+                    }
+
+                    if let Some(sev) = match_sev {
+                        let role_label = if m.narrative_role.trim().is_empty() {
+                            "RECURRING FIGURE".to_string()
+                        } else {
+                            m.narrative_role.trim().to_ascii_uppercase()
+                        };
+                        let conv_frag = m
+                            .conveyance
+                            .as_ref()
+                            .filter(|c| !c.label.trim().is_empty())
+                            .map(|c| format!(" Traveling via {} [{}].", c.label.trim(), c.signature))
+                            .unwrap_or_default();
+                        let alias_frag = m
+                            .incognito_alias
+                            .as_deref()
+                            .filter(|a| !a.trim().is_empty())
+                            .map(|a| format!(" Cover alias: '{a}'."))
+                            .unwrap_or_default();
+                        let activity_frag = m
+                            .current_excursion_note
+                            .as_deref()
+                            .filter(|s| !s.trim().is_empty())
+                            .map(|s| format!(" Activity: {s}."))
+                            .or_else(|| {
+                                m.active_trip
+                                    .as_ref()
+                                    .map(|t| format!(" Motive: {}.", t.purpose))
+                            })
+                            .unwrap_or_default();
+
+                        let gm_prompt = match m.narrative_role.trim().to_ascii_lowercase().as_str()
+                        {
+                            "patron" => "GM choice: cross paths on your terms (test, pressure, bargain, or torment the PC), drop a conveyance/presence omen, or let them pass unseen.",
+                            "rival" => "GM choice: stage a competitive clash over a lead/resource, leave proof they arrived first, or let them pass unseen.",
+                            "fixer" => "GM choice: surface a brokered rumor, shady deal, or leverage play via an intermediary, or let them pass unseen.",
+                            "hunter" => "GM choice: tighten pursuit tension (watchers spotted, locals questioned, narrowed trail) or hold the strike for later.",
+                            _ => "GM choice: trigger an organic crossing, plant a subtle sighting/rumor, or let them pass unseen.",
+                        };
+
+                        push_derived(EngineSignal {
+                            id: String::new(),
+                            dedup_key: format!("npc_convergence:{npc_id}:{pc_id}"),
+                            code: "NPC_CONVERGENCE_OPPORTUNITY".to_string(),
+                            severity: sev.to_string(),
+                            category: "world".to_string(),
+                            title: format!(
+                                "[{role_label}] {} Near {}",
+                                npc_proj.baseline.name, pc_proj.baseline.name
+                            ),
+                            summary: format!(
+                                "{} (`{npc_id}`, status: {}) is {proximity_desc}.{activity_frag}{conv_frag}{alias_frag}",
+                                npc_proj.baseline.name, m.current_status
+                            ),
+                            entity_ids: vec![(*npc_id).clone(), (*pc_id).clone()],
+                            location_id: sig_loc,
+                            suggested_actions: vec![gm_prompt.to_string()],
+                            visibility: "gm_secret".to_string(),
+                            status: "active".to_string(),
+                            source_event_seq: None,
+                            created_at_world_time: world_time.to_string(),
+                            updated_at_world_time: world_time.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     let mut out: Vec<EngineSignal> = by_dedup.into_values().collect();
     out.sort_by(|a, b| {
         severity_rank(&b.severity)
@@ -634,13 +957,26 @@ pub fn render_signals_markdown(signals: &[EngineSignal]) -> String {
     }
     let mut out = String::new();
     let _ = writeln!(out, "## Engine Alarms & Active Directives ({})", signals.len());
+    let _ = writeln!(
+        out,
+        "> *(Ledger advisories for the GM — you hold full narrative authority to invoke, time, adapt, or override any story hook.)*"
+    );
     for s in signals {
         let badge = match s.severity.as_str() {
             "critical" => "[CRITICAL]",
             "warning" => "[WARNING]",
             _ => "[INFO]",
         };
-        let _ = write!(out, "- **{badge} `{}` — {}:** {}", s.code, s.title, s.summary);
+        let sec_badge = if s.visibility.eq_ignore_ascii_case("gm_secret") {
+            " [GM SECRET — DO NOT DISCLOSE]"
+        } else {
+            ""
+        };
+        let _ = write!(
+            out,
+            "- **{badge}{sec_badge} `{}` — {}:** {}",
+            s.code, s.title, s.summary
+        );
         if !s.suggested_actions.is_empty() {
             let _ = write!(out, " *(Next: {})*", s.suggested_actions.join(" ; "));
         }

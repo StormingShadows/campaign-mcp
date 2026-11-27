@@ -785,6 +785,37 @@ fn default_trait_cat() -> String {
 // 1c. Living World NPC Mobility, Business Circuits & Networking Engagements
 // ============================================================================
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TravelConveyance {
+    /// Freeform genre-agnostic conveyance description (e.g. "Curtained lacquered sedan chair with four bearers", "Armored hover-limo", "Unmarked courier skiff").
+    #[serde(default)]
+    pub label: String,
+    /// Optional custom travel speed override in km/h (data-driven instead of hardcoding niche transport types).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed_kmh: Option<f64>,
+    /// True when the conveyance traverses trails, hills, or wild terrain smoothly compared to ordinary wheeled transport.
+    #[serde(default)]
+    pub offroad_capable: bool,
+    /// Social/sensory footprint when near a PC: "conspicuous" | "discreet" | "clandestine"
+    #[serde(default = "default_conveyance_sig")]
+    pub signature: String,
+}
+
+fn default_conveyance_sig() -> String {
+    "discreet".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GridPosition {
+    pub grid_id: String,
+    pub x: i32,
+    pub y: i32,
+    #[serde(default)]
+    pub terrain: String,
+    #[serde(default)]
+    pub label: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NpcTripState {
     pub origin_place_id: String,
@@ -813,6 +844,12 @@ pub struct NpcTripState {
     pub transport_mode: String,
     #[serde(default)]
     pub detour_note: String,
+    #[serde(default = "default_public_vis")]
+    pub visibility: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_grid_pos: Option<GridPosition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uncharted_label: Option<String>,
 }
 
 fn default_trip_purpose() -> String {
@@ -836,7 +873,7 @@ pub struct NpcEngagement {
     pub visibility: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NpcMobilityProfile {
     /// Whether this NPC is a prominent figure who travels for business, networking, inspections, etc.
     #[serde(default)]
@@ -844,8 +881,41 @@ pub struct NpcMobilityProfile {
     /// "auto" | "stationary" | "local_commuter" | "business_circuit" | "networking_envoy" | "inspector" | "wanderer"
     #[serde(default = "default_mobility_mode")]
     pub mobility_mode: String,
+    /// Epistemic visibility of this figure's movements: "public" (default) | "gm_secret" (covert/incognito, hidden from Player POV).
+    #[serde(default = "default_public_vis")]
+    pub visibility: String,
+    /// Genre-agnostic recurring narrative role: "" | "patron" | "rival" | "fixer" | "hunter" | "wanderer"
+    #[serde(default)]
+    pub narrative_role: String,
+    /// Destination selection strategy: "circuit" (default) | "weighted_random" | "map_roam"
+    #[serde(default = "default_roam_strategy")]
+    pub roam_strategy: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home_place_id: Option<String>,
+    /// Optional 2D map grid ID used for map-aware wilderness/hub roaming and km-distance convergence radar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roam_grid_id: Option<String>,
+    /// Terrain types eligible for wilderness/frontier stops on `roam_grid_id` (e.g. ["forest", "mountain", "plains", "road", "urban"]).
+    #[serde(default)]
+    pub roam_terrains: Vec<String>,
+    /// 0..=100 chance an excursion targets a wilderness grid cell or uncharted frontier stop instead of a named settlement hub.
+    #[serde(default)]
+    pub wild_roam_chance: u8,
+    /// 0..=100 soft narrative gravity biasing new excursions toward the PC's general region without teleportation.
+    #[serde(default)]
+    pub pc_proximity_bias: u8,
+    /// When true, Chronicle's live Signal Bus emits a GM-only `NPC_CONVERGENCE_OPPORTUNITY` alarm whenever this figure nears a PC.
+    #[serde(default)]
+    pub gm_convergence_alert: bool,
+    /// Regional 2D map distance threshold (in km) for emitting `NPC_CONVERGENCE_OPPORTUNITY` alerts.
+    #[serde(default = "default_convergence_radius_km")]
+    pub convergence_radius_km: f64,
+    /// Optional cover identity or alias used while traveling covertly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incognito_alias: Option<String>,
+    /// Optional data-driven conveyance/travel style (e.g. carried sedan, luxury coach, armored shuttle, river skiff).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conveyance: Option<TravelConveyance>,
     /// Named circuit stops or regular business/networking hubs (auto-discovers connected routes if empty).
     #[serde(default)]
     pub preferred_destinations: Vec<String>,
@@ -863,11 +933,17 @@ pub struct NpcMobilityProfile {
     /// Optional aides, bodyguards, or apprentices who travel with this figure.
     #[serde(default)]
     pub entourage_ids: Vec<String>,
-    /// "at_home" | "in_transit" | "visiting" | "stranded"
+    /// "at_home" | "in_transit" | "visiting" | "roaming_wild" | "stranded"
     #[serde(default = "default_mobility_status")]
     pub current_status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_trip: Option<NpcTripState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_grid_pos: Option<GridPosition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_excursion_note: Option<String>,
+    #[serde(default)]
+    pub excursions_since_home: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_trip_ended_total_hours: Option<i64>,
     #[serde(default)]
@@ -878,6 +954,14 @@ pub struct NpcMobilityProfile {
 
 fn default_mobility_mode() -> String {
     "auto".to_string()
+}
+
+fn default_roam_strategy() -> String {
+    "circuit".to_string()
+}
+
+fn default_convergence_radius_km() -> f64 {
+    25.0
 }
 
 fn default_trip_cadence_days() -> u32 {
@@ -897,7 +981,18 @@ impl Default for NpcMobilityProfile {
         Self {
             prominent: false,
             mobility_mode: default_mobility_mode(),
+            visibility: default_public_vis(),
+            narrative_role: String::new(),
+            roam_strategy: default_roam_strategy(),
             home_place_id: None,
+            roam_grid_id: None,
+            roam_terrains: Vec::new(),
+            wild_roam_chance: 0,
+            pc_proximity_bias: 0,
+            gm_convergence_alert: false,
+            convergence_radius_km: default_convergence_radius_km(),
+            incognito_alias: None,
+            conveyance: None,
             preferred_destinations: Vec::new(),
             purposes: Vec::new(),
             trip_cadence_days: default_trip_cadence_days(),
@@ -906,6 +1001,9 @@ impl Default for NpcMobilityProfile {
             entourage_ids: Vec::new(),
             current_status: default_mobility_status(),
             active_trip: None,
+            current_grid_pos: None,
+            current_excursion_note: None,
+            excursions_since_home: 0,
             last_trip_ended_total_hours: None,
             circuit_cursor: 0,
             recent_engagements: Vec::new(),
@@ -917,10 +1015,16 @@ impl NpcMobilityProfile {
     pub fn is_configured(&self) -> bool {
         self.prominent
             || self.mobility_mode != "auto"
+            || !self.narrative_role.is_empty()
+            || self.gm_convergence_alert
             || self.home_place_id.is_some()
             || !self.preferred_destinations.is_empty()
             || self.active_trip.is_some()
             || !self.recent_engagements.is_empty()
+    }
+
+    pub fn is_covert(&self) -> bool {
+        self.visibility.eq_ignore_ascii_case("gm_secret")
     }
 }
 

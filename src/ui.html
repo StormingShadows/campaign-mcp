@@ -1368,12 +1368,47 @@
     <label>Travel Speed Mode<select id="nm_speed">
       <option value="mount">Mount / Horse</option>
       <option value="foot">On Foot</option>
-      <option value="carriage">Carriage / Cart</option>
-      <option value="boat">River Boat</option>
+      <option value="wheeled">Wheeled / Carriage / Coach</option>
+      <option value="cart">Cart / Caravan</option>
+      <option value="water">Water / Boat / Ship</option>
+      <option value="air">Air / Flying / Shuttle</option>
+      <option value="fast_transit">Fast Transit</option>
     </select></label>
+    <label>Narrative Role<select id="nm_role">
+      <option value="">(None / Ordinary)</option>
+      <option value="patron">Patron (Benefactor / Tempter / Power)</option>
+      <option value="rival">Rival (Competitor)</option>
+      <option value="fixer">Fixer (Broker / Deal-Maker)</option>
+      <option value="hunter">Hunter (Pursuer / Stalker)</option>
+      <option value="wanderer">Wanderer (Drifter / Seeker)</option>
+    </select></label>
+    <label>Visibility (POV Isolation)<select id="nm_vis">
+      <option value="public">Public (Visible to World/Player)</option>
+      <option value="gm_secret">GM Secret (Covert / Incognito)</option>
+    </select></label>
+    <label>Roam Strategy<select id="nm_strategy">
+      <option value="circuit">Deterministic Circuit</option>
+      <option value="weighted_random">Weighted Random</option>
+      <option value="map_roam">Map-Aware Roam (Hubs + Wilds)</option>
+    </select></label>
+    <label>Roam Map Grid<select id="nm_grid"><option value="">(None / Route Graph Only)</option></select></label>
+    <label>Wild Roam Chance (0–100%)<input id="nm_wild" type="number" min="0" max="100" value="0" /></label>
+    <label>PC Proximity Bias (0–100%)<input id="nm_pc_bias" type="number" min="0" max="100" value="0" /></label>
+    <label>GM Convergence Radar?<select id="nm_conv_alert"><option value="false">Off</option><option value="true">On (Emit GM-Secret Alarm)</option></select></label>
+    <label>Convergence Radius (km)<input id="nm_conv_km" type="number" min="1" max="500" value="25" /></label>
     <label>Trip Cadence (Days between trips)<input id="nm_cadence" type="number" min="1" value="7" /></label>
     <label>Stay Duration (Days at destination)<input id="nm_stay" type="number" min="1" value="3" /></label>
-    <label class="full">Business / Networking Circuit Stops (comma-separated place slugs; leave blank to auto-pick open routes)<input id="nm_stops" placeholder="salt-quay, river-market, watch-keep" /></label>
+    <label class="full">Custom Conveyance / Travel Style (genre-agnostic label)<input id="nm_conv_label" placeholder="e.g. Curtained lacquered sedan chair with four bearers / Armored hover-limo" /></label>
+    <label>Conveyance Speed Override (km/h, optional)<input id="nm_conv_speed" type="number" step="0.5" min="0.5" placeholder="auto" /></label>
+    <label>Conveyance Footprint<select id="nm_conv_sig">
+      <option value="discreet">Discreet</option>
+      <option value="conspicuous">Conspicuous</option>
+      <option value="clandestine">Clandestine</option>
+    </select></label>
+    <label>Off-Road / Trail Capable?<select id="nm_conv_offroad"><option value="false">No</option><option value="true">Yes (Handles wild trails smoothly)</option></select></label>
+    <label>Incognito Alias (optional)<input id="nm_alias" placeholder="e.g. Veiled traveling apothecary" /></label>
+    <label class="full">Roam Terrains (comma-separated, for Map Roam)<input id="nm_terrains" placeholder="forest, mountain, plains, road, urban" /></label>
+    <label class="full">Business / Networking Circuit Stops (comma-separated place slugs; leave blank to auto-pick)<input id="nm_stops" placeholder="salt-quay, river-market, watch-keep" /></label>
     <label class="full">Purposes (comma-separated)<input id="nm_purposes" placeholder="business, networking, diplomacy, procurement" /></label>
     <label class="full">Entourage / Guards (comma-separated character slugs)<input id="nm_entourage" placeholder="guard-slug-1, aide-slug-2" /></label>
   </div>
@@ -5092,15 +5127,23 @@ async function loadWorldMovements() {
     const statusBadge = st => {
       if (st === "in_transit") return '<span class="pill warn">IN TRANSIT</span>';
       if (st === "visiting") return '<span class="pill pc">VISITING</span>';
+      if (st === "roaming_wild") return '<span class="pill warn">ROAMING WILD</span>';
       if (st === "stranded") return '<span class="pill injury">STRANDED</span>';
       return '<span class="pill buff">At Home</span>';
     };
     const rows = figs.map(f => {
       const m = f.mobility || {};
       const tr = m.active_trip;
+      const gp = m.current_grid_pos;
+      const conv = m.conveyance;
+      const convHtml = conv && conv.label ? `<div class="muted" style="font-size:11px;">Via: ${esc(conv.label)}${conv.speed_kmh ? ` (${conv.speed_kmh} km/h)` : ""}</div>` : "";
       let locHtml = `<span class="mono">${esc(f.current_location || "unknown")}</span>`;
       if (m.current_status === "in_transit" && tr) {
-        locHtml = `<strong>${esc(tr.origin_place_id)} &rarr; ${esc(tr.destination_place_id)}</strong> <span class="pill">${esc(tr.purpose)}</span><div class="muted" style="font-size:11px;">ETA: ${esc(tr.eta_world_time)}${tr.detour_note ? " • " + esc(tr.detour_note) : ""}</div>`;
+        const destLbl = tr.target_grid_pos ? `grid ${tr.target_grid_pos.grid_id} (${tr.target_grid_pos.x},${tr.target_grid_pos.y}) [${tr.target_grid_pos.terrain}]` : (tr.uncharted_label ? `uncharted: ${tr.uncharted_label}` : tr.destination_place_id);
+        locHtml = `<strong>${esc(tr.origin_place_id)} &rarr; ${esc(destLbl)}</strong> <span class="pill">${esc(tr.purpose)}</span><div class="muted" style="font-size:11px;">ETA: ${esc(tr.eta_world_time)}${tr.detour_note ? " • " + esc(tr.detour_note) : ""}</div>`;
+      } else if (m.current_status === "roaming_wild") {
+        const wLbl = gp ? `grid ${gp.grid_id} (${gp.x},${gp.y}) [${gp.label || gp.terrain}]` : (tr?.uncharted_label || "uncharted wilds");
+        locHtml = `<strong>@ ${esc(wLbl)}</strong>${m.current_excursion_note ? `<div class="muted" style="font-size:11px;">${esc(m.current_excursion_note)}</div>` : ""}${tr ? `<div class="muted" style="font-size:11px;">Moves on after: ${esc(tr.return_after_world_time)}</div>` : ""}`;
       } else if (m.current_status === "visiting" && tr) {
         locHtml = `<strong>@ ${esc(tr.destination_place_id)}</strong> <span class="pill">${esc(tr.purpose)}</span><div class="muted" style="font-size:11px;">Home: ${esc(m.home_place_id || "—")} • Leaves after: ${esc(tr.return_after_world_time)}</div>`;
       } else if (m.current_status === "stranded") {
@@ -5108,10 +5151,13 @@ async function loadWorldMovements() {
       }
       const circuit = (m.preferred_destinations && m.preferred_destinations.length)
         ? m.preferred_destinations.join(" → ")
-        : "Auto (open routes)";
+        : (m.roam_strategy === "map_roam" && m.roam_grid_id ? `Map Roam (${m.roam_grid_id}, ${m.wild_roam_chance || 0}% wild)` : "Auto (open routes)");
+      const rolePill = m.narrative_role ? ` <span class="pill pc">${esc(m.narrative_role.toUpperCase())}</span>` : "";
+      const secretPill = m.visibility === "gm_secret" ? ' <span class="pill injury">GM SECRET</span>' : "";
+      const radarPill = m.gm_convergence_alert ? ` <span class="pill warn" title="Convergence radar (${m.convergence_radius_km || 25} km)">Radar</span>` : "";
       return `<tr>
-        <td><a onclick="jumpToChar('${escJs(f.character_id)}')"><strong>${esc(f.name)}</strong></a>${f.title ? `<div class="muted" style="font-size:11px;">${esc(f.title)}</div>` : ""}</td>
-        <td><span class="pill">${esc(f.effective_mode || "auto")}</span>${f.prominent ? ' <span class="pill warn">Prominent</span>' : ""}</td>
+        <td><a onclick="jumpToChar('${escJs(f.character_id)}')"><strong>${esc(f.name)}</strong></a>${f.title ? `<div class="muted" style="font-size:11px;">${esc(f.title)}</div>` : ""}${convHtml}</td>
+        <td><span class="pill">${esc(f.effective_mode || "auto")}</span>${rolePill}${secretPill}${radarPill}${f.prominent && !m.narrative_role ? ' <span class="pill warn">Prominent</span>' : ""}</td>
         <td>${statusBadge(m.current_status || "at_home")}</td>
         <td>${locHtml}</td>
         <td class="muted" style="font-size:11.5px;">${esc(circuit)}<div>Every ${m.trip_cadence_days || 7}d / stay ${m.stay_duration_days || 3}d</div></td>
@@ -5152,11 +5198,25 @@ function openMobilityModal(cid) {
   const fig = (wm.figures || []).find(f => f.character_id === cid);
   if (!fig) return;
   const m = fig.mobility || {};
+  const conv = m.conveyance || {};
   document.getElementById("nm_title").textContent = `Configure Mobility: ${fig.name}`;
   document.getElementById("nm_char").value = cid;
   document.getElementById("nm_prom").value = fig.prominent ? "true" : "false";
   document.getElementById("nm_mode").value = m.mobility_mode || "auto";
   document.getElementById("nm_speed").value = m.travel_speed_mode || "mount";
+  document.getElementById("nm_role").value = m.narrative_role || "";
+  document.getElementById("nm_vis").value = m.visibility || "public";
+  document.getElementById("nm_strategy").value = m.roam_strategy || "circuit";
+  document.getElementById("nm_wild").value = m.wild_roam_chance || 0;
+  document.getElementById("nm_pc_bias").value = m.pc_proximity_bias || 0;
+  document.getElementById("nm_conv_alert").value = m.gm_convergence_alert ? "true" : "false";
+  document.getElementById("nm_conv_km").value = m.convergence_radius_km || 25;
+  document.getElementById("nm_conv_label").value = conv.label || "";
+  document.getElementById("nm_conv_speed").value = conv.speed_kmh || "";
+  document.getElementById("nm_conv_sig").value = conv.signature || "discreet";
+  document.getElementById("nm_conv_offroad").value = conv.offroad_capable ? "true" : "false";
+  document.getElementById("nm_alias").value = m.incognito_alias || "";
+  document.getElementById("nm_terrains").value = (m.roam_terrains || []).join(", ");
   document.getElementById("nm_cadence").value = m.trip_cadence_days || 7;
   document.getElementById("nm_stay").value = m.stay_duration_days || 3;
   document.getElementById("nm_stops").value = (m.preferred_destinations || []).join(", ");
@@ -5165,6 +5225,9 @@ function openMobilityModal(cid) {
   const homeSel = document.getElementById("nm_home");
   homeSel.innerHTML = `<option value="">(Current Location)</option>` +
     (wm.places || []).map(p => `<option value="${esc(p.id)}" ${m.home_place_id === p.id ? "selected" : ""}>${esc(p.name)} (${esc(p.id)})</option>`).join("");
+  const gridSel = document.getElementById("nm_grid");
+  gridSel.innerHTML = `<option value="">(None / Route Graph Only)</option>` +
+    (wm.map_grids || []).map(g => `<option value="${esc(g.id)}" ${m.roam_grid_id === g.id ? "selected" : ""}>${esc(g.name)} (${esc(g.id)})</option>`).join("");
   openModal("modalNpcMobility");
 }
 
@@ -5174,11 +5237,31 @@ async function submitNpcMobility() {
     const stops = document.getElementById("nm_stops").value.split(",").map(s => s.trim()).filter(Boolean);
     const purposes = document.getElementById("nm_purposes").value.split(",").map(s => s.trim()).filter(Boolean);
     const entourage = document.getElementById("nm_entourage").value.split(",").map(s => s.trim()).filter(Boolean);
+    const terrains = document.getElementById("nm_terrains").value.split(",").map(s => s.trim()).filter(Boolean);
+    const convLabel = document.getElementById("nm_conv_label").value.trim();
+    const convSpeedRaw = parseFloat(document.getElementById("nm_conv_speed").value);
+    const conveyance = convLabel ? {
+      label: convLabel,
+      speed_kmh: Number.isFinite(convSpeedRaw) && convSpeedRaw >= 0.5 ? convSpeedRaw : null,
+      offroad_capable: document.getElementById("nm_conv_offroad").value === "true",
+      signature: document.getElementById("nm_conv_sig").value
+    } : null;
     const res = await callTool("simulate_autonomy", {
       mode: "configure_mobility",
       character_id: cid,
       prominent: document.getElementById("nm_prom").value === "true",
       mobility_mode: document.getElementById("nm_mode").value,
+      narrative_role: document.getElementById("nm_role").value,
+      visibility: document.getElementById("nm_vis").value,
+      roam_strategy: document.getElementById("nm_strategy").value,
+      roam_grid_id: document.getElementById("nm_grid").value,
+      roam_terrains: terrains,
+      wild_roam_chance: Number(document.getElementById("nm_wild").value) || 0,
+      pc_proximity_bias: Number(document.getElementById("nm_pc_bias").value) || 0,
+      gm_convergence_alert: document.getElementById("nm_conv_alert").value === "true",
+      convergence_radius_km: Number(document.getElementById("nm_conv_km").value) || 25,
+      incognito_alias: document.getElementById("nm_alias").value.trim(),
+      conveyance,
       home_place_id: document.getElementById("nm_home").value,
       travel_speed_mode: document.getElementById("nm_speed").value,
       trip_cadence_days: Number(document.getElementById("nm_cadence").value) || 7,

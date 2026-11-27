@@ -175,8 +175,15 @@ pub struct CharacterRoutine {
     pub last_tick_total_hours: Option<i64>,
     #[serde(default)]
     pub notes: String,
+    /// "public" (default) | "gm_secret" (hidden background engine routine, e.g. passive soul-imprint drift).
+    #[serde(default = "default_routine_vis")]
+    pub visibility: String,
     #[serde(default)]
     pub updated_at_world_time: String,
+}
+
+fn default_routine_vis() -> String {
+    "public".to_string()
 }
 
 fn default_routine_category() -> String {

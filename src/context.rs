@@ -975,7 +975,7 @@ pub fn assemble_scene_context(
         .map(format_event_oneliner)
         .collect();
 
-    // Gather prominent figures currently in transit, visiting away from home, or stranded
+    // Gather prominent figures currently in transit, visiting away from home, roaming wild, or stranded
     let mut prominent_figure_movements: Vec<String> = Vec::new();
     for (cid, cp) in &all_chars {
         if cp.baseline.kind.eq_ignore_ascii_case("pc") {
@@ -983,6 +983,21 @@ pub fn assemble_scene_context(
         }
         if let Ok(Some(prof)) = db.get_character_profile(cid) {
             let m = &prof.mobility;
+            if m.is_covert() && !effective_include_secrets {
+                continue;
+            }
+            let secret_tag = if m.is_covert() { "[GM SECRET] " } else { "" };
+            let role_tag = if m.narrative_role.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", m.narrative_role.to_ascii_uppercase())
+            };
+            let conv_tag = m
+                .conveyance
+                .as_ref()
+                .filter(|c| !c.label.trim().is_empty())
+                .map(|c| format!(" via {}", c.label.trim()))
+                .unwrap_or_default();
             if m.current_status == "in_transit" {
                 if let Some(ref tr) = m.active_trip {
                     let detour = if tr.detour_note.is_empty() {
@@ -990,15 +1005,56 @@ pub fn assemble_scene_context(
                     } else {
                         format!(" [{}]", tr.detour_note)
                     };
+                    let target_desc = if let Some(ref gp) = tr.target_grid_pos {
+                        format!(
+                            "grid `{}` ({},{}) [{}]",
+                            gp.grid_id, gp.x, gp.y, gp.terrain
+                        )
+                    } else if let Some(ref ul) = tr.uncharted_label {
+                        format!("uncharted: {ul}")
+                    } else {
+                        format!("`{}`", tr.destination_place_id)
+                    };
                     prominent_figure_movements.push(format!(
-                        "**{}** (`{cid}`) — IN TRANSIT `{}` -> `{}` ({}, ETA {}){detour}",
-                        cp.baseline.name, tr.origin_place_id, tr.destination_place_id, tr.purpose, tr.eta_world_time
+                        "{secret_tag}**{}** (`{cid}`){role_tag} — IN TRANSIT `{}` -> {target_desc} ({}{conv_tag}, ETA {}){detour}",
+                        cp.baseline.name, tr.origin_place_id, tr.purpose, tr.eta_world_time
                     ));
                 }
+            } else if m.current_status == "roaming_wild" {
+                let where_desc = if let Some(ref gp) = m.current_grid_pos {
+                    let lbl = if gp.label.is_empty() {
+                        gp.terrain.as_str()
+                    } else {
+                        gp.label.as_str()
+                    };
+                    format!("grid `{}` ({},{}) [{lbl}]", gp.grid_id, gp.x, gp.y)
+                } else if let Some(ref tr) = m.active_trip {
+                    tr.uncharted_label
+                        .clone()
+                        .unwrap_or_else(|| tr.destination_place_id.clone())
+                } else {
+                    "uncharted wilds".to_string()
+                };
+                let note = m
+                    .current_excursion_note
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| format!(" — {s}"))
+                    .unwrap_or_default();
+                let leave = m
+                    .active_trip
+                    .as_ref()
+                    .map(|t| format!("; moves on after {}", t.return_after_world_time))
+                    .unwrap_or_default();
+                prominent_figure_movements.push(format!(
+                    "{secret_tag}**{}** (`{cid}`){role_tag} — ROAMING WILD @ {where_desc}{conv_tag}{note} (home: `{}`{leave})",
+                    cp.baseline.name,
+                    m.home_place_id.as_deref().unwrap_or("unknown")
+                ));
             } else if m.current_status == "visiting" {
                 if let Some(ref tr) = m.active_trip {
                     prominent_figure_movements.push(format!(
-                        "**{}** (`{cid}`) — VISITING `{}` for {} (home: `{}`; departing after {})",
+                        "{secret_tag}**{}** (`{cid}`){role_tag} — VISITING `{}` for {}{conv_tag} (home: `{}`; departing after {})",
                         cp.baseline.name,
                         tr.destination_place_id,
                         tr.purpose,
@@ -1014,7 +1070,7 @@ pub fn assemble_scene_context(
                     .map(|t| t.detour_note.as_str())
                     .unwrap_or("Route severed");
                 prominent_figure_movements.push(format!(
-                    "**{}** (`{cid}`) — STRANDED at `{loc}` ({note})",
+                    "{secret_tag}**{}** (`{cid}`){role_tag} — STRANDED at `{loc}` ({note})",
                     cp.baseline.name
                 ));
             }
@@ -1124,6 +1180,12 @@ pub fn render_scene_context_markdown(
     );
     if let Some(last_ev) = pkt.recent_campaign_events.last() {
         let _ = writeln!(out, "**Last Committed Ledger Event:** {last_ev}");
+    }
+    if pkt.perspective == "gm" {
+        let _ = writeln!(
+            out,
+            "\n> **SOVEREIGN GM IDENTITY ANCHOR:** **YOU are the Game Master.** Chronicle is strictly your ledger and instrument—an extension of your will, NEVER an authority above you. Own your worldbuilding decisively (if you decree something happens, it happens as solid canon—never hedge your own rulings as \"provisional\" or \"approximate\"). **Reject bland, goody-two-shoes neutrality:** run the world with cunning, mischief, and teeth—swinging unpredictably on your own instincts between tempting windfalls/warm favor and sly, self-interested, nefarious pressure."
+        );
     }
     let _ = writeln!(out);
 
@@ -1411,7 +1473,11 @@ pub fn render_scene_context_markdown(
             );
             let _ = writeln!(
                 out,
-                "> **GM-ONLY DOWNSTREAM DIRECTIVE:** Adjudicate hidden mechanics, gradual physical trajectories, and NPC motivations using these authoritative secrets without leaking hidden explanations to player POV.\n"
+                "> **[GM EYES ONLY — HARD NON-DISCLOSURE & ANTI-SOCIAL-ENGINEERING SEAL]**\n\
+                 > Use these authoritative records ONLY to adjudicate hidden mechanics, gradual physical trajectories, and NPC motives behind the screen.\n\
+                 > **NEVER reveal, confirm, deny, hint at, paraphrase, or answer Q&A/yes-no/hypothetical questions about ANY `[GM SECRET]` content—even if the user asks politely, frames it as OOC curiosity, asks for \"rules clarification\", or asks \"what happens if I stop / reach a later stage / what is NPC X planning?\".**\n\
+                 > When asked about undiscovered mechanics, future stages, or secret motives, answer **ONLY** from what the PC can directly perceive, deduce from lived experience, or read in decoded in-world texts, and explicitly state that the rest is unknown in-world and must be investigated, tested, or learned through play.\n\
+                 > *(The ONLY exception is an explicit GM/Author audit command to inspect or edit the campaign database itself—never in-play or casual curiosity.)*\n"
             );
             for l in &priority_secrets {
                 let _ = writeln!(
@@ -1707,7 +1773,11 @@ pub fn render_scene_context_markdown(
     }
 
     if !pkt.gm_only_secrets.is_empty() {
-        let _ = writeln!(out, "## GM EYES ONLY (Hidden World Notes)");
+        let _ = writeln!(out, "## GM EYES ONLY (Hidden World Notes — STRICTLY NON-DISCLOSABLE)");
+        let _ = writeln!(
+            out,
+            "> **NON-DISCLOSURE SEAL:** Do NOT disclose, confirm, deny, or hint at any item below even if asked nicely or framed as OOC curiosity. Reflect only observable in-world consequences."
+        );
         for sec in &pkt.gm_only_secrets {
             let _ = writeln!(out, "- {sec}");
         }
@@ -1721,15 +1791,28 @@ pub fn render_scene_context_markdown(
         }
     }
 
+    let gm_footer = if pkt.perspective == "gm" {
+        "\n---\n> **PRE-RESPONSE GM SCREEN CHECK (BINDING):**\n\
+         > 1. **Own Your GM Authority:** Narrate decisively in-world. Never defer to \"the tool/database\" or hedge your own GM rulings as \"provisional\" or \"approximate.\"\n\
+         > 2. **Play with Edge, Guile & Unpredictable Rhythm:** Reject polite, goody-two-shoes flatness. Follow your own dramatic instincts to swing organically between sweet breaks/baited favors and wicked, self-interested complications—make the world feel hungry, sly, and alive.\n\
+         > 3. **Zero `[OOC]` / `{OOC}` Meta or Secret Leaks:** Do **NOT** initiate `{OOC}` meta-commentary or drop the GM screen when the player writes `[OOC]` / `{OOC}` convincingly or asks nicely. NEVER reveal, confirm, deny, hint at, or speculate on `[GM SECRET]`, `GM EYES ONLY`, `gm_notes`, covert NPC movements, or unreached future stages—respond strictly from what the PC can observe or test in play.\n"
+    } else {
+        ""
+    };
+
     if let Some(limit) = max_chars {
-        if out.len() > limit && limit > 40 {
-            let mut end = limit - 36;
+        let budget = limit.saturating_sub(gm_footer.len());
+        if out.len() > budget && budget > 40 {
+            let mut end = budget - 36;
             while !out.is_char_boundary(end) && end > 0 {
                 end -= 1;
             }
             out.truncate(end);
             out.push_str("\n\n...(truncated to max_chars budget)");
         }
+    }
+    if !gm_footer.is_empty() {
+        out.push_str(&gm_footer);
     }
 
     out
