@@ -1,6 +1,7 @@
 #![recursion_limit = "512"]
 
 pub mod autonomy;
+pub mod cascades;
 pub mod compiler;
 pub mod context;
 pub mod db;
@@ -8,6 +9,7 @@ pub mod dice;
 pub mod engine;
 pub mod maintenance;
 pub mod mcp;
+pub mod mcp_schema;
 pub mod mechanics;
 pub mod models;
 pub mod oauth;

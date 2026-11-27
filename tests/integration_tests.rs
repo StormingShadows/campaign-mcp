@@ -6816,3 +6816,452 @@ fn test_covert_recurring_figure_map_roaming_conveyance_and_gm_convergence_radar(
 
     assert!(engine.db().verify_event_chain_detailed().unwrap().valid);
 }
+
+#[test]
+fn test_strict_unknown_key_validation_help_introspection_and_first_second_order_cascades() {
+    let tmp = TempDir::new().unwrap();
+    let engine = CampaignEngine::open(tmp.path()).unwrap();
+    engine
+        .init_campaign("Cascade & Schema Test", "Strict MCP test", "d20", None)
+        .unwrap();
+
+    // 1. Strict Unknown-Key Rejection (self-correcting error listing unknown + accepted keys)
+    let bad_meta = execute_tool(
+        &engine,
+        "admin",
+        json!({ "op": "update_meta", "invented_protocol_key": "foo" }),
+    );
+    let err_msg = bad_meta.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("Rejected unknown parameter(s) [invented_protocol_key]"),
+        "Must strictly reject unknown key: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("Accepted parameters:") && err_msg.contains("ruleset_notes"),
+        "Error must list exact accepted keys: {err_msg}"
+    );
+
+    let bad_sync = execute_tool(
+        &engine,
+        "character",
+        json!({ "op": "sync_state", "character_id": "hero", "bogus_field": 123 }),
+    );
+    assert!(
+        bad_sync
+            .unwrap_err()
+            .to_string()
+            .contains("Rejected unknown parameter(s) [bogus_field]")
+    );
+
+    // 2. On-demand zero-bloat schema introspection (`op='help'` and `query(op='describe_op')`)
+    let char_help = execute_tool(&engine, "character", json!({ "op": "help" })).unwrap();
+    assert!(char_help["operation_groups"].is_object());
+    assert!(char_help["automatic_cascades"].as_array().unwrap().len() >= 5);
+    let eq_help = execute_tool(
+        &engine,
+        "character",
+        json!({ "op": "help", "target_op": "equipment" }),
+    )
+    .unwrap();
+    assert_eq!(eq_help["resolved_tool"], "update_character_equipment");
+    assert!(eq_help["accepted_keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|k| k == "weight_kg"));
+    let query_desc = execute_tool(
+        &engine,
+        "query",
+        json!({ "op": "describe_op", "tool": "update_campaign_meta" }),
+    )
+    .unwrap();
+    assert_eq!(query_desc["resolved_tool"], "update_campaign_meta");
+
+    // 3. Create 2D map grid + places using cohesive inline `create_place(grid_id, x, y)`
+    execute_tool(
+        &engine,
+        "world",
+        json!({
+            "op": "travel",
+            "sub_action": "upsert_grid",
+            "grid_id": "valley-map",
+            "name": "Valley Map",
+            "scale_kind": "region",
+            "width": 10,
+            "height": 10,
+            "cell_scale_label": "5 km",
+            "default_terrain": "plains"
+        }),
+    )
+    .unwrap();
+    let cp1 = execute_tool(
+        &engine,
+        "world",
+        json!({
+            "op": "create_place",
+            "id": "river-town",
+            "name": "River Town",
+            "place_type": "town",
+            "terrain": "Urban",
+            "grid_id": "valley-map",
+            "x": 2,
+            "y": 2,
+            "fog_status": "charted"
+        }),
+    )
+    .unwrap();
+    assert!(cp1["_cascades"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c.as_str().unwrap().contains("valley-map")));
+    execute_tool(
+        &engine,
+        "world",
+        json!({
+            "op": "create_place",
+            "id": "mist-ruins",
+            "name": "Mist Ruins",
+            "place_type": "ruins",
+            "terrain": "Forest",
+            "grid_id": "valley-map",
+            "x": 5,
+            "y": 5,
+            "fog_status": "unexplored"
+        }),
+    )
+    .unwrap();
+
+    // 4. Create PC + NPC + Faction + Route, verify control & route cascades
+    execute_tool(
+        &engine,
+        "society",
+        json!({
+            "op": "faction",
+            "sub_action": "upsert",
+            "id": "iron-guild",
+            "name": "Iron Guild",
+            "faction_type": "merchant-guild"
+        }),
+    )
+    .unwrap();
+    let ctrl = execute_tool(
+        &engine,
+        "world",
+        json!({
+            "op": "update_place",
+            "sub_action": "control",
+            "place_id": "river-town",
+            "faction": "Iron Guild",
+            "danger_level": "Low"
+        }),
+    )
+    .unwrap();
+    assert!(ctrl["_cascades"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c.as_str().unwrap().contains("iron-guild")));
+    let fac = engine.db().get_faction("iron-guild").unwrap().unwrap();
+    assert!(fac.territory.contains(&"river-town".to_string()));
+    let rels = engine.db().list_relations_for_entity("iron-guild").unwrap();
+    assert!(rels
+        .iter()
+        .any(|r| r.relation_type == "controls" && r.target_id == "river-town"));
+
+    // Sync travel route status when `update_place(route)` blocks it
+    execute_tool(
+        &engine,
+        "world",
+        json!({
+            "op": "travel",
+            "sub_action": "upsert_route",
+            "id": "river-to-ruins",
+            "from_place_id": "river-town",
+            "to_place_id": "mist-ruins",
+            "distance_km": 20.0,
+            "terrain": "forest",
+            "status": "open",
+            "bidirectional": true
+        }),
+    )
+    .unwrap();
+    let rt_upd = execute_tool(
+        &engine,
+        "world",
+        json!({
+            "op": "update_place",
+            "sub_action": "route",
+            "place_id": "river-town",
+            "destination_id": "mist-ruins",
+            "route_status": "Blocked",
+            "notes": "Flooded bridge"
+        }),
+    )
+    .unwrap();
+    assert!(rt_upd["_cascades"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c.as_str().unwrap().contains("travel_route")));
+    assert_eq!(
+        engine.db().get_travel_route("river-to-ruins").unwrap().unwrap().status,
+        "blocked"
+    );
+
+    // 5. Create PC & NPC; test structured-field lint, atomic purchase cascade, avatar->garment fit cascade,
+    //    outfit->equipment cascade, transfer->catalog cascade, PC move->fog chart cascade, and dead->routine/mobility halt!
+    execute_tool(
+        &engine,
+        "character",
+        json!({
+            "op": "create",
+            "id": "pc-lin",
+            "name": "Lin",
+            "kind": "pc",
+            "initial_location": "river-town",
+            "initial_stats": { "STR": 10, "DEX": 12 }
+        }),
+    )
+    .unwrap();
+    execute_tool(
+        &engine,
+        "character",
+        json!({
+            "op": "create",
+            "id": "npc-merchant",
+            "name": "Old Wen",
+            "kind": "npc",
+            "initial_location": "river-town"
+        }),
+    )
+    .unwrap();
+    execute_tool(
+        &engine,
+        "character",
+        json!({
+            "op": "pc_sheet",
+            "sub_action": "update_avatar",
+            "character_id": "pc-lin",
+            "measurements": { "chest": "90 cm", "waist": "76 cm", "shoulders": "43 cm", "hips": "92 cm" }
+        }),
+    )
+    .unwrap();
+    execute_tool(
+        &engine,
+        "economy",
+        json!({ "op": "set_balance", "owner_id": "pc-lin", "currency": "copper_cash", "amount": 500 }),
+    )
+    .unwrap();
+
+    // Unstructured-in-structured lint triggers when weight text is stuffed in description without weight_kg
+    let lint_res = execute_tool(
+        &engine,
+        "character",
+        json!({
+            "op": "equipment",
+            "sub_action": "acquire",
+            "character_id": "pc-lin",
+            "name": "Iron Hammer",
+            "description": "Weight: 2.5 kg forged smithing hammer"
+        }),
+    )
+    .unwrap();
+    assert!(lint_res["_schema_warnings"].as_array().unwrap().len() >= 1);
+
+    // ONE-CALL cohesive purchase: currency + delivered item + item_economics + CatalogItem + equip_on_buy + encumbrance!
+    let tx = execute_tool(
+        &engine,
+        "economy",
+        json!({
+            "op": "execute_transaction",
+            "kind": "purchase",
+            "buyer_id": "pc-lin",
+            "seller_id": "npc-merchant",
+            "amount": 120,
+            "currency": "copper_cash",
+            "item_name": "Indigo Coat",
+            "quantity": 1,
+            "weight_kg": 1.8,
+            "slot": "outerwear",
+            "tags": ["clothing", "travel"],
+            "garment_cut": "fitted",
+            "garment_measurements": { "chest": "95 cm", "waist": "82 cm", "shoulders": "45 cm" },
+            "equip_on_buy": true,
+            "catalog_item": true,
+            "item_type": "clothing"
+        }),
+    )
+    .unwrap();
+    assert!(tx["encumbrance"]["total_weight_kg"].as_f64().unwrap() >= 1.8);
+    let econ = engine.db().list_item_economics_map().unwrap();
+    assert_eq!(econ["indigo coat"].weight_kg, 1.8);
+    assert_eq!(econ["indigo coat"].unit_value, 120);
+    assert!(engine.db().get_catalog_item("indigo-coat").unwrap().is_some());
+
+    // Avatar update cascade: chest grows to 102 cm -> fitted 95 cm Indigo Coat immediately flags garment fit alert!
+    let av_grow = execute_tool(
+        &engine,
+        "character",
+        json!({
+            "op": "pc_sheet",
+            "sub_action": "update_avatar",
+            "character_id": "pc-lin",
+            "measurements": { "chest": "102 cm" }
+        }),
+    )
+    .unwrap();
+    assert!(av_grow["garment_fit_reports"].as_array().unwrap().len() >= 1);
+    assert!(av_grow["_cascades"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c.as_str().unwrap().contains("Garment fit cascade")));
+
+    // Outfit cascade: create two outfits + set_active_outfit auto-equips/unequips!
+    execute_tool(
+        &engine,
+        "character",
+        json!({
+            "op": "equipment",
+            "sub_action": "acquire",
+            "character_id": "pc-lin",
+            "name": "Loose Linen Robe",
+            "slot": "outerwear",
+            "equipped": false,
+            "weight_kg": 0.9
+        }),
+    )
+    .unwrap();
+    execute_tool(
+        &engine,
+        "character",
+        json!({
+            "op": "pc_sheet",
+            "sub_action": "upsert_outfit",
+            "character_id": "pc-lin",
+            "id": "travel-kit",
+            "name": "Travel Kit",
+            "outer_layer": "Indigo Coat"
+        }),
+    )
+    .unwrap();
+    execute_tool(
+        &engine,
+        "character",
+        json!({
+            "op": "pc_sheet",
+            "sub_action": "upsert_outfit",
+            "character_id": "pc-lin",
+            "id": "summer-robe",
+            "name": "Summer Robe",
+            "outer_layer": "Loose Linen Robe"
+        }),
+    )
+    .unwrap();
+    let sw = execute_tool(
+        &engine,
+        "character",
+        json!({
+            "op": "pc_sheet",
+            "sub_action": "set_active_outfit",
+            "character_id": "pc-lin",
+            "outfit_id": "summer-robe"
+        }),
+    )
+    .unwrap();
+    assert!(sw["_cascades"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c.as_str().unwrap().contains("Auto-equipped outfit items")));
+    let lin_proj = engine.get_character("pc-lin", None).unwrap();
+    assert!(lin_proj.current.equipment.iter().find(|i| i.name == "Loose Linen Robe").unwrap().equipped);
+    assert!(!lin_proj.current.equipment.iter().find(|i| i.name == "Indigo Coat").unwrap().equipped);
+
+    // Transfer item cascade: transferring Indigo Coat auto-transfers CatalogItem AND prunes Travel Kit outfit!
+    let tr = execute_tool(
+        &engine,
+        "character",
+        json!({
+            "op": "transfer_item",
+            "from_character_id": "pc-lin",
+            "to_character_id": "npc-merchant",
+            "item_name": "Indigo Coat",
+            "quantity": 1,
+            "reason": "Returned for alteration"
+        }),
+    )
+    .unwrap();
+    assert!(tr["_cascades"].as_array().unwrap().len() >= 2);
+    assert_eq!(
+        engine.db().get_catalog_item("indigo-coat").unwrap().unwrap().current_holder_id.as_deref(),
+        Some("npc-merchant")
+    );
+    let lin_prof = engine.get_character_profile("pc-lin").unwrap();
+    assert!(lin_prof.avatar.outfits.iter().find(|o| o.id == "travel-kit").unwrap().outer_layer.is_empty());
+
+    // Cohesive `character(op='sync_state')` moves PC to unexplored `mist-ruins` + updates stat + adds condition in ONE call
+    // AND auto-charts the destination 2D map cell!
+    let synced = execute_tool(
+        &engine,
+        "character",
+        json!({
+            "op": "sync_state",
+            "character_id": "pc-lin",
+            "location_id": "mist-ruins",
+            "stats": { "DEX": 13 },
+            "add_conditions": [{ "name": "Damp Chill", "kind": "debuff", "severity": "mild" }],
+            "reason": "Entered misty ruins"
+        }),
+    )
+    .unwrap();
+    assert!(synced["_cascades"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c.as_str().unwrap().contains("Auto-charted map cell valley-map (5,5)")));
+    let cells = engine.db().list_map_cells("valley-map").unwrap();
+    assert_eq!(
+        cells.iter().find(|c| c.x == 5 && c.y == 5).unwrap().fog_status,
+        "charted"
+    );
+
+    // Dead status cascade: standing routine auto-paused when NPC dies!
+    execute_tool(
+        &engine,
+        "character",
+        json!({
+            "op": "routine",
+            "sub_action": "upsert",
+            "character_id": "npc-merchant",
+            "routine": {
+                "id": "wen-shopkeeping",
+                "name": "Daily Shopkeeping",
+                "category": "work",
+                "cadence_hours": 24,
+                "enabled": true
+            }
+        }),
+    )
+    .unwrap();
+    let dead = execute_tool(
+        &engine,
+        "character",
+        json!({
+            "op": "status",
+            "character_id": "npc-merchant",
+            "alive_status": "dead",
+            "reason": "Bandit raid"
+        }),
+    )
+    .unwrap();
+    assert!(dead["_cascades"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c.as_str().unwrap().contains("Auto-paused 1 standing routine")));
+    assert!(!engine.db().get_routine("wen-shopkeeping").unwrap().unwrap().enabled);
+
+    assert!(engine.db().verify_event_chain_detailed().unwrap().valid);
+}

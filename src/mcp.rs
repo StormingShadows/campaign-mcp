@@ -732,7 +732,29 @@ pub fn execute_tool(engine: &CampaignEngine, name: &str, args: Value) -> Result<
 }
 
 /// Unified tool dispatcher with explicit HTTP security policy (`allow_local_file_import`).
+/// Enforces strict unknown-key rejection, self-correcting schema errors, and structured-field lints.
 pub fn execute_tool_with_policy(
+    engine: &CampaignEngine,
+    name: &str,
+    args: Value,
+    allow_local_file_import: bool,
+) -> Result<Value> {
+    crate::mcp_schema::validate_tool_args(name, &args)?;
+    let lint_warnings = crate::mcp_schema::detect_unstructured_in_structured(name, &args);
+    match execute_tool_with_policy_inner(engine, name, args, allow_local_file_import) {
+        Ok(mut val) => {
+            if !lint_warnings.is_empty() {
+                if let Some(obj) = val.as_object_mut() {
+                    obj.insert("_schema_warnings".to_string(), json!(lint_warnings));
+                }
+            }
+            Ok(val)
+        }
+        Err(err) => Err(crate::mcp_schema::enrich_tool_error(name, err)),
+    }
+}
+
+fn execute_tool_with_policy_inner(
     engine: &CampaignEngine,
     name: &str,
     args: Value,
@@ -909,7 +931,16 @@ pub fn execute_tool_with_policy(
             let to_place = req_str(&args, "to_place_id")?;
             let notes = opt_str(&args, "travel_notes").unwrap_or_default();
             let (proj, ev) = engine.move_character(&cid, &to_place, &notes)?;
-            Ok(json!({ "event_seq": ev.seq, "summary": ev.summary, "current_status": proj.current }))
+            let cascades = engine.cascade_after_move_character(&cid, &to_place);
+            let mut out = json!({
+                "event_seq": ev.seq,
+                "summary": ev.summary,
+                "current_status": proj.current
+            });
+            if !cascades.is_empty() {
+                out["_cascades"] = json!(cascades);
+            }
+            Ok(out)
         }
 
         "modify_character_resource" => {
@@ -952,7 +983,16 @@ pub fn execute_tool_with_policy(
             let alive_status = req_str(&args, "alive_status")?;
             let reason = opt_str(&args, "reason").unwrap_or_default();
             let (proj, ev) = engine.set_character_status(&cid, &alive_status, &reason)?;
-            Ok(json!({ "event_seq": ev.seq, "summary": ev.summary, "alive_status": proj.current.alive_status }))
+            let cascades = engine.cascade_after_status_change(&cid, &alive_status);
+            let mut out = json!({
+                "event_seq": ev.seq,
+                "summary": ev.summary,
+                "alive_status": proj.current.alive_status
+            });
+            if !cascades.is_empty() {
+                out["_cascades"] = json!(cascades);
+            }
+            Ok(out)
         }
 
         "update_character_condition" => {
@@ -998,6 +1038,13 @@ pub fn execute_tool_with_policy(
                 }
                 m
             };
+            let weight_kg = args.get("weight_kg").and_then(|v| v.as_f64());
+            let base_value = args
+                .get("base_value")
+                .or_else(|| args.get("unit_value"))
+                .and_then(|v| v.as_i64());
+            let currency = opt_str(&args, "currency");
+            let volume_liters = args.get("volume_liters").and_then(|v| v.as_f64());
             match action.to_lowercase().as_str() {
                 "acquire" | "add" => {
                     let item = Item {
@@ -1017,6 +1064,15 @@ pub fn execute_tool_with_policy(
                     };
                     let iname = item.name.clone();
                     let (proj, ev) = engine.add_item(&cid, item, &reason)?;
+                    let (cascades, enc_val) = engine.cascade_after_equipment_change(
+                        &cid,
+                        &iname,
+                        "acquire",
+                        weight_kg,
+                        base_value,
+                        currency.as_deref(),
+                        volume_liters,
+                    );
                     let fit_report = engine
                         .get_character_profile(&cid)
                         .ok()
@@ -1027,7 +1083,17 @@ pub fn execute_tool_with_policy(
                                 .find(|i| i.name.eq_ignore_ascii_case(&iname))
                                 .and_then(|it| crate::autonomy::evaluate_garment_fit(it, &prof.avatar))
                         });
-                    Ok(json!({ "event_seq": ev.seq, "summary": ev.summary, "fit_report": fit_report, "equipment": proj.current.equipment }))
+                    let mut out = json!({
+                        "event_seq": ev.seq,
+                        "summary": ev.summary,
+                        "fit_report": fit_report,
+                        "encumbrance": enc_val,
+                        "equipment": proj.current.equipment
+                    });
+                    if !cascades.is_empty() {
+                        out["_cascades"] = json!(cascades);
+                    }
+                    Ok(out)
                 }
                 "tailor" | "resize" | "update" => {
                     let item = Item {
@@ -1047,6 +1113,15 @@ pub fn execute_tool_with_policy(
                     };
                     let iname = item.name.clone();
                     let (proj, ev) = engine.add_item(&cid, item, &reason)?;
+                    let (cascades, enc_val) = engine.cascade_after_equipment_change(
+                        &cid,
+                        &iname,
+                        "tailor",
+                        weight_kg,
+                        base_value,
+                        currency.as_deref(),
+                        volume_liters,
+                    );
                     let fit_report = engine
                         .get_character_profile(&cid)
                         .ok()
@@ -1057,19 +1132,50 @@ pub fn execute_tool_with_policy(
                                 .find(|i| i.name.eq_ignore_ascii_case(&iname))
                                 .and_then(|it| crate::autonomy::evaluate_garment_fit(it, &prof.avatar))
                         });
-                    Ok(json!({ "event_seq": ev.seq, "summary": ev.summary, "fit_report": fit_report, "equipment": proj.current.equipment }))
+                    let mut out = json!({
+                        "event_seq": ev.seq,
+                        "summary": ev.summary,
+                        "fit_report": fit_report,
+                        "encumbrance": enc_val,
+                        "equipment": proj.current.equipment
+                    });
+                    if !cascades.is_empty() {
+                        out["_cascades"] = json!(cascades);
+                    }
+                    Ok(out)
                 }
                 "remove" | "consume" => {
                     let name = req_str(&args, "name").or_else(|_| req_str(&args, "item_name"))?;
                     let qty = args.get("quantity").and_then(|v| v.as_i64()).unwrap_or(1);
                     let (proj, ev) = engine.remove_item(&cid, &name, qty, &reason)?;
-                    Ok(json!({ "event_seq": ev.seq, "summary": ev.summary, "equipment": proj.current.equipment }))
+                    let (cascades, enc_val) = engine.cascade_after_equipment_change(
+                        &cid, &name, "remove", None, None, None, None,
+                    );
+                    let mut out = json!({
+                        "event_seq": ev.seq,
+                        "summary": ev.summary,
+                        "encumbrance": enc_val,
+                        "equipment": proj.current.equipment
+                    });
+                    if !cascades.is_empty() {
+                        out["_cascades"] = json!(cascades);
+                    }
+                    Ok(out)
                 }
                 "equip" | "unequip" => {
                     let name = req_str(&args, "name").or_else(|_| req_str(&args, "item_name"))?;
                     let slot = opt_str(&args, "slot");
                     let equipped = action.eq_ignore_ascii_case("equip");
                     let (proj, ev) = engine.equip_item(&cid, &name, slot, equipped)?;
+                    let (cascades, enc_val) = engine.cascade_after_equipment_change(
+                        &cid,
+                        &name,
+                        if equipped { "equip" } else { "unequip" },
+                        None,
+                        None,
+                        None,
+                        None,
+                    );
                     let fit_report = if equipped {
                         engine.get_character_profile(&cid).ok().and_then(|prof| {
                             proj.current
@@ -1081,7 +1187,17 @@ pub fn execute_tool_with_policy(
                     } else {
                         None
                     };
-                    Ok(json!({ "event_seq": ev.seq, "summary": ev.summary, "fit_report": fit_report, "equipment": proj.current.equipment }))
+                    let mut out = json!({
+                        "event_seq": ev.seq,
+                        "summary": ev.summary,
+                        "fit_report": fit_report,
+                        "encumbrance": enc_val,
+                        "equipment": proj.current.equipment
+                    });
+                    if !cascades.is_empty() {
+                        out["_cascades"] = json!(cascades);
+                    }
+                    Ok(out)
                 }
                 "tag" | "set_tags" | "add_tags" | "remove_tags" => {
                     if let Some(batch) = args.get("items").and_then(|v| v.as_array()) {
@@ -1376,12 +1492,49 @@ pub fn execute_tool_with_policy(
         }
 
         "create_place" => {
+            let grid_id = opt_str(&args, "grid_id");
+            let grid_x = args.get("x").and_then(|v| v.as_i64()).map(|n| n as i32);
+            let grid_y = args.get("y").and_then(|v| v.as_i64()).map(|n| n as i32);
+            let fog_status = opt_str(&args, "fog_status").unwrap_or_else(|| "charted".to_string());
             let baseline: PlaceBaseline = serde_json::from_value(args)?;
             let proj = engine.create_place(baseline)?;
-            Ok(json!({
+            let mut cascades = Vec::new();
+            if let (Some(gid), Some(x), Some(y)) = (grid_id, grid_x, grid_y) {
+                let cell = crate::world_sim::MapGridCell {
+                    grid_id: slugify(&gid),
+                    x,
+                    y,
+                    terrain: proj.baseline.terrain.to_ascii_lowercase(),
+                    elevation: 0,
+                    label: proj.baseline.name.clone(),
+                    place_id: Some(proj.baseline.id.clone()),
+                    landmark_name: String::new(),
+                    faction_control: proj.current.controlling_faction.clone(),
+                    fog_status,
+                    passable: true,
+                    hazards: Vec::new(),
+                    notes: String::new(),
+                    gm_notes: String::new(),
+                    updated_at_world_time: String::new(),
+                };
+                if engine
+                    .upsert_map_cells(&gid, vec![cell], "Auto-placed during create_place")
+                    .is_ok()
+                {
+                    cascades.push(format!(
+                        "Placed '{}' on 2D map grid '{}' at ({},{})",
+                        proj.baseline.id, gid, x, y
+                    ));
+                }
+            }
+            let mut out = json!({
                 "doc_path": engine.docs_dir().join("places").join(format!("{}.md", proj.baseline.id)).display().to_string(),
                 "place": proj
-            }))
+            });
+            if !cascades.is_empty() {
+                out["_cascades"] = json!(cascades);
+            }
+            Ok(out)
         }
 
         "get_place" => {
@@ -1428,10 +1581,27 @@ pub fn execute_tool_with_policy(
                     Ok(json!({ "event_seq": ev.seq, "summary": ev.summary, "current_status": proj.current }))
                 }
                 "control" => {
+                    let prev_faction = engine
+                        .get_place(&pid, None)
+                        .ok()
+                        .and_then(|p| p.current.controlling_faction);
                     let faction = opt_str(&args, "faction");
                     let danger = opt_str(&args, "danger_level");
-                    let (proj, ev) = engine.set_place_control(&pid, faction, danger, &notes)?;
-                    Ok(json!({ "event_seq": ev.seq, "summary": ev.summary, "current_status": proj.current }))
+                    let (proj, ev) = engine.set_place_control(&pid, faction.clone(), danger, &notes)?;
+                    let cascades = engine.cascade_after_place_control(
+                        &pid,
+                        faction.as_deref(),
+                        prev_faction.as_deref(),
+                    );
+                    let mut out = json!({
+                        "event_seq": ev.seq,
+                        "summary": ev.summary,
+                        "current_status": proj.current
+                    });
+                    if !cascades.is_empty() {
+                        out["_cascades"] = json!(cascades);
+                    }
+                    Ok(out)
                 }
                 "landmark" => {
                     let lm = Landmark {
@@ -1446,16 +1616,31 @@ pub fn execute_tool_with_policy(
                     Ok(json!({ "event_seq": ev.seq, "summary": ev.summary, "landmarks": proj.current.landmarks }))
                 }
                 "route" => {
+                    let dest_id = req_str(&args, "destination_id")?;
+                    let route_status = opt_str(&args, "route_status")
+                        .unwrap_or_else(|| "Open".to_string());
                     let route = Route {
-                        destination_id: req_str(&args, "destination_id")?,
+                        destination_id: dest_id.clone(),
                         travel_time: opt_str(&args, "travel_time").unwrap_or_default(),
                         terrain_difficulty: opt_str(&args, "terrain_difficulty").unwrap_or_default(),
-                        status: opt_str(&args, "route_status")
-                            .unwrap_or_else(|| "Open".to_string()),
+                        status: route_status.clone(),
                         notes: notes.clone(),
                     };
                     let (proj, ev) = engine.upsert_route(&pid, route, &notes)?;
-                    Ok(json!({ "event_seq": ev.seq, "summary": ev.summary, "routes": proj.current.routes }))
+                    let cascades = engine.cascade_after_place_route_change(
+                        &pid,
+                        &dest_id,
+                        &route_status,
+                    );
+                    let mut out = json!({
+                        "event_seq": ev.seq,
+                        "summary": ev.summary,
+                        "routes": proj.current.routes
+                    });
+                    if !cascades.is_empty() {
+                        out["_cascades"] = json!(cascades);
+                    }
+                    Ok(out)
                 }
                 other => Err(anyhow!(
                     "Unknown place action '{other}'; expected 'weather', 'add_condition', 'remove_condition', 'control', 'landmark', or 'route'"
@@ -1927,12 +2112,33 @@ pub fn execute_tool_with_policy(
                 created_at_world_time: String::new(),
                 updated_at_world_time: String::new(),
             };
+            let weight_kg = args.get("weight_kg").and_then(|v| v.as_f64());
+            let base_value = args
+                .get("base_value")
+                .or_else(|| args.get("unit_value"))
+                .and_then(|v| v.as_i64());
+            let currency = opt_str(&args, "currency");
+            let volume_liters = args.get("volume_liters").and_then(|v| v.as_f64());
             let (saved, ev) = engine.upsert_catalog_item(item, &notes)?;
-            Ok(json!({
+            let mut cascades = Vec::new();
+            if let Some(c) = engine.sync_item_economics_fields(
+                &saved.name,
+                weight_kg,
+                base_value,
+                currency.as_deref(),
+                volume_liters,
+            ) {
+                cascades.push(c);
+            }
+            let mut out = json!({
                 "event_seq": ev.seq,
                 "doc_path": engine.docs_dir().join("items").join(format!("{}.md", saved.id)).display().to_string(),
                 "item": saved
-            }))
+            });
+            if !cascades.is_empty() {
+                out["_cascades"] = json!(cascades);
+            }
+            Ok(out)
         }
 
         "get_item" => {
@@ -2292,11 +2498,16 @@ pub fn execute_tool_with_policy(
             let reason = opt_str(&args, "reason").unwrap_or_default();
             let (ev_rem, ev_add) =
                 engine.transfer_item(&from_id, &to_id, &item_name, quantity, &reason)?;
-            Ok(json!({
+            let cascades = engine.cascade_after_item_transfer(&from_id, &to_id, &item_name);
+            let mut out = json!({
                 "removed_event_seq": ev_rem.seq,
                 "added_event_seq": ev_add.seq,
                 "summary": format!("{} | {}", ev_rem.summary, ev_add.summary)
-            }))
+            });
+            if !cascades.is_empty() {
+                out["_cascades"] = json!(cascades);
+            }
+            Ok(out)
         }
 
         "rest_characters" => {
@@ -2403,11 +2614,12 @@ pub fn execute_tool_with_policy(
                         if let Some(s) = seq_opt {
                             slim["event_seq"] = json!(s);
                         }
-                        // Preserve key mechanical results (rolls/checks/contests/draws/warnings/stage_rules) in compact mode
+                        // Preserve key mechanical results (rolls/checks/contests/draws/warnings/cascades/stage_rules) in compact mode
                         for k in [
                             "outcome", "degree", "roll", "modifier", "total", "difficulty", "margin",
                             "winner_id", "warnings", "world_time", "rolls", "kept", "stage_rules_applied",
                             "stat_xp_gained", "job_xp_gained", "currency_conversion",
+                            "_cascades", "_schema_warnings", "fit_report", "encumbrance",
                         ] {
                             if let Some(v) = res.get(k) {
                                 slim[k] = v.clone();
@@ -3137,7 +3349,7 @@ pub fn execute_tool_with_policy(
         "manage_faction" => {
             let action = req_str(&args, "action")?.to_lowercase();
             match action.as_str() {
-                "create" | "update" => {
+                "create" | "update" | "upsert" => {
                     let notes = opt_str(&args, "reason").unwrap_or_default();
                     let faction: FactionRecord = serde_json::from_value(args)?;
                     let (saved, ev) = engine.upsert_faction(faction, &notes)?;
@@ -3571,9 +3783,13 @@ pub fn execute_tool_with_policy(
                     let tax = args.get("tax_rate_pct").and_then(|v| v.as_i64()).unwrap_or(0);
                     let tax_to = opt_str(&args, "tax_recipient_id");
                     let item_name = opt_str(&args, "item_name");
-                    let qty = args.get("quantity").and_then(|v| v.as_i64()).unwrap_or(1);
+                    let qty = args
+                        .get("quantity")
+                        .or_else(|| args.get("item_quantity"))
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(1);
                     let notes = opt_str(&args, "notes").unwrap_or_default();
-                    let (res, _) = engine.execute_transaction(
+                    let (mut res, _) = engine.execute_transaction(
                         &kind,
                         &buyer,
                         &seller,
@@ -3585,6 +3801,121 @@ pub fn execute_tool_with_policy(
                         qty,
                         &notes,
                     )?;
+                    // Cohesive 1st- & 2nd-order purchase cascades: enrich delivered item metadata,
+                    // sync item_economics (weight_kg & unit price), optional catalog record,
+                    // equip_on_buy, garment fit & live encumbrance in ONE call.
+                    if let Some(ref iname) = item_name {
+                        let mut cascades = Vec::new();
+                        let unit_price = args
+                            .get("base_value")
+                            .or_else(|| args.get("unit_value"))
+                            .and_then(|v| v.as_i64())
+                            .or_else(|| Some((amt / qty.max(1)).max(1)));
+                        let weight_kg = args.get("weight_kg").and_then(|v| v.as_f64());
+                        let volume_liters = args.get("volume_liters").and_then(|v| v.as_f64());
+                        let slot = opt_str(&args, "slot");
+                        let tags = opt_str_vec(&args, "tags");
+                        let desc = opt_str(&args, "description").unwrap_or_default();
+                        let durability = opt_str(&args, "durability");
+                        let garment_cut = opt_str(&args, "garment_cut").unwrap_or_default();
+                        let garment_taper = opt_str(&args, "garment_taper").unwrap_or_default();
+                        let equip_on_buy = args
+                            .get("equip_on_buy")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let mut garment_measurements = std::collections::BTreeMap::new();
+                        if let Some(obj) =
+                            args.get("garment_measurements").and_then(|v| v.as_object())
+                        {
+                            for (k, v) in obj {
+                                let s = v
+                                    .as_str()
+                                    .map(|x| x.trim().to_string())
+                                    .unwrap_or_else(|| v.to_string());
+                                garment_measurements.insert(k.trim().to_string(), s);
+                            }
+                        }
+                        let has_extra_item_meta = slot.is_some()
+                            || !tags.is_empty()
+                            || !desc.is_empty()
+                            || durability.is_some()
+                            || !garment_measurements.is_empty()
+                            || !garment_cut.is_empty()
+                            || !garment_taper.is_empty()
+                            || equip_on_buy;
+                        let buyer_slug = slugify(&buyer);
+                        if has_extra_item_meta
+                            && engine.db().get_character_baseline(&buyer_slug).ok().flatten().is_some()
+                        {
+                            let patch_item = Item {
+                                name: iname.clone(),
+                                slot: slot.clone(),
+                                quantity: 0,
+                                equipped: equip_on_buy,
+                                durability: durability.clone(),
+                                tags: tags.clone(),
+                                description: desc.clone(),
+                                garment_measurements: garment_measurements.clone(),
+                                garment_cut: garment_cut.clone(),
+                                garment_taper: garment_taper.clone(),
+                            };
+                            if engine.add_item(&buyer_slug, patch_item, "Transaction item metadata").is_ok() {
+                                cascades.push(format!(
+                                    "Applied structured metadata to purchased item '{}' (equip={})",
+                                    iname, equip_on_buy
+                                ));
+                            }
+                        }
+                        if args.get("catalog_item").and_then(|v| v.as_bool()).unwrap_or(false) {
+                            let cat = CatalogItem {
+                                id: String::new(),
+                                name: iname.clone(),
+                                item_type: opt_str(&args, "item_type").unwrap_or_else(|| "gear".to_string()),
+                                rarity_or_tier: String::new(),
+                                slot,
+                                quantity: qty.max(1),
+                                equipped: equip_on_buy,
+                                condition_or_durability: durability.unwrap_or_else(|| "New".to_string()),
+                                origin_and_maker: format!("Purchased from {seller}"),
+                                previous_owners: vec![slugify(&seller)],
+                                current_holder_id: Some(buyer_slug.clone()),
+                                significance: String::new(),
+                                properties_and_effects: String::new(),
+                                description: desc,
+                                linked_text_id: None,
+                                gm_notes: String::new(),
+                                keywords: Vec::new(),
+                                tags,
+                                related_ids: Vec::new(),
+                                garment_measurements,
+                                garment_cut,
+                                garment_taper,
+                                created_at_world_time: String::new(),
+                                updated_at_world_time: String::new(),
+                            };
+                            if let Ok((saved_cat, _)) = engine.upsert_catalog_item(cat, &notes) {
+                                cascades.push(format!("Registered catalog item '{}'", saved_cat.id));
+                            }
+                        }
+                        let (eq_cascades, enc_val) = engine.cascade_after_equipment_change(
+                            &buyer_slug,
+                            iname,
+                            "acquire",
+                            weight_kg,
+                            unit_price,
+                            Some(&curr),
+                            volume_liters,
+                        );
+                        cascades.extend(eq_cascades);
+                        if let Some(obj) = res.as_object_mut() {
+                            if let Some(ev) = enc_val {
+                                obj.insert("encumbrance".to_string(), ev);
+                            }
+                            if !cascades.is_empty() {
+                                obj.insert("_cascades".to_string(), json!(cascades));
+                            }
+                        }
+                    }
                     Ok(res)
                 }
                 "upsert_market" => {
@@ -4193,7 +4524,48 @@ pub fn execute_tool_with_policy(
         "manage_player_character" => {
             let action = req_str(&args, "action")?;
             let cid = opt_str(&args, "character_id");
-            engine.manage_player_character_action(cid.as_deref(), &action, &args)
+            let mut res = engine.manage_player_character_action(cid.as_deref(), &action, &args)?;
+            let act_l = action.trim().to_ascii_lowercase();
+            let resolved_cid = res
+                .get("character_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .or(cid);
+            if let Some(ref target_cid) = resolved_cid {
+                if act_l == "update_avatar" {
+                    let (cascades, fit_reports) = engine.cascade_after_avatar_update(target_cid);
+                    if let Some(obj) = res.as_object_mut() {
+                        if !fit_reports.is_empty() {
+                            obj.insert("garment_fit_reports".to_string(), json!(fit_reports));
+                        }
+                        if !cascades.is_empty() {
+                            obj.insert("_cascades".to_string(), json!(cascades));
+                        }
+                    }
+                } else if act_l == "set_active_outfit" {
+                    let sync_eq = args
+                        .get("sync_equipment")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    if let Some(oid) = res
+                        .get("active_outfit")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                    {
+                        let (cascades, fit_reports) =
+                            engine.cascade_after_outfit_change(target_cid, &oid, sync_eq);
+                        if let Some(obj) = res.as_object_mut() {
+                            if !fit_reports.is_empty() {
+                                obj.insert("garment_fit_reports".to_string(), json!(fit_reports));
+                            }
+                            if !cascades.is_empty() {
+                                obj.insert("_cascades".to_string(), json!(cascades));
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(res)
         }
 
         "advance_world" => {
@@ -6781,6 +7153,11 @@ fn execute_manage_routines(engine: &CampaignEngine, args: Value) -> Result<Value
                 .cloned()
                 .unwrap_or_else(|| args.clone());
             if let Some(obj) = routine_val.as_object_mut() {
+                if !obj.contains_key("character_id") {
+                    if let Some(cid) = opt_str(&args, "character_id") {
+                        obj.insert("character_id".to_string(), Value::String(cid));
+                    }
+                }
                 if !obj.contains_key("enabled") && !obj.contains_key("active") {
                     if let Some(st) = obj.get("status").and_then(|v| v.as_str()) {
                         let sl = st.trim().to_ascii_lowercase();
@@ -6815,6 +7192,13 @@ fn execute_domain_scene(
     allow_local_file_import: bool,
 ) -> Result<Value> {
     let op = extract_op(&args, "context");
+    if matches!(op.as_str(), "help" | "describe_op" | "schema") {
+        return Ok(crate::mcp_schema::describe_domain_help(
+            "scene",
+            opt_str(&args, "target_op").or_else(|| opt_str(&args, "tool")).as_deref(),
+            opt_str(&args, "sub_action").as_deref(),
+        ));
+    }
     match op.as_str() {
         "status" | "campaign_status" => {
             execute_tool_with_policy(engine, "campaign_status", args, allow_local_file_import)
@@ -6870,6 +7254,18 @@ fn execute_domain_query(
     allow_local_file_import: bool,
 ) -> Result<Value> {
     let op = extract_op(&args, "search_all");
+    if matches!(op.as_str(), "help" | "describe_op" | "describe_tool" | "schema") {
+        let domain = opt_str(&args, "domain")
+            .or_else(|| opt_str(&args, "tool"))
+            .unwrap_or_else(|| "query".to_string());
+        let target = opt_str(&args, "target_op").or_else(|| opt_str(&args, "tool"));
+        let sub = opt_str(&args, "sub_action");
+        return Ok(crate::mcp_schema::describe_domain_help(
+            &domain,
+            target.as_deref(),
+            sub.as_deref(),
+        ));
+    }
     let target_tool = match op.as_str() {
         "character" | "get_character" => "get_character",
         "place" | "get_place" => "get_place",
@@ -6936,6 +7332,14 @@ fn execute_domain_resolve(
         }
     };
 
+    if matches!(op.as_str(), "help" | "describe_op" | "schema") {
+        return Ok(crate::mcp_schema::describe_domain_help(
+            "resolve",
+            opt_str(&args, "target_op").or_else(|| opt_str(&args, "tool")).as_deref(),
+            opt_str(&args, "sub_action").as_deref(),
+        ));
+    }
+
     match op.as_str() {
         "check" | "resolve_check" => {
             execute_tool_with_policy(engine, "resolve_check", args, allow_local_file_import)
@@ -6965,12 +7369,255 @@ fn execute_domain_resolve(
     }
 }
 
+/// Cohesive composite character mutation (`character(op='sync_state')`):
+/// Atomically updates location, alive_status, stats, resources, conditions, avatar, and/or profile
+/// in one strictly validated call with automatic 1st- and 2nd-order cascades.
+fn execute_character_sync_state(
+    engine: &CampaignEngine,
+    args: Value,
+    allow_local_file_import: bool,
+) -> Result<Value> {
+    const ALLOWED_KEYS: &[&str] = &[
+        "op",
+        "sub_action",
+        "mode",
+        "character_id",
+        "location_id",
+        "to_place_id",
+        "travel_notes",
+        "alive_status",
+        "stats",
+        "resources",
+        "add_conditions",
+        "remove_conditions",
+        "avatar",
+        "profile",
+        "reason",
+    ];
+    if let Some(obj) = args.as_object() {
+        let mut unknown: Vec<String> = obj
+            .keys()
+            .filter(|k| !ALLOWED_KEYS.contains(&k.as_str()))
+            .cloned()
+            .collect();
+        if !unknown.is_empty() {
+            unknown.sort();
+            return Err(anyhow!(
+                "Rejected unknown parameter(s) [{}] for 'character(op=sync_state)'. Accepted parameters: [character_id, location_id, travel_notes, alive_status, stats, resources, add_conditions, remove_conditions, avatar, profile, reason].",
+                unknown.join(", ")
+            ));
+        }
+    }
+    let cid = req_str(&args, "character_id")?;
+    let reason = opt_str(&args, "reason").unwrap_or_default();
+
+    engine.with_deferred_compile(|engine| {
+        let mut applied: Vec<String> = Vec::new();
+        let mut all_cascades: Vec<String> = Vec::new();
+        let mut event_seqs: Vec<i64> = Vec::new();
+
+        let collect = |res: &Value, seqs: &mut Vec<i64>, cascades: &mut Vec<String>| {
+            if let Some(s) = res.get("event_seq").and_then(|v| v.as_i64()) {
+                seqs.push(s);
+            }
+            if let Some(arr) = res.get("_cascades").and_then(|v| v.as_array()) {
+                for item in arr {
+                    if let Some(st) = item.as_str() {
+                        cascades.push(st.to_string());
+                    }
+                }
+            }
+        };
+
+        if let Some(to_place) = opt_str(&args, "location_id").or_else(|| opt_str(&args, "to_place_id")) {
+            let res = execute_tool_with_policy(
+                engine,
+                "move_character",
+                json!({
+                    "character_id": cid,
+                    "to_place_id": to_place,
+                    "travel_notes": opt_str(&args, "travel_notes").unwrap_or_else(|| reason.clone())
+                }),
+                allow_local_file_import,
+            )?;
+            collect(&res, &mut event_seqs, &mut all_cascades);
+            applied.push(format!("moved -> {to_place}"));
+        }
+
+        if let Some(st) = opt_str(&args, "alive_status") {
+            let res = execute_tool_with_policy(
+                engine,
+                "set_character_status",
+                json!({
+                    "character_id": cid,
+                    "alive_status": st,
+                    "reason": reason
+                }),
+                allow_local_file_import,
+            )?;
+            collect(&res, &mut event_seqs, &mut all_cascades);
+            applied.push(format!("status -> {st}"));
+        }
+
+        if let Some(stats_obj) = args.get("stats").and_then(|v| v.as_object()) {
+            for (stat_name, spec) in stats_obj {
+                let mut a = json!({ "character_id": cid, "stat": stat_name, "reason": reason });
+                if let Some(n) = spec.as_i64() {
+                    a["set_value"] = json!(n);
+                } else if let Some(o) = spec.as_object() {
+                    for (k, v) in o {
+                        a[k] = v.clone();
+                    }
+                }
+                let res = execute_tool_with_policy(
+                    engine,
+                    "modify_character_stat",
+                    a,
+                    allow_local_file_import,
+                )?;
+                collect(&res, &mut event_seqs, &mut all_cascades);
+                applied.push(format!("stat:{stat_name}"));
+            }
+        }
+
+        if let Some(res_obj) = args.get("resources").and_then(|v| v.as_object()) {
+            for (res_name, spec) in res_obj {
+                let mut a = json!({ "character_id": cid, "resource": res_name, "reason": reason });
+                if let Some(n) = spec.as_i64() {
+                    a["delta"] = json!(n);
+                } else if let Some(o) = spec.as_object() {
+                    for (k, v) in o {
+                        a[k] = v.clone();
+                    }
+                }
+                let res = execute_tool_with_policy(
+                    engine,
+                    "modify_character_resource",
+                    a,
+                    allow_local_file_import,
+                )?;
+                collect(&res, &mut event_seqs, &mut all_cascades);
+                applied.push(format!("resource:{res_name}"));
+            }
+        }
+
+        if let Some(add_arr) = args.get("add_conditions").and_then(|v| v.as_array()) {
+            for cond in add_arr {
+                let mut a = if let Some(s) = cond.as_str() {
+                    json!({ "name": s })
+                } else {
+                    cond.clone()
+                };
+                if let Some(o) = a.as_object_mut() {
+                    o.insert("action".to_string(), json!("add"));
+                    o.insert("character_id".to_string(), json!(cid));
+                }
+                let cname = a.get("name").and_then(|v| v.as_str()).unwrap_or("condition").to_string();
+                let res = execute_tool_with_policy(
+                    engine,
+                    "update_character_condition",
+                    a,
+                    allow_local_file_import,
+                )?;
+                collect(&res, &mut event_seqs, &mut all_cascades);
+                applied.push(format!("+condition:{cname}"));
+            }
+        }
+
+        if let Some(rem_arr) = args.get("remove_conditions").and_then(|v| v.as_array()) {
+            for cond in rem_arr {
+                let cname = cond
+                    .as_str()
+                    .or_else(|| cond.get("name").and_then(|v| v.as_str()))
+                    .ok_or_else(|| anyhow!("Each entry in 'remove_conditions' must be a string or {{name}}"))?;
+                let res = execute_tool_with_policy(
+                    engine,
+                    "update_character_condition",
+                    json!({
+                        "action": "remove",
+                        "character_id": cid,
+                        "name": cname,
+                        "reason": reason
+                    }),
+                    allow_local_file_import,
+                )?;
+                collect(&res, &mut event_seqs, &mut all_cascades);
+                applied.push(format!("-condition:{cname}"));
+            }
+        }
+
+        if let Some(av_obj) = args.get("avatar").and_then(|v| v.as_object()) {
+            let mut a = Value::Object(av_obj.clone());
+            if let Some(o) = a.as_object_mut() {
+                o.insert("action".to_string(), json!("update_avatar"));
+                o.insert("character_id".to_string(), json!(cid));
+                if !reason.is_empty() && !o.contains_key("reason") {
+                    o.insert("reason".to_string(), json!(reason));
+                }
+            }
+            let res = execute_tool_with_policy(
+                engine,
+                "manage_player_character",
+                a,
+                allow_local_file_import,
+            )?;
+            collect(&res, &mut event_seqs, &mut all_cascades);
+            applied.push("avatar".to_string());
+        }
+
+        if let Some(prof_obj) = args.get("profile").and_then(|v| v.as_object()) {
+            let mut a = Value::Object(prof_obj.clone());
+            if let Some(o) = a.as_object_mut() {
+                o.insert("character_id".to_string(), json!(cid));
+                if !reason.is_empty() && !o.contains_key("reason") {
+                    o.insert("reason".to_string(), json!(reason));
+                }
+            }
+            let res = execute_tool_with_policy(
+                engine,
+                "update_character_profile",
+                a,
+                allow_local_file_import,
+            )?;
+            collect(&res, &mut event_seqs, &mut all_cascades);
+            applied.push("profile".to_string());
+        }
+
+        if applied.is_empty() {
+            return Err(anyhow!(
+                "character(op='sync_state') requires at least one change field: location_id, alive_status, stats, resources, add_conditions, remove_conditions, avatar, or profile."
+            ));
+        }
+
+        let mut out = json!({
+            "character_id": cid,
+            "applied": applied,
+            "event_seqs": event_seqs,
+            "summary": format!("Synced character '{}' ({})", cid, applied.join(", "))
+        });
+        if !all_cascades.is_empty() {
+            out["_cascades"] = json!(all_cascades);
+        }
+        Ok(out)
+    })
+}
+
 fn execute_domain_character(
     engine: &CampaignEngine,
     args: Value,
     allow_local_file_import: bool,
 ) -> Result<Value> {
     let op = extract_op(&args, "get");
+    if matches!(op.as_str(), "help" | "describe_op" | "schema") {
+        return Ok(crate::mcp_schema::describe_domain_help(
+            "character",
+            opt_str(&args, "target_op").or_else(|| opt_str(&args, "tool")).as_deref(),
+            opt_str(&args, "sub_action").as_deref(),
+        ));
+    }
+    if matches!(op.as_str(), "sync_state" | "patch") {
+        return execute_character_sync_state(engine, args, allow_local_file_import);
+    }
     match op.as_str() {
         "create" | "create_character" => {
             execute_tool_with_policy(engine, "create_character", args, allow_local_file_import)
@@ -7132,6 +7779,13 @@ fn execute_domain_progression(
     allow_local_file_import: bool,
 ) -> Result<Value> {
     let op = extract_op(&args, "get_character_progression");
+    if matches!(op.as_str(), "help" | "describe_op" | "schema") {
+        return Ok(crate::mcp_schema::describe_domain_help(
+            "progression",
+            opt_str(&args, "target_op").or_else(|| opt_str(&args, "tool")).as_deref(),
+            opt_str(&args, "sub_action").as_deref(),
+        ));
+    }
     if op == "apply_stage_rule" {
         let cid = req_str(&args, "character_id")?;
         let tid = slugify(&req_str(&args, "track_id")?);
@@ -7183,6 +7837,13 @@ fn execute_domain_world(
     allow_local_file_import: bool,
 ) -> Result<Value> {
     let op = extract_op(&args, "advance_time");
+    if matches!(op.as_str(), "help" | "describe_op" | "schema") {
+        return Ok(crate::mcp_schema::describe_domain_help(
+            "world",
+            opt_str(&args, "target_op").or_else(|| opt_str(&args, "tool")).as_deref(),
+            opt_str(&args, "sub_action").as_deref(),
+        ));
+    }
     match op.as_str() {
         "advance_time" | "time" => {
             execute_tool_with_policy(engine, "advance_time", args, allow_local_file_import)
@@ -7248,6 +7909,13 @@ fn execute_domain_society(
     allow_local_file_import: bool,
 ) -> Result<Value> {
     let op = extract_op(&args, "relation");
+    if matches!(op.as_str(), "help" | "describe_op" | "schema") {
+        return Ok(crate::mcp_schema::describe_domain_help(
+            "society",
+            opt_str(&args, "target_op").or_else(|| opt_str(&args, "tool")).as_deref(),
+            opt_str(&args, "sub_action").as_deref(),
+        ));
+    }
     match op.as_str() {
         "relation" | "upsert_relation" => {
             execute_tool_with_policy(engine, "upsert_relation", args, allow_local_file_import)
@@ -7314,6 +7982,13 @@ fn execute_domain_codex(
     allow_local_file_import: bool,
 ) -> Result<Value> {
     let op = extract_op(&args, "upsert_lore");
+    if matches!(op.as_str(), "help" | "describe_op" | "schema") {
+        return Ok(crate::mcp_schema::describe_domain_help(
+            "codex",
+            opt_str(&args, "target_op").or_else(|| opt_str(&args, "tool")).as_deref(),
+            opt_str(&args, "sub_action").as_deref(),
+        ));
+    }
     match op.as_str() {
         "lore" | "upsert_lore" => {
             execute_tool_with_policy(engine, "upsert_lore", args, allow_local_file_import)
@@ -7348,6 +8023,13 @@ fn execute_domain_economy(
     allow_local_file_import: bool,
 ) -> Result<Value> {
     let op = extract_op(&args, "get_balances");
+    if matches!(op.as_str(), "help" | "describe_op" | "schema") {
+        return Ok(crate::mcp_schema::describe_domain_help(
+            "economy",
+            opt_str(&args, "target_op").or_else(|| opt_str(&args, "tool")).as_deref(),
+            opt_str(&args, "sub_action").as_deref(),
+        ));
+    }
     match op.as_str() {
         "upsert_item" | "catalog_item" => {
             execute_tool_with_policy(engine, "upsert_item", args, allow_local_file_import)
@@ -7391,6 +8073,13 @@ fn execute_domain_admin(
     allow_local_file_import: bool,
 ) -> Result<Value> {
     let op = extract_op(&args, "diagnose");
+    if matches!(op.as_str(), "help" | "describe_op" | "schema") {
+        return Ok(crate::mcp_schema::describe_domain_help(
+            "admin",
+            opt_str(&args, "target_op").or_else(|| opt_str(&args, "tool")).as_deref(),
+            opt_str(&args, "sub_action").as_deref(),
+        ));
+    }
     let target = match op.as_str() {
         "diagnose" | "diagnose_campaign" => "diagnose_campaign",
         "cleanup" | "cleanup_campaign" => "cleanup_campaign",
@@ -7419,19 +8108,19 @@ fn unified_domain_only_definitions() -> Vec<Value> {
     let arr = json!([
         {
             "name": "scene",
-            "description": "Active campaign & scene context hub: read global status, assemble perspective-safe scene context (Markdown with top-banner `## Engine Alarms & Active Directives`), inspect/acknowledge/resolve active Engine Signals, or start a new session.",
+            "description": "Active campaign & scene hub: status, perspective-safe scene context (`## Engine Alarms & Active Directives`), Engine Signals, start_session, or `op='help'` for schema.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "op": { "type": "string", "enum": ["context", "status", "signals", "ack_signal", "resolve_signal", "emit_signal", "start_session"], "default": "context" },
+                    "op": { "type": "string", "enum": ["context", "status", "signals", "ack_signal", "resolve_signal", "emit_signal", "start_session", "help"], "default": "context" },
                     "place_id": { "type": "string" },
                     "character_ids": { "type": "array", "items": { "type": "string" } },
-                    "scene_text": { "type": "string", "description": "Latest player input or scene text to trigger Lorebook, Books/Scrolls, and FTS5 recall." },
-                    "perspective": { "type": "string", "description": "'gm' (default), 'player', or '<character_id>' (strict epistemic wall)." },
+                    "scene_text": { "type": "string" },
+                    "perspective": { "type": "string", "description": "'gm' (default), 'player', or '<character_id>'." },
                     "include_gm_secrets": { "type": "boolean", "default": true },
                     "format": { "type": "string", "enum": ["markdown", "json"], "default": "markdown" },
                     "max_chars": { "type": "integer" },
-                    "signal_id": { "type": "string", "description": "Signal id or dedup_key for ack_signal / resolve_signal." },
+                    "signal_id": { "type": "string" },
                     "title": { "type": "string" },
                     "summary": { "type": "string" }
                 }
@@ -7439,7 +8128,7 @@ fn unified_domain_only_definitions() -> Vec<Value> {
         },
         {
             "name": "query",
-            "description": "Unified read-only retrieval, verbatim file chunk reader, and multi-dimensional 'Search By' engine across Characters, Places, Lore, Books/Scrolls, Carryable Items, Histories, Attachments, Events, Relations, and Epistemic Knowledge.",
+            "description": "Read-only retrieval, verbatim file reader, multi-dimensional search across all registers, AND on-demand strict schema lookup (`op='describe_op', tool='<name>'`).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -7449,10 +8138,12 @@ fn unified_domain_only_definitions() -> Vec<Value> {
                             "search_all", "get_character", "get_place", "get_text", "get_item", "get_lore",
                             "get_attachment", "read_file", "search_characters", "search_places", "search_lore",
                             "search_texts", "search_items", "search_inventory", "search_histories", "search_attachments",
-                            "search_events", "search_relations", "search_knowledge"
+                            "search_events", "search_relations", "search_knowledge", "describe_op", "help"
                         ],
                         "default": "search_all"
                     },
+                    "tool": { "type": "string", "description": "For describe_op: domain or underlying tool name to inspect exact accepted keys & cascades." },
+                    "target_op": { "type": "string", "description": "For describe_op/help: specific op within a domain." },
                     "query": { "type": "string" },
                     "character_id": { "type": "string" },
                     "place_id": { "type": "string" },
@@ -7460,18 +8151,18 @@ fn unified_domain_only_definitions() -> Vec<Value> {
                     "item_id": { "type": "string" },
                     "lore_id": { "type": "string" },
                     "attachment_id": { "type": "string" },
-                    "target": { "type": "string", "description": "For read_file: e.g. 'attachment:<id>', 'text:<id>', 'lore:<id>', 'doc:characters/<id>.md'." },
+                    "target": { "type": "string" },
                     "offset_chars": { "type": "integer" },
                     "max_chars": { "type": "integer" },
                     "actor_id": { "type": "string" },
-                    "not_known_by": { "type": "string", "description": "For search_knowledge: blind-spot finder!" },
+                    "not_known_by": { "type": "string" },
                     "subject": { "type": "string" },
                     "entity_id": { "type": "string" },
                     "entity_kind": { "type": "string" },
                     "location_id": { "type": "string" },
                     "faction": { "type": "string" },
                     "tag": { "type": "string" },
-                    "tags": { "type": "array", "items": { "type": "string" }, "description": "Multi-tag filter for search_inventory / search_items (e.g. ['clothing', 'spare'])." },
+                    "tags": { "type": "array", "items": { "type": "string" } },
                     "tag_match": { "type": "string", "enum": ["all", "any"], "default": "all" },
                     "exclude_tags": { "type": "array", "items": { "type": "string" } },
                     "equipped": { "type": "boolean" },
@@ -7482,21 +8173,21 @@ fn unified_domain_only_definitions() -> Vec<Value> {
         },
         {
             "name": "resolve",
-            "description": "Deterministic RPG resolution engine: structured action checks (`op='check'`, auto-hydrating stats, skills, gear, garment fit, titles, traits, proficiencies, injuries, encumbrance & weather, plus automatic Skill -> Stat Training + Job XP trickle), opposed contests (`op='contest'`), weighted/deck random tables (`op='draw_table'`, staging loot receipts), encounters (`op='encounter'`), and ruleset profiles.",
+            "description": "Deterministic resolution: checks (auto-hydrating stats/skills/gear/fit/injuries/encumbrance/weather), contests, random tables, encounters, ruleset profiles, or `op='help'`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "op": { "type": "string", "enum": ["check", "contest", "draw_table", "roll_dice", "ruleset", "random_table", "encounter"], "default": "check" },
-                    "sub_action": { "type": "string", "description": "For op='encounter': start, log_action, next_turn, update_participant, end, get, list." },
+                    "op": { "type": "string", "enum": ["check", "contest", "draw_table", "roll_dice", "ruleset", "random_table", "encounter", "help"], "default": "check" },
+                    "sub_action": { "type": "string", "description": "For encounter: start, log_action, next_turn, update_participant, end, get, list." },
                     "actor_id": { "type": "string" },
-                    "action": { "type": "string", "description": "What is being attempted (e.g. 'Cut mortise joint', 'Slip past watchmen')." },
+                    "action": { "type": "string" },
                     "stat": { "type": "string" },
                     "skill": { "type": "string" },
                     "technique": { "type": "string" },
                     "progression_track": { "type": "string" },
                     "equipment": { "type": "array", "items": { "type": "string" } },
                     "dc_tier": { "type": "string", "enum": ["trivial", "easy", "moderate", "hard", "very_hard", "nearly_impossible"] },
-                    "dc_factors": { "type": "array", "description": "Situational DC modifiers (e.g. 'rushed', 'proper_tools', 'darkness', or {label, delta, reason})." },
+                    "dc_factors": { "type": "array" },
                     "difficulty": { "type": "integer" },
                     "modifier": { "type": "integer" },
                     "advantage": { "type": "string", "enum": ["none", "advantage", "disadvantage"] },
@@ -7512,19 +8203,20 @@ fn unified_domain_only_definitions() -> Vec<Value> {
         },
         {
             "name": "character",
-            "description": "Unified character lifecycle, vitals/stats/conditions, sized apparel & equipment, persistent injuries/recovery/crafting, standing daily/weekly `routine` habits, and dedicated `pc_sheet` (avatar baseline vs. current measurements, outfits, titles, segregated Stat/Job/Proficiency XP, traits).",
+            "description": "Cohesive character hub with automatic 1st/2nd-order cascades: `sync_state` (one-call composite location/status/stats/resources/conditions/avatar/profile), equipment (auto-syncs weight_kg/item_economics/CatalogItem/outfits/fit/encumbrance), move (auto-charts PC map cell), status (auto-halts dead/incapacitated routines & trips), pc_sheet, health, routine. Call `op='help'` for exact keys.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "op": {
                         "type": "string",
                         "enum": [
-                            "get", "create", "move", "resource", "stat", "status", "condition", "equipment",
-                            "transfer_item", "skill", "technique", "goal", "rest", "profile", "pc_sheet",
-                            "health", "routine"
+                            "get", "create", "sync_state", "move", "resource", "stat", "status", "condition",
+                            "equipment", "transfer_item", "skill", "technique", "goal", "rest", "profile",
+                            "pc_sheet", "health", "routine", "help"
                         ]
                     },
-                    "sub_action": { "type": "string", "description": "Sub-operation for condition (add/remove), equipment (acquire/remove/equip/unequip/tailor/tag/auto_tag/search), pc_sheet (get_sheet/update_avatar/adjust_stat_xp/upsert_job/adjust_job_xp/upsert_proficiency/upsert_title/upsert_trait/upsert_outfit), health (apply_injury/treat_injury/advance_recovery/resolve_downtime/begin_crafting/resolve_crafting), or routine (list/upsert/delete)." },
+                    "sub_action": { "type": "string", "description": "condition(add|remove), equipment(acquire|tailor|remove|equip|unequip|tag|auto_tag), pc_sheet(get_sheet|update_avatar|upsert_marker|upsert_outfit|set_active_outfit|adjust_stat_xp|upsert_job|adjust_job_xp|upsert_proficiency|upsert_title|upsert_trait), health(apply_injury|treat_injury|advance_recovery|resolve_downtime|begin_crafting|resolve_crafting), routine(list|upsert|delete)." },
+                    "target_op": { "type": "string", "description": "For op='help': inspect exact accepted keys of one op." },
                     "character_id": { "type": "string" },
                     "name": { "type": "string" },
                     "to_place_id": { "type": "string" },
@@ -7535,7 +8227,12 @@ fn unified_domain_only_definitions() -> Vec<Value> {
                     "set_current": { "type": "integer" },
                     "set_max": { "type": "integer" },
                     "item_name": { "type": "string" },
-                    "tags": { "type": "array", "items": { "type": "string" }, "description": "Item tags (e.g. ['clothing', 'workwear', 'tool', 'cultivation', 'document'])." },
+                    "slot": { "type": "string" },
+                    "quantity": { "type": "integer" },
+                    "equipped": { "type": "boolean" },
+                    "weight_kg": { "type": "number", "description": "Auto-syncs item_economics & encumbrance." },
+                    "base_value": { "type": "integer" },
+                    "tags": { "type": "array", "items": { "type": "string" } },
                     "add_tags": { "type": "array", "items": { "type": "string" } },
                     "remove_tags": { "type": "array", "items": { "type": "string" } },
                     "set_tags": { "type": "array", "items": { "type": "string" } },
@@ -7544,7 +8241,7 @@ fn unified_domain_only_definitions() -> Vec<Value> {
                     "garment_taper": { "type": "string" },
                     "measurements": { "type": "object", "additionalProperties": { "type": "string" } },
                     "baseline_measurements": { "type": "object", "additionalProperties": { "type": "string" } },
-                    "routine": { "type": "object", "description": "For op='routine', sub_action='upsert': { name, category, cadence_hours, require_location_id?, halt_on_injury_severity?, progression_xp?, skill_xp?, job_xp?, stat_training_xp?, currency_deltas?, resource_deltas? }." },
+                    "routine": { "type": "object" },
                     "reason": { "type": "string" }
                 },
                 "required": ["op"]
@@ -7552,7 +8249,7 @@ fn unified_domain_only_definitions() -> Vec<Value> {
         },
         {
             "name": "progression",
-            "description": "Genre-agnostic stateful progression & cultivation engine: define ladders (`xianxia_standard`, `body_tempering`, `dnd_level_20`, `scifi_tier`), enroll parallel tracks with declarative `stage_rules` (auto-applying measurements, stats, conditions, traits, checkpoints & emitting CRITICAL signals on layer/stage advance!), award/revert XP, and resolve bottleneck breakthroughs.",
+            "description": "Stateful progression & cultivation engine: ladders, parallel tracks with declarative `stage_rules` (auto-applying body/stat/condition/trait cascades on stage advance), XP award/revert, breakthroughs. Call `op='help'` for full schema.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -7561,16 +8258,17 @@ fn unified_domain_only_definitions() -> Vec<Value> {
                         "enum": [
                             "get_tracks", "define_ladder", "list_ladders", "enroll_track", "advance_xp",
                             "adjust_xp", "revert_xp", "reset_xp", "attempt_breakthrough", "update_track",
-                            "remove_track", "apply_stage_rule"
+                            "remove_track", "apply_stage_rule", "help"
                         ]
                     },
+                    "target_op": { "type": "string" },
                     "character_id": { "type": "string" },
                     "track_id": { "type": "string" },
                     "ladder_id": { "type": "string" },
                     "preset": { "type": "string", "enum": ["xianxia_standard", "body_tempering", "dnd_level_20", "scifi_tier"] },
                     "name": { "type": "string" },
                     "xp": { "type": "integer" },
-                    "stage_rules": { "type": "object", "description": "Map of '<sub_stage>' or '<major_idx>:<sub_stage>' -> StageTransitionRule ({ appearance_stage?, height?, weight?, measurements?, facial_hair?, stat_set?, stat_deltas?, unspent_stat_points_delta?, upsert_conditions?, remove_conditions?, grant_traits?, checkpoint_summary?, narrative_directive? })." },
+                    "stage_rules": { "type": "object" },
                     "dc_tier": { "type": "string" },
                     "reason": { "type": "string" }
                 },
@@ -7579,7 +8277,7 @@ fn unified_domain_only_definitions() -> Vec<Value> {
         },
         {
             "name": "world",
-            "description": "World calendar, bounded-scope `advance_world` orchestrator, places/landmarks/exits, seasonal Markov weather, auto-ticking `clock` trackers (`cadence_hours`, `consequence_on_fill`, `auto_reset`), Dijkstra overland travel routing, and sparse 2D `(x, y)` map grids (terrain/landmark/fog painting via `sub_action='set_cell'`, single `x,y` or batch `cells[]`).",
+            "description": "World time/simulation, places (create_place supports inline grid_id+x+y; control auto-syncs Faction.controlled_places & controls relation; route auto-syncs Dijkstra TravelRoute), weather, auto-ticking clocks, overland routing, and 2D map grids (`travel`, `sub_action='set_cell'`). Call `op='help'` for full schema.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -7587,10 +8285,11 @@ fn unified_domain_only_definitions() -> Vec<Value> {
                         "type": "string",
                         "enum": [
                             "advance_time", "advance_world", "create_place", "get_place", "update_place",
-                            "weather", "clock", "travel"
+                            "weather", "clock", "travel", "help"
                         ]
                     },
-                    "sub_action": { "type": "string", "description": "For update_place (weather/add_condition/remove_condition/landmark/route/control), clock (create/tick/update/list), weather (generate/advance/get), or travel (upsert_route/list_routes/update_spatial/calculate/advance/explore/upsert_grid/list_grids/get_grid/set_cell/clear_cell/auto_layout_grid)." },
+                    "sub_action": { "type": "string", "description": "update_place(weather|add_condition|remove_condition|control|landmark|route), clock(create|tick|update|list), weather(generate|advance|get), travel(upsert_route|list_routes|update_spatial|calculate|advance|explore|upsert_grid|list_grids|get_grid|set_cell|clear_cell|auto_layout_grid)." },
+                    "target_op": { "type": "string" },
                     "minutes": { "type": "integer" },
                     "duration_hours": { "type": "integer" },
                     "place_id": { "type": "string" },
@@ -7598,26 +8297,26 @@ fn unified_domain_only_definitions() -> Vec<Value> {
                     "clock_id": { "type": "string" },
                     "segments": { "type": "integer" },
                     "delta": { "type": "integer" },
-                    "cadence_hours": { "type": "integer", "description": "For clock create: auto-ticks +1 segment every `cadence_hours` on advance_time!" },
+                    "cadence_hours": { "type": "integer" },
                     "consequence_on_fill": { "type": "string" },
                     "auto_reset": { "type": "boolean" },
                     "from_place_id": { "type": "string" },
                     "to_place_id": { "type": "string" },
-                    "grid_id": { "type": "string", "description": "2D map grid ID for upsert_grid/get_grid/set_cell/clear_cell." },
+                    "grid_id": { "type": "string" },
                     "scale_kind": { "type": "string", "enum": ["world", "region", "settlement", "dungeon", "space_sector", "tactical"] },
                     "width": { "type": "integer" },
                     "height": { "type": "integer" },
-                    "cell_scale_label": { "type": "string", "description": "e.g. '5 km', '80 m', '1 AU'." },
+                    "cell_scale_label": { "type": "string" },
                     "default_terrain": { "type": "string" },
-                    "x": { "type": "integer", "description": "Grid column for set_cell / clear_cell." },
-                    "y": { "type": "integer", "description": "Grid row for set_cell / clear_cell." },
-                    "terrain": { "type": "string", "description": "Cell terrain (e.g. forest, mountain, plains, river, road, swamp, urban, ruins, wilderness)." },
+                    "x": { "type": "integer" },
+                    "y": { "type": "integer" },
+                    "terrain": { "type": "string" },
                     "label": { "type": "string" },
                     "landmark_name": { "type": "string" },
                     "fog_status": { "type": "string", "enum": ["unexplored", "rumored", "surveyed", "charted"] },
                     "passable": { "type": "boolean" },
                     "hazards": { "type": "array", "items": { "type": "string" } },
-                    "cells": { "type": "array", "items": { "type": "object" }, "description": "Batch cells for set_cell: [{x, y, terrain, label?, place_id?, landmark_name?, faction_control?, fog_status?, passable?, hazards?, notes?, gm_notes?}]." },
+                    "cells": { "type": "array", "items": { "type": "object" } },
                     "center_x": { "type": "integer" },
                     "center_y": { "type": "integer" },
                     "radius": { "type": "integer" },
@@ -7630,7 +8329,7 @@ fn unified_domain_only_definitions() -> Vec<Value> {
         },
         {
             "name": "society",
-            "description": "Social graph, dedicated Factions, Epistemic Knowledge & witness beliefs (`record_knowledge` / `propagate_knowledge`), Jurisdictions/Crimes/Warrants/Reputation, and off-screen NPC Autonomy & Business-Circuit Mobility.",
+            "description": "Social graph, Factions, Epistemic Knowledge/witness beliefs, Law/Crimes/Reputation, and NPC Autonomy & Mobility. Call `op='help'` for exact structured keys.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -7638,10 +8337,11 @@ fn unified_domain_only_definitions() -> Vec<Value> {
                         "type": "string",
                         "enum": [
                             "relation", "remove_relation", "record_knowledge", "propagate_knowledge",
-                            "faction", "law", "autonomy"
+                            "faction", "law", "autonomy", "help"
                         ]
                     },
-                    "sub_action": { "type": "string", "description": "For faction (upsert/get/list/modify_resource), law (upsert_jurisdiction/record_crime/update_warrant/modify_reputation/get_reputation), or autonomy (prepare/commit/auto_mechanical/configure_mobility/dispatch_trip/tick_movements/list_movements)." },
+                    "sub_action": { "type": "string", "description": "faction(upsert|get|list|modify_resource|add_member), law(upsert_jurisdiction|record_crime|update_warrant|modify_reputation|get_reputation), autonomy(prepare|commit|auto_mechanical|configure_mobility|dispatch_trip|tick_movements|list_movements)." },
+                    "target_op": { "type": "string" },
                     "source_id": { "type": "string" },
                     "relation_type": { "type": "string" },
                     "target_id": { "type": "string" },
@@ -7659,7 +8359,7 @@ fn unified_domain_only_definitions() -> Vec<Value> {
         },
         {
             "name": "codex",
-            "description": "World-building Lorebook (`upsert_lore`), physical readable Books/Scrolls/Manuals (`upsert_text`, `record_text_reading`), Entity Historical Chronicles (`add_history`), Attached/Pasted Reference Docs (`import_attachment`, `create_reference_doc`), and standalone Narrative Events (`log_event`).",
+            "description": "Lorebook (`upsert_lore`), physical readable Books/Scrolls/Manuals (`upsert_text`, `record_text_reading`), Entity Chronicles (`add_history`), Attachments/Reference Docs, and Narrative Events (`log_event`). Call `op='help'` for exact structured keys.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -7667,9 +8367,10 @@ fn unified_domain_only_definitions() -> Vec<Value> {
                         "type": "string",
                         "enum": [
                             "upsert_lore", "upsert_text", "record_text_reading", "add_history",
-                            "import_attachment", "create_reference_doc", "log_event"
+                            "import_attachment", "create_reference_doc", "log_event", "help"
                         ]
                     },
+                    "target_op": { "type": "string" },
                     "id": { "type": "string" },
                     "title": { "type": "string" },
                     "category": { "type": "string" },
@@ -7683,7 +8384,7 @@ fn unified_domain_only_definitions() -> Vec<Value> {
                     "entity_kind": { "type": "string" },
                     "details": { "type": "string" },
                     "visibility": { "type": "string" },
-                    "always_include": { "type": "boolean", "description": "For upsert_lore: true loads this rule/protocol into every GM scene brief." },
+                    "always_include": { "type": "boolean" },
                     "tags": { "type": "array", "items": { "type": "string" } },
                     "keywords": { "type": "array", "items": { "type": "string" } },
                     "related_ids": { "type": "array", "items": { "type": "string" } }
@@ -7693,7 +8394,7 @@ fn unified_domain_only_definitions() -> Vec<Value> {
         },
         {
             "name": "economy",
-            "description": "Carryable catalog items (`upsert_item` with provenance & garment sizing, `transfer_catalog_item`), staged loot claiming (`claim_discovery`), Encumbrance, Atomic Multi-Denomination Currency (auto-making change within the same currency family!), and Dynamic Settlement Markets with broken-route price ripples.",
+            "description": "Cohesive commerce & items hub: `execute_transaction` (ONE-CALL atomic currency+change, structured item delivery, weight_kg/item_economics, optional CatalogItem & encumbrance), `upsert_item` (auto-syncs weight_kg & inventory), encumbrance, and dynamic markets. Call `op='help'` for full schema.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -7702,9 +8403,10 @@ fn unified_domain_only_definitions() -> Vec<Value> {
                         "enum": [
                             "get_balances", "set_balance", "transfer_currency", "execute_transaction",
                             "check_encumbrance", "upsert_market", "get_market_prices", "update_market_supply",
-                            "set_item_economics", "upsert_item", "tag_item", "transfer_catalog_item", "claim_discovery"
+                            "set_item_economics", "upsert_item", "tag_item", "transfer_catalog_item", "claim_discovery", "help"
                         ]
                     },
+                    "target_op": { "type": "string" },
                     "owner_id": { "type": "string" },
                     "buyer_id": { "type": "string" },
                     "seller_id": { "type": "string" },
@@ -7715,6 +8417,14 @@ fn unified_domain_only_definitions() -> Vec<Value> {
                     "character_id": { "type": "string" },
                     "place_id": { "type": "string" },
                     "item_id": { "type": "string" },
+                    "item_name": { "type": "string" },
+                    "quantity": { "type": "integer" },
+                    "weight_kg": { "type": "number" },
+                    "base_value": { "type": "integer" },
+                    "slot": { "type": "string" },
+                    "tags": { "type": "array", "items": { "type": "string" } },
+                    "equip_on_buy": { "type": "boolean" },
+                    "catalog_item": { "type": "boolean" },
                     "discovery_id": { "type": "string" },
                     "name": { "type": "string" },
                     "garment_measurements": { "type": "object", "additionalProperties": { "type": "string" } },
@@ -7727,7 +8437,7 @@ fn unified_domain_only_definitions() -> Vec<Value> {
         },
         {
             "name": "admin",
-            "description": "Campaign diagnostics, backups, hygiene & structural refactoring (`diagnose`, `cleanup`, `backup`, `restore_backup`, `rollback`, `compile_docs`, `update_meta`, `reclassify`, `rename_or_merge`, `delete_entity`, `update_character_baseline`, `update_place_baseline`, `update_entity_history`, `update_attachment`).",
+            "description": "Campaign diagnostics, backups, metadata (`update_meta` with `ruleset_notes`/`append_ruleset_notes`), & structural refactoring. Call `op='help'` for full schema.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -7737,9 +8447,10 @@ fn unified_domain_only_definitions() -> Vec<Value> {
                             "diagnose", "cleanup", "backup", "restore_backup", "rollback", "compile_docs",
                             "update_meta", "reclassify", "rename_or_merge", "delete_entity",
                             "update_character_baseline", "update_place_baseline", "update_entity_history",
-                            "update_attachment"
+                            "update_attachment", "help"
                         ]
                     },
+                    "target_op": { "type": "string" },
                     "dry_run": { "type": "boolean" },
                     "to_seq": { "type": "integer" },
                     "backup_filename": { "type": "string" },
@@ -7747,10 +8458,10 @@ fn unified_domain_only_definitions() -> Vec<Value> {
                     "entity_id": { "type": "string" },
                     "old_id": { "type": "string" },
                     "new_id": { "type": "string" },
-                    "name": { "type": "string", "description": "For update_meta: campaign name." },
-                    "description": { "type": "string", "description": "For update_meta: campaign description." },
-                    "ruleset_notes": { "type": "string", "description": "For update_meta: replace campaign ruleset/protocol notes." },
-                    "append_ruleset_notes": { "type": "string", "description": "For update_meta: append a standing rule/protocol to ruleset_notes without overwriting." },
+                    "name": { "type": "string" },
+                    "description": { "type": "string" },
+                    "ruleset_notes": { "type": "string" },
+                    "append_ruleset_notes": { "type": "string" },
                     "global_weather": { "type": "string" },
                     "reason": { "type": "string" }
                 },

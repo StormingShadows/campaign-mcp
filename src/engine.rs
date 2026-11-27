@@ -6767,12 +6767,17 @@ impl CampaignEngine {
         // If an item was purchased and buyer is a character, deliver it cleanly
         if let Some(iname) = item_name.filter(|s| !s.trim().is_empty()) {
             let qty = item_quantity.max(1);
-            // If seller is also a character carrying the item, transfer it; otherwise mint from merchant stock
+            // If seller is a character carrying the item in personal inventory, transfer it;
+            // otherwise mint from merchant/shop stock so buyers never pay without receiving the item.
+            let mut delivered = false;
             if self.db.get_character_baseline(&seller)?.is_some()
                 && self.db.get_character_baseline(&buyer)?.is_some()
             {
-                let _ = self.transfer_item(&seller, &buyer, iname, qty, notes);
-            } else if self.db.get_character_baseline(&buyer)?.is_some() {
+                if self.transfer_item(&seller, &buyer, iname, qty, notes).is_ok() {
+                    delivered = true;
+                }
+            }
+            if !delivered && self.db.get_character_baseline(&buyer)?.is_some() {
                 let _ = self.add_item(
                     &buyer,
                     Item {
@@ -9416,10 +9421,11 @@ impl CampaignEngine {
             "set_active_outfit" => {
                 let target = args
                     .get("id")
+                    .or_else(|| args.get("outfit_id"))
                     .or_else(|| args.get("name"))
                     .or_else(|| args.get("active_outfit"))
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow!("set_active_outfit requires 'id' or 'name'"))?
+                    .ok_or_else(|| anyhow!("set_active_outfit requires 'id', 'outfit_id', or 'name'"))?
                     .trim();
                 let resolved = profile
                     .avatar
@@ -9439,9 +9445,10 @@ impl CampaignEngine {
             "remove_outfit" => {
                 let id = args
                     .get("id")
+                    .or_else(|| args.get("outfit_id"))
                     .or_else(|| args.get("name"))
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow!("remove_outfit requires 'id' or 'name'"))?;
+                    .ok_or_else(|| anyhow!("remove_outfit requires 'id', 'outfit_id', or 'name'"))?;
                 let slug = slugify(id);
                 let before = profile.avatar.outfits.len();
                 profile
